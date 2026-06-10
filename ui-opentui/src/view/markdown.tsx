@@ -49,7 +49,34 @@ function buildSyntaxStyle(theme: Theme): SyntaxStyle {
     'markup.quote': { fg: rgba(c.muted) },
     'markup.link': { fg: rgba(c.accent) },
     'markup.raw': { fg: rgba(c.label) },
-    'markup.raw.block': { fg: rgba(c.label) }
+    'markup.raw.block': { fg: rgba(c.label) },
+    // ── CODE token scopes (tree-sitter highlight families; subscopes like
+    // `keyword.return` fall back onto these). Without them every code token
+    // rendered `default` — syntax highlighting parsed but painted monochrome
+    // (glitch's report). Palette stays on existing theme tokens: keywords/
+    // numbers warm accent, strings label-gold, comments muted italic,
+    // functions the machinery blue, types ok-green; punctuation recedes.
+    comment: { fg: rgba(c.muted), italic: true },
+    keyword: { bold: true, fg: rgba(c.accent) },
+    string: { fg: rgba(c.label) },
+    'string.special': { fg: rgba(c.label) },
+    number: { fg: rgba(c.accent) },
+    boolean: { fg: rgba(c.accent) },
+    constant: { fg: rgba(c.accent) },
+    function: { fg: rgba(c.shellDollar) },
+    'function.method': { fg: rgba(c.shellDollar) },
+    constructor: { fg: rgba(c.shellDollar) },
+    type: { fg: rgba(c.ok) },
+    'type.builtin': { fg: rgba(c.ok) },
+    attribute: { fg: rgba(c.label) },
+    tag: { fg: rgba(c.accent) },
+    property: { fg: rgba(c.text) },
+    variable: { fg: rgba(c.text) },
+    'variable.builtin': { fg: rgba(c.accent) },
+    operator: { fg: rgba(c.muted) },
+    punctuation: { fg: rgba(c.muted) },
+    'punctuation.bracket': { fg: rgba(c.muted) },
+    'punctuation.delimiter': { fg: rgba(c.muted) }
   })
 }
 
