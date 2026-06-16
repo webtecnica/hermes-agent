@@ -392,6 +392,65 @@ async def host_header_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
+# CSRF guard — reject cross-origin state-changing requests via Sec-Fetch-Site.
+#
+# This is the credential-free replacement for the legacy ``_SESSION_TOKEN``'s
+# only robust contribution: blocking drive-by CSRF from a web page the user
+# visits. It applies in BOTH auth regimes (loopback and gated).
+#
+# Middleware order note: ``@app.middleware`` prepends, so the runtime order
+# (outermost→innermost) is auth_middleware → _dashboard_auth_gate →
+# csrf_guard_middleware → host_header_middleware → CORS → route. So an
+# UNAUTHENTICATED cross-site mutation is already rejected by the outer auth
+# layer (401 token in loopback, 401 cookie in gated); the CSRF guard's job is
+# to reject an AUTHENTICATED cross-site mutation (403) — the genuine CSRF
+# case where the victim's own credentials ride along. Both regimes covered.
+# ---------------------------------------------------------------------------
+
+# Methods whose side effects a cross-origin page could trigger WITHOUT a CORS
+# preflight ("simple requests" plus anything the browser will send cross-site).
+# Reads are not guarded here — the CORSMiddleware (localhost-only origin regex,
+# allow_credentials off) already prevents a foreign origin from reading any
+# /api/* response body, so a cross-origin GET leaks nothing.
+_CSRF_GUARDED_METHODS: frozenset = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# Sec-Fetch-Site values that indicate a same-origin or user-initiated request.
+# ``Sec-Fetch-Site`` is a forbidden header name (browser-set, JS cannot forge
+# it), Baseline-available since 2023. ``none`` covers user navigation AND the
+# packaged desktop renderer's file:// origin.
+_CSRF_SAFE_FETCH_SITES: frozenset = frozenset({"same-origin", "none"})
+
+
+@app.middleware("http")
+async def csrf_guard_middleware(request: Request, call_next):
+    """Reject cross-origin state-changing requests via Sec-Fetch-Site.
+
+    Fail-open on an ABSENT header so non-browser clients (curl, the NAS
+    liveness probe, the desktop main process) are unaffected — those carry
+    no CSRF risk and the real auth gate (cookie / Origin guard) still
+    applies to them. Only a PRESENT, hostile value (``cross-site`` /
+    ``same-site``) is rejected.
+    """
+    if (
+        request.method in _CSRF_GUARDED_METHODS
+        and request.url.path.startswith("/api/")
+    ):
+        sfs = request.headers.get("sec-fetch-site")
+        if sfs is not None and sfs not in _CSRF_SAFE_FETCH_SITES:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "cross_origin_blocked",
+                    "detail": (
+                        "Cross-origin state-changing request rejected. The "
+                        "dashboard only accepts mutations from its own origin."
+                    ),
+                },
+            )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # Dashboard OAuth auth gate — engaged only when start_server flags the
 # bind as non-loopback-without-insecure.  No-op pass-through in loopback
 # mode so the legacy auth_middleware (below) handles those binds via
