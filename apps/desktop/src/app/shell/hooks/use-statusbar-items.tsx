@@ -326,19 +326,34 @@ export function useStatusbarItems({
     const title = profile ? `${baseTooltip} · ${profile}` : baseTooltip
 
     return {
+      // VS Code-style remote indicator: a solid colored block (not a muted
+      // pill) so "you are running on a remote host" is unmistakable, pinned to
+      // the FAR LEFT of the status bar. SSH gets the primary accent; a plain URL
+      // remote gets a calmer tint so the two are visually distinct.
+      className: cn(
+        'px-2 font-medium',
+        isSsh
+          ? 'bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground'
+          : 'bg-accent text-accent-foreground hover:bg-accent/90 hover:text-accent-foreground'
+      ),
       icon: <Network className="size-3" />,
       id: 'connection',
       label,
       title,
       // Deep-link straight to the Gateway connection panel (the settings index
       // reads ?tab=), so the pill lands the user where they manage/switch it.
-      to: `${SETTINGS_ROUTE}?tab=gateway`,
-      variant: 'link'
+      // NB: default (button) variant — NOT 'link', which renders an <a href> and
+      // would swallow the in-app `to:` navigation.
+      to: `${SETTINGS_ROUTE}?tab=gateway`
     }
   }, [connection?.mode, connection?.remoteHost, connection?.remoteKind, connection?.baseUrl, connection?.profile, copy])
 
   const coreLeftStatusbarItems = useMemo<readonly StatusbarItem[]>(
     () => [
+      // Remote-connection indicator pinned to the far left (VS Code parity) —
+      // first thing in the bar so "where am I running" is the dominant cue.
+      // Absent in local mode.
+      ...(connectionItem ? [connectionItem] : []),
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
         icon: <Command className="size-3.5" />,
@@ -405,6 +420,7 @@ export function useStatusbarItems({
       bgFailed,
       bgRunning,
       commandCenterOpen,
+      connectionItem,
       copy,
       gatewayMenuContent,
       gatewayClassName,
@@ -467,7 +483,6 @@ export function useStatusbarItems({
         title: terminalTakeover ? copy.hideTerminal : copy.showTerminal,
         variant: 'action'
       },
-      ...(connectionItem ? [connectionItem] : []),
       clientVersionItem,
       ...(backendVersionItem ? [backendVersionItem] : [])
     ],
@@ -482,7 +497,6 @@ export function useStatusbarItems({
       terminalTakeover,
       toggleYolo,
       turnStartedAt,
-      connectionItem,
       clientVersionItem,
       backendVersionItem,
       yoloActive
