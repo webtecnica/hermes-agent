@@ -442,6 +442,28 @@ export interface Translations {
       localDesc: string
       remoteTitle: string
       remoteDesc: string
+      cloudTitle: string
+      cloudDesc: string
+      cloudSignInTitle: string
+      cloudSignIn: string
+      cloudSignedIn: string
+      cloudNeedsSignIn: string
+      cloudSignedInDesc: string
+      cloudAgentsTitle: string
+      cloudLoadingAgents: string
+      cloudNoAgents: string
+      cloudRefresh: string
+      cloudConnect: string
+      cloudConnecting: string
+      cloudDiscoverFailed: string
+      cloudConnectFailed: string
+      cloudSignInFailed: string
+      cloudSignedOutTitle: string
+      cloudSignedOutMessage: string
+      cloudConnectedTitle: string
+      cloudConnectedTo: (name: string) => string
+      cloudAgentProvisioning: string
+      cloudStatusLabel: (status: string) => string
       remoteUrlTitle: string
       remoteUrlDesc: string
       probing: string

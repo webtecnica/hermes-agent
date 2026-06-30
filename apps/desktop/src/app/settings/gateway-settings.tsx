@@ -3,9 +3,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { DesktopAuthProvider, DesktopConnectionProbeResult } from '@/global'
+import type { DesktopAuthProvider, DesktopCloudAgent, DesktopConnectionProbeResult } from '@/global'
 import { useI18n } from '@/i18n'
-import { AlertCircle, Check, FileText, Globe, Loader2, LogIn, Monitor } from '@/lib/icons'
+import { AlertCircle, Check, Cloud, FileText, Globe, Loader2, LogIn, Monitor, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $profiles, refreshActiveProfile } from '@/store/profile'
@@ -16,6 +16,8 @@ import { EmptyState, ListRow, LoadingState, Pill, SettingsContent } from './prim
 type Mode = 'local' | 'remote' | 'cloud'
 type AuthMode = 'oauth' | 'token'
 type ProbeStatus = 'idle' | 'probing' | 'done' | 'error'
+// Hermes Cloud discovery lifecycle for the cloud-mode panel.
+type CloudDiscoverStatus = 'idle' | 'loading' | 'done' | 'error'
 
 interface GatewaySettingsState {
   envOverride: boolean
@@ -104,6 +106,16 @@ export function GatewaySettings() {
   const [state, setState] = useState<GatewaySettingsState>(EMPTY_STATE)
   const [remoteToken, setRemoteToken] = useState('')
   const [lastTest, setLastTest] = useState<null | string>(null)
+
+  // --- Hermes Cloud (cloud mode) state ---
+  // One portal session powers discovery + the silent per-agent cascade. These
+  // track the cloud panel: whether we're signed in, the discovered agent list,
+  // and which agent is mid-connect.
+  const [cloudSignedIn, setCloudSignedIn] = useState(false)
+  const [cloudSigningIn, setCloudSigningIn] = useState(false)
+  const [cloudAgents, setCloudAgents] = useState<DesktopCloudAgent[]>([])
+  const [cloudDiscover, setCloudDiscover] = useState<CloudDiscoverStatus>('idle')
+  const [cloudConnectingId, setCloudConnectingId] = useState<null | string>(null)
 
   // Connection scope: null = the global/default connection (the original
   // behavior); a profile name = that profile's per-profile remote override, so
@@ -379,6 +391,171 @@ export function GatewaySettings() {
     }
   }
 
+  // --- Hermes Cloud handlers ---
+
+  // Pull the discovered agent list over the shared portal session. Tolerant of
+  // a lapsed session: a needsCloudLogin error flips us back to signed-out.
+  const discoverCloud = async () => {
+    const desktop = window.hermesDesktop
+
+    if (!desktop?.cloud) {
+      return
+    }
+
+    setCloudDiscover('loading')
+
+    try {
+      const { agents } = await desktop.cloud.discover()
+      setCloudAgents(agents)
+      setCloudDiscover('done')
+    } catch (err) {
+      setCloudAgents([])
+      setCloudDiscover('error')
+
+      // A lapsed/absent portal session means we're effectively signed out.
+      if (err && typeof err === 'object' && 'needsCloudLogin' in err) {
+        setCloudSignedIn(false)
+      }
+
+      notifyError(err, g.cloudDiscoverFailed)
+    }
+  }
+
+  // On entering cloud mode (or scope change), read the portal session status and
+  // auto-discover when already signed in, so the picker is populated on open.
+  useEffect(() => {
+    if (state.mode !== 'cloud') {
+      return
+    }
+
+    const desktop = window.hermesDesktop
+
+    if (!desktop?.cloud) {
+      return
+    }
+
+    let cancelled = false
+    desktop.cloud
+      .status()
+      .then(status => {
+        if (cancelled) {
+          return
+        }
+
+        setCloudSignedIn(status.signedIn)
+
+        if (status.signedIn) {
+          void discoverCloud()
+        } else {
+          setCloudAgents([])
+          setCloudDiscover('idle')
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCloudSignedIn(false)
+        }
+      })
+
+    return () => void (cancelled = true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reload on mode/scope change only
+  }, [state.mode, scope])
+
+  const cloudSignIn = async () => {
+    const desktop = window.hermesDesktop
+
+    if (!desktop?.cloud) {
+      return
+    }
+
+    setCloudSigningIn(true)
+
+    try {
+      const result = await desktop.cloud.login()
+      setCloudSignedIn(result.signedIn)
+
+      if (result.signedIn) {
+        await discoverCloud()
+      }
+    } catch (err) {
+      notifyError(err, g.cloudSignInFailed)
+    } finally {
+      setCloudSigningIn(false)
+    }
+  }
+
+  const cloudSignOut = async () => {
+    const desktop = window.hermesDesktop
+
+    if (!desktop?.cloud) {
+      return
+    }
+
+    setCloudSigningIn(true)
+
+    try {
+      await desktop.cloud.logout()
+      setCloudSignedIn(false)
+      setCloudAgents([])
+      setCloudDiscover('idle')
+      notify({ kind: 'success', title: g.cloudSignedOutTitle, message: g.cloudSignedOutMessage })
+    } catch (err) {
+      notifyError(err, g.signOutFailed)
+    } finally {
+      setCloudSigningIn(false)
+    }
+  }
+
+  // Select a discovered agent: drive the silent per-agent cascade (no second
+  // prompt — the shared portal session auto-approves), then persist a cloud-mode
+  // connection pointed at its dashboardUrl and apply it (reconnects the window).
+  const connectCloudAgent = async (agent: DesktopCloudAgent) => {
+    if (!agent.dashboardUrl) {
+      return
+    }
+
+    const desktop = window.hermesDesktop
+
+    if (!desktop?.cloud) {
+      return
+    }
+
+    setCloudConnectingId(agent.id)
+
+    try {
+      const result = await desktop.cloud.agentSignIn(agent.dashboardUrl)
+
+      if (!result.connected) {
+        notify({
+          kind: 'warning',
+          title: t.boot.failure.signInIncompleteTitle,
+          message: t.boot.failure.signInIncompleteMessage
+        })
+
+        return
+      }
+
+      // Persist a cloud-mode connection (remote-shaped, oauth) and reconnect.
+      const next = await desktop.applyConnectionConfig({
+        mode: 'cloud',
+        profile: scope ?? undefined,
+        remoteAuthMode: 'oauth',
+        remoteUrl: agent.dashboardUrl
+      })
+
+      setState(next)
+      notify({ kind: 'success', title: g.cloudConnectedTitle, message: g.cloudConnectedTo(agent.name) })
+    } catch (err) {
+      if (err && typeof err === 'object' && 'needsCloudLogin' in err) {
+        setCloudSignedIn(false)
+      }
+
+      notifyError(err, g.cloudConnectFailed)
+    } finally {
+      setCloudConnectingId(null)
+    }
+  }
+
   const testRemote = async () => {
     if (!canUseRemote) {
       notify({
@@ -465,7 +642,7 @@ export function GatewaySettings() {
         </div>
       ) : null}
 
-      <div className="grid gap-3 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-3">
         <ModeCard
           active={state.mode === 'local'}
           description={g.localDesc}
@@ -473,6 +650,14 @@ export function GatewaySettings() {
           icon={Monitor}
           onSelect={() => setState(current => ({ ...current, mode: 'local' }))}
           title={g.localTitle}
+        />
+        <ModeCard
+          active={state.mode === 'cloud'}
+          description={g.cloudDesc}
+          disabled={state.envOverride}
+          icon={Cloud}
+          onSelect={() => setState(current => ({ ...current, mode: 'cloud' }))}
+          title={g.cloudTitle}
         />
         <ModeCard
           active={state.mode === 'remote'}
@@ -484,6 +669,92 @@ export function GatewaySettings() {
         />
       </div>
 
+      {/* Hermes Cloud panel: one portal sign-in, then a discovered-agent picker
+          whose selection drives the silent per-agent cascade + a cloud
+          connection. Replaces the URL/token form while in cloud mode. */}
+      {state.mode === 'cloud' && !state.envOverride ? (
+        <div className="mt-5 grid gap-1">
+          <ListRow
+            action={
+              cloudSignedIn ? (
+                <div className="flex items-center gap-2">
+                  <Pill tone="primary">
+                    <Check className="size-3" /> {g.cloudSignedIn}
+                  </Pill>
+                  <Button disabled={cloudSigningIn} onClick={() => void cloudSignOut()} variant="outline">
+                    {cloudSigningIn ? <Loader2 className="animate-spin" /> : null}
+                    {g.signOut}
+                  </Button>
+                </div>
+              ) : (
+                <Button disabled={cloudSigningIn} onClick={() => void cloudSignIn()}>
+                  {cloudSigningIn ? <Loader2 className="animate-spin" /> : <LogIn />}
+                  {g.cloudSignIn}
+                </Button>
+              )
+            }
+            description={cloudSignedIn ? g.cloudSignedInDesc : g.cloudNeedsSignIn}
+            title={g.cloudSignInTitle}
+          />
+
+          {cloudSignedIn ? (
+            <div className="mt-3">
+              <div className="mb-2 flex items-center justify-between">
+                <div className="text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+                  {g.cloudAgentsTitle}
+                </div>
+                <Button
+                  disabled={cloudDiscover === 'loading'}
+                  onClick={() => void discoverCloud()}
+                  size="sm"
+                  variant="text"
+                >
+                  {cloudDiscover === 'loading' ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  {g.cloudRefresh}
+                </Button>
+              </div>
+
+              {cloudDiscover === 'loading' ? (
+                <div className="flex items-center gap-2 py-3 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+                  <Loader2 className="size-4 animate-spin" />
+                  {g.cloudLoadingAgents}
+                </div>
+              ) : cloudAgents.length === 0 ? (
+                <div className="flex items-start gap-2 py-3 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+                  <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                  {g.cloudNoAgents}
+                </div>
+              ) : (
+                <div className="grid gap-1">
+                  {cloudAgents.map(agent => (
+                    <ListRow
+                      action={
+                        <Button
+                          disabled={!agent.dashboardUrl || cloudConnectingId !== null}
+                          onClick={() => void connectCloudAgent(agent)}
+                          size="sm"
+                        >
+                          {cloudConnectingId === agent.id ? <Loader2 className="animate-spin" /> : null}
+                          {agent.dashboardUrl
+                            ? cloudConnectingId === agent.id
+                              ? g.cloudConnecting
+                              : g.cloudConnect
+                            : g.cloudAgentProvisioning}
+                        </Button>
+                      }
+                      description={g.cloudStatusLabel(agent.dashboardGatewayState)}
+                      key={agent.id}
+                      title={agent.name}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {state.mode === 'remote' && !state.envOverride ? (
       <div className="mt-5 grid gap-1">
         <ListRow
           action={
@@ -568,28 +839,36 @@ export function GatewaySettings() {
           />
         ) : null}
       </div>
+      ) : null}
 
       {lastTest ? <div className="mt-4 text-xs text-primary">{lastTest}</div> : null}
 
-      <div className="mt-6 flex flex-wrap items-center justify-end gap-4">
-        <Button
-          className="mr-auto"
-          disabled={state.envOverride || testing || !canUseRemote}
-          onClick={() => void testRemote()}
-          size="sm"
-          variant="text"
-        >
-          {testing ? <Loader2 className="animate-spin" /> : null}
-          {g.testRemote}
-        </Button>
-        <Button disabled={state.envOverride || saving} onClick={() => void save(false)} size="sm" variant="textStrong">
-          {g.saveForRestart}
-        </Button>
-        <Button disabled={state.envOverride || saving} onClick={() => void save(true)} size="sm">
-          {saving ? <Loader2 className="animate-spin" /> : null}
-          {g.saveAndReconnect}
-        </Button>
-      </div>
+      {/* Test/Save apply to local + remote. Cloud connects via the agent picker
+          above (which applies a cloud connection on select), so its only
+          bottom-row action would be redundant — hidden in cloud mode. */}
+      {state.mode !== 'cloud' ? (
+        <div className="mt-6 flex flex-wrap items-center justify-end gap-4">
+          {state.mode === 'remote' ? (
+            <Button
+              className="mr-auto"
+              disabled={state.envOverride || testing || !canUseRemote}
+              onClick={() => void testRemote()}
+              size="sm"
+              variant="text"
+            >
+              {testing ? <Loader2 className="animate-spin" /> : null}
+              {g.testRemote}
+            </Button>
+          ) : null}
+          <Button disabled={state.envOverride || saving} onClick={() => void save(false)} size="sm" variant="textStrong">
+            {g.saveForRestart}
+          </Button>
+          <Button disabled={state.envOverride || saving} onClick={() => void save(true)} size="sm">
+            {saving ? <Loader2 className="animate-spin" /> : null}
+            {g.saveAndReconnect}
+          </Button>
+        </div>
+      ) : null}
 
       <div className="mt-6 grid gap-1">
         <ListRow
