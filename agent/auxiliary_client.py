@@ -5242,43 +5242,76 @@ def resolve_vision_provider_client(
                     main_provider,
                 )
             else:
-                # Custom endpoints (``custom`` / ``custom:<name>``) carry no
-                # built-in base_url/api_key — resolve_provider_client("custom")
-                # would return None ("no endpoint credentials found") and the
-                # whole chain would fall through to the aggregators, breaking
-                # vision for every user on a custom provider that has no
-                # separate ``auxiliary.vision`` block.  Recover the live main
-                # endpoint that ``set_runtime_main()`` recorded for this turn so
-                # Step 1 can build a working client.
-                rpc_base_url = None
-                rpc_api_key = None
-                rpc_api_mode = resolved_api_mode
-                if main_provider == "custom" or main_provider.startswith("custom:"):
-                    if _RUNTIME_MAIN_BASE_URL:
-                        rpc_base_url = _RUNTIME_MAIN_BASE_URL
-                        rpc_api_key = _RUNTIME_MAIN_API_KEY or None
-                        rpc_api_mode = resolved_api_mode or _RUNTIME_MAIN_API_MODE or None
-                    else:
-                        # No live runtime recorded (non-gateway caller): fall
-                        # back to resolving the configured custom endpoint.
-                        custom_base, custom_key, custom_mode = _resolve_custom_runtime()
-                        if custom_base:
-                            rpc_base_url = custom_base
-                            rpc_api_key = custom_key
-                            rpc_api_mode = resolved_api_mode or custom_mode or None
-                rpc_client, rpc_model = resolve_provider_client(
-                    main_provider, vision_model,
-                    api_mode=rpc_api_mode,
-                    explicit_base_url=rpc_base_url,
-                    explicit_api_key=rpc_api_key,
-                    is_vision=True)
-                if rpc_client is not None:
-                    logger.info(
-                        "Vision auto-detect: using main provider %s (%s)",
-                        main_provider, rpc_model or vision_model,
+                # When the user has explicitly configured ``auxiliary.vision``
+                # AND the main provider's vision capability is unknown
+                # (``_main_model_supports_vision`` returned True only because
+                # ``_lookup_supports_vision`` returned None), the main provider
+                # is almost certainly text-only and using it will send an image
+                # payload to a model that rejects it — producing a cryptic 400
+                # error (``unknown variant `image_url`, expected `text```,
+                # #31179, #58581).  Skip the main provider and fall through to
+                # the aggregator chain (OpenRouter → Nous).
+                _skip_unknown = False
+                try:
+                    from agent.image_routing import (
+                        _explicit_aux_vision_override,
+                        _lookup_supports_vision,
                     )
-                    return _finalize(
-                        main_provider, rpc_client, rpc_model or vision_model)
+                    from hermes_cli.config import load_config
+                    _cfg = load_config()
+                    if _explicit_aux_vision_override(_cfg):
+                        _supports = _lookup_supports_vision(
+                            main_provider, vision_model, _cfg
+                        )
+                        if _supports is None:
+                            _skip_unknown = True
+                except Exception:
+                    pass
+                if _skip_unknown:
+                    logger.debug(
+                        "Vision auto-detect: main provider %s has unknown "
+                        "vision capability and auxiliary.vision is "
+                        "configured; falling through to aggregator chain",
+                        main_provider,
+                    )
+                else:
+                    # Custom endpoints (``custom`` / ``custom:<name>``) carry no
+                    # built-in base_url/api_key — resolve_provider_client("custom")
+                    # would return None ("no endpoint credentials found") and the
+                    # whole chain would fall through to the aggregators, breaking
+                    # vision for every user on a custom provider that has no
+                    # separate ``auxiliary.vision`` block.  Recover the live main
+                    # endpoint that ``set_runtime_main()`` recorded for this turn so
+                    # Step 1 can build a working client.
+                    rpc_base_url = None
+                    rpc_api_key = None
+                    rpc_api_mode = resolved_api_mode
+                    if main_provider == "custom" or main_provider.startswith("custom:"):
+                        if _RUNTIME_MAIN_BASE_URL:
+                            rpc_base_url = _RUNTIME_MAIN_BASE_URL
+                            rpc_api_key = _RUNTIME_MAIN_API_KEY or None
+                            rpc_api_mode = resolved_api_mode or _RUNTIME_MAIN_API_MODE or None
+                        else:
+                            # No live runtime recorded (non-gateway caller): fall
+                            # back to resolving the configured custom endpoint.
+                            custom_base, custom_key, custom_mode = _resolve_custom_runtime()
+                            if custom_base:
+                                rpc_base_url = custom_base
+                                rpc_api_key = custom_key
+                                rpc_api_mode = resolved_api_mode or custom_mode or None
+                    rpc_client, rpc_model = resolve_provider_client(
+                        main_provider, vision_model,
+                        api_mode=rpc_api_mode,
+                        explicit_base_url=rpc_base_url,
+                        explicit_api_key=rpc_api_key,
+                        is_vision=True)
+                    if rpc_client is not None:
+                        logger.info(
+                            "Vision auto-detect: using main provider %s (%s)",
+                            main_provider, rpc_model or vision_model,
+                        )
+                        return _finalize(
+                            main_provider, rpc_client, rpc_model or vision_model)
 
         # Fall back through aggregators (uses their dedicated vision model,
         # not the user's main model) when main provider has no client.
