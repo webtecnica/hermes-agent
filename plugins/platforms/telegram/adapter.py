@@ -3067,7 +3067,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     ),
                 )
             elif proxy_url:
-                logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
+                safe_url = re.sub(r'://[^@]+@', '://***@', proxy_url)
+                logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, safe_url)
                 request = HTTPXRequest(
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
