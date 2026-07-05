@@ -616,22 +616,34 @@ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
     return None
 
 
+# Default auto-continue freshness window in seconds (1 hour).
+# Mirrors gateway/session.py's _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT.
+# Defined locally so _auto_continue_freshness_window() has zero import
+# dependencies on gateway.session — a lazy import there would cause an
+# ImportError crash-loop on gateway startup if the symbol is ever moved
+# or renamed.
+_AUTO_CONTINUE_FRESHNESS_WINDOW = 60 * 60
+
+
 def _auto_continue_freshness_window() -> float:
     """Return the configured auto-continue freshness window in seconds.
 
-    Thin wrapper that delegates to the canonical implementation in
-    ``gateway.session`` (the single source of truth shared with the
-    routing-time zombie gate in ``get_or_create_session``).  Reads
-    ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from ``config.yaml``
+    Reads ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from ``config.yaml``
     ``agent.gateway_auto_continue_freshness`` at gateway startup, same
-    pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the module default
-    when unset or malformed.  Non-positive values disable the freshness gate
-    (restores the pre-fix "always fresh" behaviour for users who want to opt
-    out).  Kept here so existing call sites and test patches importing it
-    from ``gateway.run`` continue to work.
+    pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to 1 hour when unset
+    or malformed.  Non-positive values disable the freshness gate (restores
+    the pre-fix "always fresh" behaviour for users who want to opt out).
+    Inlined from ``gateway.session.auto_continue_freshness_window`` to
+    eliminate the lazy-import coupling that can crash the gateway on startup
+    if ``gateway.session`` is ever refactored.
     """
-    from gateway.session import auto_continue_freshness_window
-    return auto_continue_freshness_window()
+    raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
+    if raw is None or raw == "":
+        return float(_AUTO_CONTINUE_FRESHNESS_WINDOW)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(_AUTO_CONTINUE_FRESHNESS_WINDOW)
 
 
 def _float_env(name: str, default: float) -> float:
