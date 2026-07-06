@@ -1675,6 +1675,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
+                result_dict["success"] = False
             if not result_dict.get("error"):
                 _mark_verification_stale(task_id, [path], session_id=session_id)
             _update_read_timestamp(path, task_id)
@@ -1697,6 +1698,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning
+                result_dict["success"] = False
             # Always report the ABSOLUTE path actually written, so a wrong-cwd
             # mismatch is visible in the response instead of silently routing
             # the edit to the wrong checkout.
