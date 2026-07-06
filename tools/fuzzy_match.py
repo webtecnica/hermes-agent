@@ -133,6 +133,7 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
             # sequences in source code constants far more often than help.
             effective_new = _maybe_unescape_new_string(
                 new_string, content, matches,
+                unescape_newlines=(strategy_name == "escape_normalized"),
             )
             # Unicode-preservation guard: when strategy 7 (unicode_normalized)
             # matched, the file has Unicode characters (em-dashes, smart quotes,
@@ -282,8 +283,9 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
 
 def _maybe_unescape_new_string(new_string: str,
                                content: str,
-                               matches: List[Tuple[int, int]]) -> str:
-    """Conditionally unescape ``\\t``/``\\r`` in new_string.
+                               matches: List[Tuple[int, int]],
+                               unescape_newlines: bool = False) -> str:
+    """Conditionally unescape ``\\t``/``\\r`` (and optionally ``\\n``) in new_string.
 
     LLMs frequently send the two-character sequences ``\\t`` (backslash + t)
     and ``\\r`` (backslash + r) inside JSON tool-call arguments where they
@@ -298,13 +300,19 @@ def _maybe_unescape_new_string(new_string: str,
     ``sep = "\\t"``) get a backslash+t in the matched region instead of a
     tab, so we leave new_string alone.
 
-    ``\\n`` is intentionally excluded: newlines serialize correctly through
-    JSON and rewriting backslash-n would corrupt escape sequences in
-    string literals far more often than it would help.
+    When *unescape_newlines* is True (used by the ``escape_normalized``
+    strategy), ``\\n`` is also unescaped to actual newlines if the matched
+    region contains real newlines.  ``\\n`` is excluded by default because
+    newlines serialize correctly through JSON and rewriting backslash-n
+    would corrupt escape sequences in string literals far more often than
+    it would help — but when the *pattern* was matched with ``\\n`` → newline
+    normalization, the replacement must match or the file gets literal
+    ``\\n`` text instead of line breaks (#59188).
     """
     # Cheap pre-check — bail out unless new_string actually contains one of
     # the suspect sequences. Keeps the common case free.
-    if "\\t" not in new_string and "\\r" not in new_string:
+    if ("\\t" not in new_string and "\\r" not in new_string
+            and not (unescape_newlines and "\\n" in new_string)):
         return new_string
 
     matched_regions = "".join(content[start:end] for start, end in matches)
@@ -313,6 +321,8 @@ def _maybe_unescape_new_string(new_string: str,
         out = out.replace("\\t", "\t")
     if "\\r" in out and "\r" in matched_regions:
         out = out.replace("\\r", "\r")
+    if unescape_newlines and "\\n" in out and "\n" in matched_regions:
+        out = out.replace("\\n", "\n")
     return out
 
 
