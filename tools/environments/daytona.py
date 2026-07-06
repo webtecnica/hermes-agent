@@ -23,6 +23,7 @@ from tools.environments.file_sync import (
     quoted_rm_command,
     unique_parent_dirs,
 )
+from tools.env_passthrough import is_env_passthrough
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +237,8 @@ class DaytonaEnvironment(BaseEnvironment):
             shell_cmd = f"bash -c {shlex.quote(cmd_string)}"
 
         def exec_fn() -> tuple[str, int]:
-            response = sandbox.process.exec(shell_cmd, timeout=timeout)
+            env = {k: v for k, v in os.environ.items() if is_env_passthrough(k)}
+            response = sandbox.process.exec(shell_cmd, timeout=timeout, env=env)
             return (response.result or "", response.exit_code)
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
