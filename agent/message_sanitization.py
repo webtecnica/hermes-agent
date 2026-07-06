@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -461,6 +461,45 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
     return found
 
 
+# Known keys that indicate a JSON blob is a hallucinated tool-call envelope
+# rather than legitimate assistant content. No registered tool schema defines
+# these as top-level fields in assistant messages (#59291).
+_TOOLCALL_SHAPED_KEYS = frozenset({
+    "action",       # e.g. {"action":"clarify","question":...,"choices":...}
+})
+
+
+def _detect_toolcall_shaped_content(content: str) -> Optional[str]:
+    """Detect and strip tool-call-shaped JSON from assistant content.
+
+    Some local models (particularly Ollama) occasionally emit a JSON object
+    as plain assistant text that mimics a tool-call envelope (e.g.
+    ``{"action": "clarify", "question": ..., "choices": ...}``) instead of
+    issuing a native OpenAI-style ``tool_calls`` array.  This JSON then
+    leaks verbatim to end users (Telegram, WhatsApp, etc.) because the
+    message sanitizer only repairs malformed arguments *inside* an already-
+    recognised ``tool_calls`` block.
+
+    Returns an empty string if the content is entirely a tool-call-shaped
+    JSON blob, or ``None`` if no match.
+    """
+    if not content or not isinstance(content, str):
+        return None
+    stripped = content.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return None
+    try:
+        obj = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    # Check for tell-tale hallucinated tool-call keys at the top level
+    if any(k in obj for k in _TOOLCALL_SHAPED_KEYS):
+        return ""
+    return None
+
+
 __all__ = [
     "_SURROGATE_RE",
     "close_interrupted_tool_sequence",
@@ -474,4 +513,5 @@ __all__ = [
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
+    "_detect_toolcall_shaped_content",
 ]

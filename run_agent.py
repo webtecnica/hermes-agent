@@ -177,6 +177,7 @@ from agent.message_sanitization import (  # noqa: F401
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _sanitize_structure_non_ascii,
+    _detect_toolcall_shaped_content,
 )
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -5779,6 +5780,13 @@ class AIAgent:
             str: Final assistant response
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
+        # Strip hallucinated tool-call JSON from assistant output before it
+        # reaches gateway delivery channels (Telegram, WhatsApp, etc.) (#59291)
+        resp = result.get("final_response")
+        if isinstance(resp, str):
+            sanitized = _detect_toolcall_shaped_content(resp)
+            if sanitized is not None:
+                result["final_response"] = sanitized
         return result["final_response"]
 
     def _run_codex_app_server_turn(
