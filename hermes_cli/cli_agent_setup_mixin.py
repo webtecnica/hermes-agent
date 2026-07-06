@@ -654,6 +654,8 @@ class CLIAgentSetupMixin:
             )
 
         for i, (role, text) in enumerate(entries):
+            if not text:
+                continue
             if role == "user":
                 lines.append("  ● You: ", style=f"dim bold {_session_label_c}")
                 # Show first line inline, indent rest
