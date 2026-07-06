@@ -53,10 +53,21 @@ def _scan_context_content(content: str, filename: str) -> str:
     cloned repo (security research, infra docs).  Content matching is
     BLOCKED at this layer because the file would otherwise enter the
     system prompt verbatim and the user has no chance to intervene.
+
+    When content is blocked, a user-facing warning is also recorded via
+    ``_record_truncation_warning`` so the caller (system_prompt.py) can
+    surface it through ``agent._emit_status()`` — the user sees the
+    notification in chat instead of only in the log file (#59612).
     """
     findings = _scan_for_threats(content, scope="context")
     if findings:
+        msg = (
+            f"\u26a0\ufe0f  Context file {filename} BLOCKED: "
+            f"{', '.join(findings)} \u2014 "
+            f"file content removed from the system prompt!"
+        )
         logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
+        _record_truncation_warning(msg)
         return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
 
     return content
