@@ -133,6 +133,32 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
     if not host:
         return proxy
 
+    # Python's urllib.request.proxy_bypass_environment does NOT support CIDR
+    # notation in NO_PROXY (e.g. "10.0.0.0/24" is never matched). Many other
+    # tools (curl, browsers) do support CIDR ranges, so a user's no_proxy that
+    # works everywhere else silently breaks Hermes' custom provider HTTP clients.
+    # Check for CIDR entries before falling through to the stdlib function.
+    # See https://github.com/NousResearch/hermes-agent/issues/59465
+    try:
+        no_proxy = os.environ.get("no_proxy", "") or os.environ.get("NO_PROXY", "")
+        if no_proxy:
+            for entry in no_proxy.split(","):
+                entry = entry.strip()
+                if "/" in entry:
+                    import ipaddress
+                    import socket
+                    try:
+                        network = ipaddress.ip_network(entry, strict=False)
+                        host_ip = socket.getaddrinfo(
+                            host, 0, socket.AF_INET, socket.SOCK_STREAM
+                        )
+                        if host_ip and ipaddress.ip_address(host_ip[0][4][0]) in network:
+                            return None
+                    except (ValueError, OSError, socket.gaierror):
+                        continue
+    except Exception:
+        pass
+
     try:
         if urllib.request.proxy_bypass_environment(host):
             return None
