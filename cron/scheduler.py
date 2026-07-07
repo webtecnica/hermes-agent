@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -70,6 +71,13 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Fallback chain was exhausted or unavailable. "
             "Full details saved in cron output."
         )
+
+    # Script timeout is a distinct error — check BEFORE the generic
+    # "timed out" / "timeout" match below, because "Script timed out"
+    # would otherwise match the generic branch and be misreported as
+    # a provider timeout.
+    if lower and "script timed out" in lower:
+        return text
 
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
@@ -1999,22 +2007,45 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-        result = subprocess.run(
+        # start_new_session creates a new process group for process group kill
+        # on POSIX. On Windows, this parameter is not supported, so skip it.
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(
             argv,
             capture_output=True,
             text=True,
-            timeout=script_timeout,
             cwd=str(path.parent),
             env=_sanitize_subprocess_env(os.environ.copy()),
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        try:
+            stdout, stderr = proc.communicate(timeout=script_timeout)
+        except subprocess.TimeoutExpired:
+            # Kill entire process group to avoid orphan subprocesses
+            try:
+                if hasattr(os, 'killpg'):
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(pgid, signal.SIGKILL)
+                        proc.wait()
+                else:
+                    proc.kill()
+                    proc.wait()
+            except (OSError, ProcessLookupError):
+                proc.kill()
+                proc.wait()
+            return False, f"Script timed out after {script_timeout}s: {path}"
+        stdout = (stdout or "").strip()
+        stderr = (stderr or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
             from agent.redact import redact_sensitive_text
+
             stdout = redact_sensitive_text(stdout)
             stderr = redact_sensitive_text(stderr)
         except Exception as e:
@@ -2022,8 +2053,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if proc.returncode != 0:
+            parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -2032,8 +2063,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
         return True, stdout
 
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
