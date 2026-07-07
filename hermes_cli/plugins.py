@@ -1312,6 +1312,21 @@ class PluginManager:
             self._discovered = False
             raise
 
+        # Re-register config-file shell hooks after force-reload.
+        # Shell hooks from config.yaml are registered against the plugin
+        # manager's _hooks dict at startup.  A force-reload clears _hooks,
+        # silently dropping them unless we re-run registration here.
+        if force:
+            try:
+                from agent.shell_hooks import re_register_config_hooks
+
+                re_register_config_hooks()
+            except Exception:
+                logger.debug(
+                    "shell-hook re-registration after force-reload failed",
+                    exc_info=True,
+                )
+
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         manifests: List[PluginManifest] = []
