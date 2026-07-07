@@ -3302,6 +3302,21 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Smart model router — automatically selects the best model/provider
+    # based on task type and current pricing.  Task categories: chat, vision,
+    # code, analysis.  Rules are evaluated in order; the first match whose
+    # provider is available and whose constraints are satisfied is selected.
+    # When no rule matches, the agent falls back to its current model.
+    "model_router": {
+        "enabled": False,
+        "rules": [
+            {"task": "chat", "provider": ""},
+            {"task": "vision", "provider": ""},
+            {"task": "code", "provider": ""},
+            {"task": "analysis", "provider": ""},
+        ],
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }
