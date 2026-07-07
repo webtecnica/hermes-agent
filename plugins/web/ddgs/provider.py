@@ -79,6 +79,13 @@ class DDGSWebSearchProvider(WebSearchProvider):
         ``hermes tools`` paint.
         """
         try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("search.ddgs", prompt=False)
+        except ImportError:
+            pass
+        except Exception:  # noqa: BLE001
+            return False
+        try:
             import ddgs  # noqa: F401
 
             return True
@@ -98,6 +105,16 @@ class DDGSWebSearchProvider(WebSearchProvider):
         wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung search cannot
         block the shared agent loop indefinitely (#36776).
         """
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("search.ddgs", prompt=False)
+        except ImportError:
+            pass
+        except Exception:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": "ddgs package is not available — ensure failed",
+            }
         try:
             import ddgs  # type: ignore  # noqa: F401 — availability probe
         except ImportError:
