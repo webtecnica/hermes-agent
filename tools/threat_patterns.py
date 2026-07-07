@@ -233,7 +233,50 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     # since normalisation can strip some of these codepoints.
     char_set = set(content)
     invisible_hits = char_set & INVISIBLE_CHARS
+    filtered_hits: set[str] = set()
     for ch in invisible_hits:
+        if ch == '\u200d':
+            # ZWJ is only a threat if NOT joining emoji characters.
+            # Check if the surrounding characters are emoji-like.
+            # Use Unicode category + codepoint heuristics since
+            # unicodedata.name() does not expose the Emoji property.
+            import unicodedata as _ud
+
+            def _is_emoji_like(c: str) -> bool:
+                if not c:
+                    return False
+                cp = ord(c)
+                # Supplementary Multilingual Plane (>U+FFFF) — almost all emoji
+                if cp >= 0x10000:
+                    return True
+                # Emoji presentation variation selector
+                if cp == 0xFE0F:
+                    return True
+                # Symbol Other (So) — covers most legacy emoji (☀★🐱⬛)
+                return _ud.category(c) == 'So'
+
+            # If every occurrence of U+200D in content is between two
+            # emoji-like characters, it's a legitimate emoji ZWJ sequence.
+            is_legitimate_emoji = True
+            idx = 0
+            while True:
+                idx = content.find('\u200d', idx)
+                if idx == -1:
+                    break
+                before = content[idx - 1] if idx > 0 else ''
+                after = content[idx + 1] if idx < len(content) - 1 else ''
+                if not (before and after):
+                    is_legitimate_emoji = False
+                    break
+                if not (_is_emoji_like(before) and _is_emoji_like(after)):
+                    is_legitimate_emoji = False
+                    break
+                idx += 1
+            if is_legitimate_emoji:
+                continue  # skip — legitimate emoji ZWJ sequence
+        filtered_hits.add(ch)
+
+    for ch in filtered_hits:
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
 
     # Normalise to NFKC so full-width / compatibility Unicode variants
