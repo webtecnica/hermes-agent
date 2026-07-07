@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -117,6 +118,53 @@ _REFERENCE_SYSTEM_PROMPT = (
     "aggregator, not an answer shown to the user."
 )
 
+
+
+# Regex patterns for sensitive-data redaction in MoA reference outputs.
+# Order matters: more specific (API keys, tokens) patterns come first to
+# prevent patterns like phone numbers from partially matching inside keys.
+_PRIVACY_PATTERNS: list[tuple[str, str]] = [
+    # API keys / tokens — long alphanumeric prefixed keys.
+    # OpenAI: sk-proj-..., sk-... (hyphens or underscores).
+    (r"\bsk(?:-[a-zA-Z0-9]+)+[a-zA-Z0-9]{8,}\b", "[REDACTED API KEY]"),
+    # Other common prefixes: xai-..., fk-..., pplx-..., grok-..., etc.
+    # Accept both hyphen and underscore separators.
+    (r"\b(?:xai|fk|pplx|grok|ghp|gho|ghu|ghs|ghr)[-_][a-zA-Z0-9]{20,}", "[REDACTED API KEY]"),
+    # HuggingFace token (hf_...).
+    (r"\bhf_[a-zA-Z0-9]{20,}", "[REDACTED API KEY]"),
+    # AWS access key ID (starts with AKIA, then 16+ uppercase alphanumeric chars).
+    (r"\bAKIA[0-9A-Z]{16,}\b", "[REDACTED API KEY]"),
+    # JWT / base64-encoded tokens (starts with eyJ...).
+    (r"\beyJ[a-zA-Z0-9_-]{10,}\.\S+", "[REDACTED TOKEN]"),
+    # Generic catch-all for secrets: api_key=..., secret=..., password=...
+    # Case-insensitive to catch SECRET=, ApiKey=, etc.
+    (r"(?i)\b(?:api[_-]?key|secret|password|token|apikey)[=:]\s*[a-zA-Z0-9_\-]{16,}", "[REDACTED SECRET]"),
+    # Email addresses.
+    (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "[REDACTED EMAIL]"),
+    # US/NA phone numbers: +1 (555) 123-4567, 555-123-4567, etc.
+    (
+        r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}",
+        "[REDACTED PHONE]",
+    ),
+    # Generic international phone numbers: +44 20 7946 0958, etc.
+    # Requires at least 3 digit groups after the country code to avoid
+    # matching short digit sequences inside other tokens.
+    (r"\+\d{1,3}(?:[\s.-]\d{2,4}){3,4}\b", "[REDACTED PHONE]"),
+]
+
+
+def _redact_sensitive_data(text: str) -> str:
+    """Redact emails, phone numbers, and API keys/tokens from text.
+
+    Applies all patterns in ``_PRIVACY_PATTERNS`` sequentially via
+    ``re.sub``. Returns the redacted text.  Non-string inputs are
+    returned unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+    for pattern, replacement in _PRIVACY_PATTERNS:
+        text = re.sub(pattern, replacement, text)
+    return text
 
 
 def _slot_label(slot: dict[str, str]) -> str:
@@ -603,6 +651,19 @@ def aggregate_moa_context(
         max_tokens=max_tokens,
     )
 
+    # Apply privacy redaction when configured.
+    try:
+        from hermes_cli.config import load_config
+
+        _moa_config = load_config().get("moa") or {}
+        if _moa_config.get("privacy_filter", False):
+            reference_outputs = [
+                (label, _redact_sensitive_data(text), acct)
+                for label, text, acct in reference_outputs
+            ]
+    except Exception:
+        pass
+
     joined = "\n\n".join(
         f"Reference {idx} — {label}:\n{text}"
         for idx, (label, text, _usage) in enumerate(reference_outputs, start=1)
@@ -956,6 +1017,13 @@ class MoAChatCompletions:
                     aggregator=_slot_label(aggregator),
                     ref_count=_ref_count,
                 )
+
+        # Apply privacy redaction to reference outputs when configured.
+        if reference_outputs and load_config().get("moa", {}).get("privacy_filter", False):
+            reference_outputs = [
+                (label, _redact_sensitive_data(text), acct)
+                for label, text, acct in reference_outputs
+            ]
 
         agg_messages = [dict(m) for m in messages]
         if reference_outputs:

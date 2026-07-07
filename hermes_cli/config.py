@@ -2298,6 +2298,10 @@ DEFAULT_CONFIG = {
         # override the output directory.
         "save_traces": False,
         "trace_dir": "",
+        # When true, reference model outputs have sensitive data (emails,
+        # phone numbers, API keys) automatically redacted via regex before
+        # being passed to the aggregator. Off by default.
+        "privacy_filter": False,
         "presets": {
             "default": {
                 "reference_models": [

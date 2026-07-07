@@ -193,6 +193,7 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "reference_max_tokens": active.get("reference_max_tokens"),
         "fanout": active.get("fanout", "per_iteration"),
         "enabled": active["enabled"],
+        "privacy_filter": bool(raw.get("privacy_filter", False)),
     }
 
 
