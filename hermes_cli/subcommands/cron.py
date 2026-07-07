@@ -159,5 +159,27 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+    # cron executions
+    cron_exec = cron_subparsers.add_parser(
+        "executions", help="Manage cron job execution history"
+    )
+    exec_subparsers = cron_exec.add_subparsers(dest="cron_exec_command")
+
+    # executions prune
+    exec_prune = exec_subparsers.add_parser(
+        "prune", help="Delete execution output older than N days"
+    )
+    exec_prune.add_argument(
+        "--older-than", required=True,
+        help="Age threshold (e.g. '7d', '30d', '90d')"
+    )
+
+    # executions clear
+    exec_clear = exec_subparsers.add_parser(
+        "clear", help="Clear execution history for a job or all jobs"
+    )
+    exec_clear.add_argument("--job-id", help="Clear history for a specific job ID")
+    exec_clear.add_argument("--all", action="store_true", help="Clear all execution history")
+
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

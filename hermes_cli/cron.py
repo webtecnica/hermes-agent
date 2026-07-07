@@ -451,6 +451,70 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
+    if subcmd == "executions":
+        return _cron_executions(args)
+
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick|executions]")
     sys.exit(1)
+
+
+def _cron_executions(args):
+    """Handle cron executions subcommands (prune/clear)."""
+    import shutil
+    import time
+    import re
+
+    cron_output_dir = Path.home() / ".hermes" / "cron" / "output"
+    if not cron_output_dir.exists():
+        print("No cron execution history found.")
+        return 0
+
+    subcmd = getattr(args, "cron_exec_command", None)
+
+    if subcmd == "prune":
+        # Parse --older-than (e.g. "7d", "30d")
+        match = re.match(r"^(\d+)([dhms])$", args.older_than)
+        if not match:
+            print(f"Invalid format: {args.older_than}. Use e.g. '7d', '30d'.")
+            return 1
+        value, unit = int(match.group(1)), match.group(2)
+        multipliers = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+        cutoff = time.time() - (value * multipliers[unit])
+
+        deleted = 0
+        for job_dir in sorted(cron_output_dir.iterdir()):
+            if job_dir.is_dir():
+                for f in sorted(job_dir.iterdir()):
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        deleted += 1
+                # Remove empty job directories
+                if not any(job_dir.iterdir()):
+                    job_dir.rmdir()
+
+        print(f"Deleted {deleted} execution file(s) older than {args.older_than}.")
+        return 0
+
+    if subcmd == "clear":
+        if args.all:
+            for job_dir in sorted(cron_output_dir.iterdir()):
+                if job_dir.is_dir():
+                    shutil.rmtree(job_dir)
+            print("Cleared all cron execution history.")
+            return 0
+
+        if args.job_id:
+            job_dir = cron_output_dir / args.job_id
+            if not job_dir.exists():
+                print(f"No execution history found for job '{args.job_id}'.")
+                return 1
+            shutil.rmtree(job_dir)
+            print(f"Cleared execution history for job '{args.job_id}'.")
+            return 0
+
+        print("Specify --job-id <id> or --all.")
+        return 1
+
+    print("Usage: hermes cron executions [prune --older-than 7d | clear --job-id <id> | clear --all]")
+    return 1
