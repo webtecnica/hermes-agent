@@ -132,7 +132,20 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
         or PureWindowsPath(candidate).is_absolute()
         or PureWindowsPath(candidate).drive
     ):
-        return "Skill name must be a relative path within the skills directory."
+        # Allow absolute paths that resolve within trusted directories.
+        # Cron jobs legitimately store absolute paths for skills outside
+        # ~/.hermes/skills/ (e.g. symlinked trading-skills repos or
+        # profile-scoped directories).
+        from hermes_constants import get_hermes_home
+
+        _hermes_home = get_hermes_home()
+        _trusted_roots = (
+            str(_hermes_home / "skills") + "/",
+            str(_hermes_home / "profiles") + "/",
+        )
+        resolved = str(Path(candidate).resolve())
+        if not resolved.startswith(_trusted_roots):
+            return "Skill name must be a relative path within the skills directory."
     if has_traversal_component(candidate):
         return "Skill name cannot contain '..' path traversal components."
     return None
