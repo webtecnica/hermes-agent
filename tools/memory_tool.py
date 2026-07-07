@@ -828,7 +828,7 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
 
     Only the mutating actions (add/replace/remove) are gated.
     """
-    if action not in {"add", "replace", "remove"}:
+    if action not in {"add", "replace", "remove", "audit"}:
         return None
 
     try:
@@ -991,6 +991,24 @@ def memory_tool(
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
+
+    # --- Audit (read-only) ------------------------------------------------
+    if action == "audit":
+        entries = store._entries_for(target)
+        char_limit = store._char_limit(target)
+        char_count = store._char_count(target)
+        result = {
+            "target": target,
+            "usage": f"{char_count}/{char_limit} chars",
+            "usage_pct": f"{int(char_count / char_limit * 100) if char_limit else 0}%",
+            "entry_count": len(entries),
+            "entries": [
+                {"idx": i, "chars": len(e), "preview": e[:80]}
+                for i, e in enumerate(entries)
+            ],
+        }
+        return json.dumps(result, ensure_ascii=False)
+
     # Validate required params BEFORE the gate so an invalid write is rejected
     # immediately instead of being staged and only failing at approve time.
     if action == "add" and not content:
@@ -1084,7 +1102,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "audit"],
                 "description": "The action to perform (single-op shape). Omit when using 'operations'."
             },
             "target": {
@@ -1110,7 +1128,7 @@ MEMORY_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                        "action": {"type": "string", "enum": ["add", "replace", "remove", "audit"]},
                         "content": {"type": "string", "description": "Entry content for add/replace."},
                         "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
                     },
