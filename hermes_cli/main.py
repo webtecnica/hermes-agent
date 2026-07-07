@@ -5873,6 +5873,8 @@ def _find_stale_dashboard_pids(
                     if (
                         any(p in current_cmd for p in patterns)
                         and int(pid_str) != self_pid
+                        and "--status" not in current_cmd
+                        and "--stop" not in current_cmd
                     ):
                         try:
                             dashboard_pids.append(int(pid_str))
@@ -5904,7 +5906,12 @@ def _find_stale_dashboard_pids(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if (
+                        any(p in command for p in patterns)
+                        and pid != self_pid
+                        and "--status" not in command
+                        and "--stop" not in command
+                    ):
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
