@@ -223,6 +223,7 @@ def _run_reference(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    custom_providers: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model and return ``(label, text, usage)``.
 
@@ -243,16 +244,34 @@ def _run_reference(
     a MoA turn's token spend — is invisible to cost tracking, which only ever
     saw the aggregator's usage.
 
+    ``custom_providers``: optional list of custom-provider config entries.
+    When the reference slot uses a ``custom`` or ``custom:xxx`` provider,
+    the matching ``extra_body`` (if any) is forwarded to the API call so
+    provider-specific knobs (e.g. ``enable_thinking: false``) reach the
+    reference model just as they would the main agent.
+
     Never raises: a failed reference becomes a labelled note so the aggregator
     can still act with partial context. Designed to run inside a thread pool —
     ``call_llm`` is synchronous/blocking, so threads (not asyncio) are the right
     concurrency primitive, mirroring ``delegate_task``'s batch fan-out.
     """
+    from agent.agent_init import _custom_provider_extra_body_for_agent
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
 
     label = _slot_label(slot)
     runtime = _slot_runtime(slot)
     try:
+        # Resolve extra_body from custom_providers config for this reference
+        # slot.  If the slot's provider is ``custom`` or ``custom:xxx``, the
+        # matched provider entry's ``extra_body`` (e.g. ``enable_thinking:
+        # false``) is forwarded so reasoning models used as advisors receive
+        # the same provider-specific request fields the main agent would.
+        reference_extra_body = _custom_provider_extra_body_for_agent(
+            provider=slot.get("provider") or runtime.get("provider") or "",
+            model=slot.get("model") or runtime.get("model") or "",
+            base_url=runtime.get("base_url") or "",
+            custom_providers=custom_providers or [],
+        )
         # Prepend the advisory-role system prompt so the reference understands
         # it is analyzing state for an aggregator, not acting on the task. The
         # trimmed view (_reference_messages) already strips the agent's own
@@ -275,6 +294,7 @@ def _run_reference(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_body=reference_extra_body,
             **runtime,
         )
         usage = CanonicalUsage()
@@ -339,6 +359,7 @@ def _run_references_parallel(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    custom_providers: list[dict[str, Any]] | None = None,
 ) -> list[tuple[str, str, Any]]:
     """Fan out all reference models in parallel, returning outputs in order.
 
@@ -375,6 +396,7 @@ def _run_references_parallel(
                     ref_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    custom_providers=custom_providers,
                 )
             ] = idx
         # Collect every reference before returning — the aggregator needs the
@@ -577,6 +599,7 @@ def aggregate_moa_context(
     temperature: float | None = None,
     aggregator_temperature: float | None = None,
     max_tokens: int | None = None,
+    custom_providers: list[dict[str, Any]] | None = None,
 ) -> str:
     """Run configured reference models and synthesize their advice.
 
@@ -593,6 +616,11 @@ def aggregate_moa_context(
     like max_tokens, ``call_llm`` omits temperature when None so the
     provider default applies — matching single-model agent behavior. Presets
     may still pin explicit values.
+
+    ``custom_providers``: optional list of custom-provider config entries
+    forwarded to each reference-model call so that provider-specific
+    ``extra_body`` fields (e.g. ``enable_thinking: false``) reach reference
+    models that use custom providers.
     """
     reference_outputs: list[tuple[str, str, Any]] = []
     ref_messages = _reference_messages(api_messages)
@@ -601,6 +629,7 @@ def aggregate_moa_context(
         ref_messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        custom_providers=custom_providers,
     )
 
     joined = "\n\n".join(
