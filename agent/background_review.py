@@ -158,14 +158,21 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
 _MEMORY_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
-    "1. Has the user revealed things about themselves — their persona, desires, "
+    "Review the conversation above and manage the memory system.\n\n"
+    "Phase 1 — Audit: First, call memory(action='audit') to see current entries.\n"
+    "Classify each entry as either:\n"
+    "  \u2022 DURABLE FACT \u2014 user preference, environment detail, core rule, stable convention\n"
+    "  \u2022 TASK RESIDUE \u2014 one-off task state, completed work, temporary context that is now stale\n\n"
+    "Phase 2 \u2014 Clean: Remove or consolidate task residue to free space:\n"
+    "  \u2022 Task residue \u2192 memory(action='remove', old_text='...')\n"
+    "  \u2022 Repeated/mergable entries \u2192 memory(action='replace', ...) to consolidate\n\n"
+    "Phase 3 \u2014 Save: Then review the conversation for NEW durable facts:\n"
+    "  1. Has the user revealed things about themselves \u2014 their persona, desires, "
     "preferences, or personal details worth remembering?\n"
-    "2. Has the user expressed expectations about how you should behave, their work "
-    "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "  2. Has the user expressed expectations about how you should behave, their work "
+    "style, or ways they want you to operate?\n"
+    "If so, save using memory(action='add', ...).\n\n"
+    "If nothing changed, just say 'Nothing to update.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
