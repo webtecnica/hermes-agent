@@ -1,0 +1,9 @@
+name: float16
+version: 1.0.0
+description: "Float16 semantic memory — automatic turn capture as float16 vector embeddings with local similarity search."
+pip_dependencies:
+  - numpy>=1.24.0
+  - sentence-transformers>=2.2.0
+requires_env: []
+hooks:
+  - on_session_end
