@@ -418,6 +418,17 @@ class MemoryStore:
                 # If all matches are identical (exact duplicates), operate on the first one
                 unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
+                    # Check if new_content already exists verbatim among matched entries
+                    if any(e == new_content for _, e in matches):
+                        return {
+                            "success": False,
+                            "error": (
+                                f"'new_content' already exists verbatim among the matched entries. "
+                                f"Use 'remove' to delete stale entries, then try 'add' instead, or include "
+                                f"more identifying text in 'old_text' to disambiguate."
+                            ),
+                            "matches": self._previews([e for _, e in matches]),
+                        }
                     previews = self._previews([e for _, e in matches])
                     return {
                         "success": False,
