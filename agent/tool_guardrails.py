@@ -358,6 +358,54 @@ class ToolCallGuardrailController:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
 
+        # Content-hash based repetition detection: catches loops where args
+        # vary but result content is identical (e.g. fetching a consistently-404
+        # URL with different query params).  Also catches multimodal results
+        # whose str() differs every call due to base64 payloads but whose
+        # parsed content is the same.
+        content_hash = _result_hash(result)
+        if content_hash == self._last_content_hash:
+            content_repeat = self._content_seen.get(content_hash, 0) + 1
+            self._content_seen[content_hash] = content_repeat
+        else:
+            content_repeat = 1
+            self._content_seen.clear()
+            self._content_seen[content_hash] = content_repeat
+        self._last_content_hash = content_hash
+
+        # Content-hash repetition fires first (broader detection —
+        # catches loops across varying args).
+        if self.config.hard_stop_enabled and content_repeat >= self.config.no_progress_block_after:
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="content_repetition_block",
+                message=(
+                    f"Blocked {tool_name}: this call returned the same content "
+                    f"{content_repeat} times. Stop repeating calls that produce "
+                    "identical results; use the result already provided."
+                ),
+                tool_name=tool_name,
+                count=content_repeat,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
+
+        if self.config.warnings_enabled and content_repeat >= self.config.no_progress_warn_after:
+            decision = ToolGuardrailDecision(
+                action="warn",
+                code="content_repetition_warning",
+                message=(
+                    f"{tool_name} returned the same content {content_repeat} times. "
+                    "Calls are producing identical results; change strategy "
+                    "instead of repeating."
+                ),
+                tool_name=tool_name,
+                count=content_repeat,
+                signature=signature,
+            )
+            return decision
+
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(
                 action="warn",
