@@ -252,6 +252,18 @@ def _run_reference(
 
     label = _slot_label(slot)
     runtime = _slot_runtime(slot)
+    # If _slot_runtime couldn't resolve an api_key for a custom provider
+    # (resolve_runtime_provider("custom") without explicit_base_url), fall
+    # back to the user's custom_providers config.
+    if not runtime.get("api_key") and custom_providers:
+        _slot_provider = slot.get("provider", "")
+        _slot_provider_norm = _slot_provider.removeprefix("custom:").strip()
+        for _cp in custom_providers:
+            _cp_name = (_cp.get("name") or "").strip()
+            _cp_api_key = _cp.get("api_key")
+            if _cp_api_key and (_cp_name == _slot_provider or (_slot_provider_norm and _cp_name == _slot_provider_norm)):
+                runtime = dict(runtime, api_key=_cp_api_key)
+                break
     try:
         # Prepend the advisory-role system prompt so the reference understands
         # it is analyzing state for an aggregator, not acting on the task. The
