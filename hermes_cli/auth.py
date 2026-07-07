@@ -5566,8 +5566,19 @@ def resolve_nous_runtime_credentials(
             refresh_token = state.get("refresh_token")
 
             if not isinstance(access_token, str) or not access_token:
-                raise AuthError("No access token found for Nous Portal login.",
-                                provider="nous", relogin_required=True)
+                # Attempt recovery from shared store before giving up
+                with _nous_shared_store_lock(timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)):
+                    if _merge_shared_nous_oauth_state(state):
+                        access_token = state.get("access_token")
+                        refresh_token = state.get("refresh_token")
+                        _persist_state("runtime_shared_merge_on_empty_token")
+
+            if not isinstance(access_token, str) or not access_token:
+                raise AuthError(
+                    "No access token found for Nous Portal login.",
+                    provider="nous",
+                    relogin_required=True,
+                )
 
             invoke_jwt_status = _nous_invoke_jwt_status(
                 access_token,
