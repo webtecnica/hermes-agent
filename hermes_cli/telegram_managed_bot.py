@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import select
 import sys
 import time
 import urllib.parse
@@ -79,12 +80,82 @@ def _parse_owner_user_id(value: object) -> int | None:
     return None
 
 
+def _detect_terminal_theme() -> str:
+    """Detect the terminal's background color theme (light or dark).
+
+    Uses OSC 11 escape sequence query to request the background color from
+    the terminal emulator (works in most modern terminals like iTerm2,
+    GNOME Terminal, xterm, etc.). Falls back to the ``COLORFGBG`` env var
+    (set by rxvt, Konsole, and some other terminals).
+
+    Returns:
+        ``'light'`` if the terminal appears to have a light background,
+        ``'dark'`` if it appears to have a dark background,
+        ``'unknown'`` if detection is not possible.
+    """
+    # --- OSC 11 query: request terminal background color ---
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            query = b"\x1b]11;?\x1b\\"
+            sys.stdout.buffer.write(query)
+            sys.stdout.buffer.flush()
+
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if ready:
+                response = sys.stdin.buffer.read(64)
+                # Parse formats like:
+                #   ESC ] 11 ; rgb:ffff/ffff/ffff ESC \     (4 hex digits)
+                #   ESC ] 11 ; rgb:ff/ff/ff ESC \            (2 hex digits)
+                #   ESC ] 11 ; rgba:ffff/ffff/ffff/ffff ESC \ (with alpha)
+                m = re.search(
+                    rb"11;rgb(?:a)?:([0-9a-fA-F]{2,4})/"
+                    rb"([0-9a-fA-F]{2,4})/"
+                    rb"([0-9a-fA-F]{2,4})",
+                    response,
+                )
+                if m:
+                    r = int(m.group(1)[:2], 16)
+                    g = int(m.group(2)[:2], 16)
+                    b = int(m.group(3)[:2], 16)
+                    # Perceived brightness (ITU-R BT.601 luma coefficients)
+                    brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+                    return "light" if brightness > 0.5 else "dark"
+        except Exception:
+            pass
+
+    # --- Fallback: COLORFGBG env var ---
+    colorfgbg = os.environ.get("COLORFGBG", "")
+    if colorfgbg:
+        parts = colorfgbg.split(";")
+        if len(parts) >= 2:
+            bg = parts[-1]  # Last part is the background color
+            if bg != "default":
+                try:
+                    bg_num = int(bg)
+                    # Terminal color codes: 0=black, 1-6=colors, 7=white, 8-255=light
+                    return "light" if bg_num >= 7 else "dark"
+                except ValueError:
+                    pass
+
+    return "unknown"
+
+
 def render_qr_terminal(url: str) -> str:
-    """Render a URL as a QR code string suitable for terminal output."""
+    """Render a URL as a QR code string suitable for terminal output.
+
+    Automatically detects the terminal's background color theme (light/dark)
+    via OSC 11 query and selects the appropriate inversion for best contrast.
+    Falls back to light-terminal rendering when the theme cannot be detected.
+    """
     try:
         import io
 
         import qrcode  # type: ignore[import-untyped]
+
+        theme = _detect_terminal_theme()
+        # invert=True: dark blocks on light background (light terminals)
+        # invert=False: light blocks on dark background (dark terminals)
+        invert = theme != "dark"
 
         qr = qrcode.QRCode(
             version=None,
@@ -96,7 +167,7 @@ def render_qr_terminal(url: str) -> str:
         qr.make(fit=True)
 
         buf = io.StringIO()
-        qr.print_ascii(out=buf, invert=True)
+        qr.print_ascii(out=buf, invert=invert)
         return buf.getvalue()
     except ImportError:
         return ""
