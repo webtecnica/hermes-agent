@@ -1272,12 +1272,13 @@ clone_repo() {
         # GIT_SSH_COMMAND disables interactive prompts and sets a short timeout
         # so SSH fails fast instead of hanging when no key is configured.
         log_info "Trying SSH clone..."
-        if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
-           git clone --depth 1 --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
+        GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
+            git clone --depth 1 --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null || true
+        if [ -d "$INSTALL_DIR/.git" ]; then
             log_success "Cloned via SSH"
         else
             rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
-            log_info "SSH failed, trying HTTPS..."
+            log_info "SSH clone did not produce a valid repository, falling back to HTTPS..."
             if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
                 log_success "Cloned via HTTPS"
             else
@@ -2687,7 +2688,7 @@ _electron_dir() {
     fi
 }
 
-# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.mjs).
+# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.cjs).
 _electron_dist_ok() {
     local install_dir="$1"
     local electron_dir
@@ -3067,7 +3068,7 @@ run_stage_protocol() {
     # before emitting the frame and the Rust/Electron parser would see "no
     # result frame" instead of a clean {ok:false} contract response.
     set +e
-    ( run_stage_body "$stage" )
+    ( set -e; run_stage_body "$stage" )
     local code=$?
     set -e
 
