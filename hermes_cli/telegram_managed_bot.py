@@ -94,48 +94,73 @@ def _detect_terminal_theme() -> str:
         ``'unknown'`` if detection is not possible.
     """
     # --- OSC 11 query: request terminal background color ---
+    # Hardened probe with termios lifecycle, SSH exemption, and TCSAFLUSH cleanup.
     if sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            query = b"\x1b]11;?\x1b\\"
-            sys.stdout.buffer.write(query)
-            sys.stdout.buffer.flush()
+        if not any(os.environ.get(v) for v in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+            try:
+                import termios
+                import tty
 
-            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if ready:
-                response = sys.stdin.buffer.read(64)
-                # Parse formats like:
-                #   ESC ] 11 ; rgb:ffff/ffff/ffff ESC \     (4 hex digits)
-                #   ESC ] 11 ; rgb:ff/ff/ff ESC \            (2 hex digits)
-                #   ESC ] 11 ; rgba:ffff/ffff/ffff/ffff ESC \ (with alpha)
-                m = re.search(
-                    rb"11;rgb(?:a)?:([0-9a-fA-F]{2,4})/"
-                    rb"([0-9a-fA-F]{2,4})/"
-                    rb"([0-9a-fA-F]{2,4})",
-                    response,
-                )
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+            except Exception:
+                old = None
+            try:
+                if old is not None:
+                    try:
+                        tty.setcbreak(fd)
+                    except Exception:
+                        pass
+                try:
+                    sys.stdout.write("\x1b]11;?\x1b\\")
+                    sys.stdout.flush()
+                except Exception:
+                    return "unknown"
+                import select
+
+                deadline = time.monotonic() + 0.1
+                buf = b""
+                while time.monotonic() < deadline:
+                    r, _, _ = select.select([fd], [], [], deadline - time.monotonic())
+                    if not r:
+                        continue
+                    try:
+                        chunk = os.read(fd, 64)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\x1b\\" in buf or b"\x07" in buf:
+                        break
+                m = re.search(rb"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", buf)
                 if m:
-                    r = int(m.group(1)[:2], 16)
-                    g = int(m.group(2)[:2], 16)
-                    b = int(m.group(3)[:2], 16)
-                    # Perceived brightness (ITU-R BT.601 luma coefficients)
+
+                    def norm(h: bytes) -> int:
+                        v = int(h, 16)
+                        bits = len(h) * 4
+                        return (v * 255) // ((1 << bits) - 1) if bits else 0
+
+                    r, g, b = norm(m.group(1)), norm(m.group(2)), norm(m.group(3))
                     brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
                     return "light" if brightness > 0.5 else "dark"
-        except Exception:
-            pass
+            finally:
+                if old is not None:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+                    except Exception:
+                        pass
 
     # --- Fallback: COLORFGBG env var ---
-    colorfgbg = os.environ.get("COLORFGBG", "")
-    if colorfgbg:
-        parts = colorfgbg.split(";")
-        if len(parts) >= 2:
-            bg = parts[-1]  # Last part is the background color
-            if bg != "default":
-                try:
-                    bg_num = int(bg)
-                    # Terminal color codes: 0=black, 1-6=colors, 7=white, 8-255=light
-                    return "light" if bg_num >= 7 else "dark"
-                except ValueError:
-                    pass
+    cfgbg = (os.environ.get("COLORFGBG") or "").strip()
+    if cfgbg:
+        last = cfgbg.split(";")[-1] if ";" in cfgbg else cfgbg
+        if last.isdigit():
+            bg = int(last)
+            if bg in {7, 15}:
+                return "light"
+            if 0 <= bg < 16:
+                return "dark"
 
     return "unknown"
 
