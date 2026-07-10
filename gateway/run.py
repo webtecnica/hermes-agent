@@ -12122,6 +12122,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                # Goal continuation: streaming path skipped the outer
+                # _post_turn_goal_continuation call (the non-streaming
+                # path at _handle_message level).  Fire it here so the
+                # goal judge evaluates every turn, not just non-streaming ones.
+                if response and response.strip():
+                    try:
+                        _g_session_entry = self.session_store.get_or_create_session(source)
+                    except Exception:
+                        _g_session_entry = None
+                    if _g_session_entry is not None:
+                        await self._post_turn_goal_continuation(
+                            session_entry=_g_session_entry,
+                            source=source,
+                            final_response=response,
+                        )
                 return None
 
             return response
