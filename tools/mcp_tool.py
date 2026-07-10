@@ -499,7 +499,16 @@ def _is_method_not_found_error(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     if not msg:
-        return False
+        # Empty message: could be a dead MCP server process (EOFError,
+        # ConnectionResetError, BrokenPipeError, or an McpError with no
+        # message). Treat as potential "method not found" so the keepalive
+        # probe falls back to list_tools instead of triggering a reconnect
+        # loop.  TimeoutError is the one builtin empty-str exception that
+        # is clearly NOT "ping unsupported" — a timeout is a real liveness
+        # failure.
+        if isinstance(exc, TimeoutError):
+            return False
+        return True
     return (
         str(_JSONRPC_METHOD_NOT_FOUND) in msg
         or "method not found" in msg
@@ -1945,6 +1954,18 @@ class MCPServerTask:
                             "triggering reconnect: %s",
                             self.name, exc,
                         )
+                        self._keepalive_reconnect_count = getattr(
+                            self, '_keepalive_reconnect_count', 0
+                        ) + 1
+                        if self._keepalive_reconnect_count > 3:
+                            logger.error(
+                                "MCP server '%s': keepalive reconnect loop "
+                                "detected (%d attempts), shutting down",
+                                self.name,
+                                self._keepalive_reconnect_count,
+                            )
+                            self._shutdown_event.set()
+                            break
                         self._reconnect_event.set()
                         break
         finally:
