@@ -112,6 +112,12 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("grok-4-fast-reasoning", 300),
     ("grok-4.20-reasoning", 300),
     ("grok-4-fast-non-reasoning", 180),
+    # MiniMax — M2.x reasoning models emit reasoning_content like
+    # DeepSeek V4 / Qwen QwQ but had no floor, getting killed at the
+    # default 180s chat-model stale timeout.  ``minimax-m2`` covers
+    # m2.5, m2.7, and future M2.x variants via the start-of-slug +
+    # end-or-separator regex on the slug-only component.
+    ("minimax-m2", 300),
 )
 
 
