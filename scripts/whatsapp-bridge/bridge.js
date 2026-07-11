@@ -238,6 +238,51 @@ function getContextInfo(messageContent) {
   return {};
 }
 
+// ── Crash resilience: log uncaught exceptions and unhandled rejections ──
+// Without these handlers, any unhandled error in Baileys or Express silently
+// kills the process.  The Python adapter only sees "bridge process exited"
+// with no diagnostic info.  Stderr is merged into bridge.log, so these
+// writes survive into the log file even when stdout is buffered.
+process.on('uncaughtException', (err, origin) => {
+  const ts = new Date().toISOString();
+  try {
+    process.stderr.write(`[${ts}] UNCAUGHT EXCEPTION (origin: ${origin}): ${err.stack || err.message}\n`);
+  } catch {
+    console.error(`[${ts}] UNCAUGHT EXCEPTION:`, err);
+  }
+  // Give logs a moment to flush, then exit hard so the Python adapter
+  // detects the death and triggers reconnection logic.
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  const ts = new Date().toISOString();
+  const message = reason instanceof Error ? reason.stack || reason.message : String(reason);
+  try {
+    process.stderr.write(`[${ts}] UNHANDLED REJECTION: ${message}\n`);
+  } catch {
+    console.error(`[${ts}] UNHANDLED REJECTION:`, reason);
+  }
+  // Unhandled rejections in Node 15+ are deprecated and will eventually
+  // crash the process.  Log them prominently so they appear in bridge.log
+  // and can be diagnosed, but do not exit — let the existing connection.close
+  // handler restart the socket if needed.
+});
+
+// Flush stderr after every write so bridge.log is never 0 bytes when the
+// bridge crashes during early startup (before the HTTP server is up).
+// Override sync methods too so any fs.writeSync to fd 2 is synchronous.
+const _origStdErrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = function(...args) {
+  _origStdErrWrite(...args);
+  // fd 2 is unbuffered by default but fd 1 may be buffered when piped.
+  // Calling fs.fsync on stderr ensures the file on disk has the latest bytes.
+  try {
+    require('fs').fdatasyncSync(2);
+  } catch {}
+  return true;
+};
+
 mkdirSync(SESSION_DIR, { recursive: true });
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)

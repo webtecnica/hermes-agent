@@ -21,7 +21,9 @@ import os
 import platform
 import re
 import signal
+import shutil
 import subprocess
+import time
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -334,6 +336,53 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+# ── creds.json backup / restore ────────────────────────────────────
+# The bridge can silently lose creds.json on crash (Baileys corruption
+# during shutdown, gateway restart loop, etc.).  Back up the file before
+# every bridge launch and restore it when the bridge exits and creds.json
+# is missing — avoiding full re-pairing.
+_CREDS_BACKUP_SUFFIX = ".creds.json.bak"
+
+
+def _backup_creds(session_path: Path) -> None:
+    """Snapshot creds.json before starting the bridge."""
+    creds = session_path / "creds.json"
+    backup = session_path / _CREDS_BACKUP_SUFFIX
+    try:
+        if creds.exists():
+            shutil.copy2(str(creds), str(backup))
+            logger.debug(
+                "[whatsapp] Backed up creds.json (%d bytes)",
+                creds.stat().st_size,
+            )
+    except OSError:
+        pass
+
+
+def _restore_creds(session_path: Path) -> bool:
+    """Restore creds.json from backup when the original is missing.
+
+    Returns True if a restore was attempted (whether it succeeded or not),
+    False if no backup exists or creds.json is already present.
+    """
+    creds = session_path / "creds.json"
+    backup = session_path / _CREDS_BACKUP_SUFFIX
+    if creds.exists():
+        return False
+    if not backup.exists():
+        return False
+    try:
+        shutil.copy2(str(backup), str(creds))
+        logger.info(
+            "[whatsapp] Restored creds.json from backup (%d bytes)",
+            backup.stat().st_size,
+        )
+        return True
+    except OSError as exc:
+        logger.error("[whatsapp] Failed to restore creds.json from backup: %s", exc)
+        return False
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -424,6 +473,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
 
+        # Crash-loop detection: track consecutive rapid bridge deaths.
+        # After 3 crashes within a 60-second window, the bridge is marked
+        # as non-retryable so the gateway stops hammering it.
+        self._bridge_start_ts: float = 0.0
+        self._bridge_crash_ts: list[float] = []
+
         # Text debounce batching (mirrors Telegram adapter pattern).
         # WhatsApp often delivers multiple messages in rapid succession
         # (e.g. forwarded batches, paste-splits) — without debounce each
@@ -493,7 +548,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # for indefinite retries.  Mark non-retryable so the user gets a
         # clear pairing message instead of the watcher
         # silently hammering an unconfigured platform.
+        # Before giving up, try restoring from backup — the bridge may
+        # have crashed and lost creds.json during a previous run.
         creds_path = self._session_path / "creds.json"
+        if not creds_path.exists():
+            _restore_creds(self._session_path)
         if not creds_path.exists():
             logger.warning(
                 "[%s] WhatsApp is enabled but not paired (no creds.json at %s). "
@@ -614,8 +673,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
             # messages are preserved for troubleshooting.
+            # Back up creds.json before launch so we can restore it on crash.
             whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
             self._bridge_log = self._session_path.parent / "bridge.log"
+            _backup_creds(self._session_path)
+            self._bridge_start_ts = time.time()
             bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
             self._bridge_log_fh = bridge_log_fh
 
@@ -777,6 +839,35 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._set_fatal_error("whatsapp_bridge_exited", message, retryable=True)
             self._close_bridge_log()
             await self._notify_fatal_error()
+
+        # Crash-loop detection: if the bridge dies within 30s of starting
+        # (a "rapid crash"), track it.  After 3 rapid crashes in a 60s
+        # window, mark non-retryable so the gateway does not keep bouncing.
+        now = time.time()
+        uptime = now - getattr(self, "_bridge_start_ts", 0)
+        if 0 < uptime < 30:
+            self._bridge_crash_ts.append(now)
+            # Prune crash timestamps older than 60s
+            cutoff = now - 60
+            self._bridge_crash_ts = [t for t in self._bridge_crash_ts if t > cutoff]
+            if len(self._bridge_crash_ts) >= 3:
+                logger.critical(
+                    "[%s] Bridge crashed %d times in 60s (last uptime=%.1fs) — "
+                    "marking non-retryable.",
+                    self.name, len(self._bridge_crash_ts), uptime,
+                )
+                self._set_fatal_error(
+                    "whatsapp_bridge_crash_loop",
+                    "WhatsApp bridge crashed repeatedly. Check bridge.log and "
+                    "run `hermes whatsapp` to re-pair if needed.",
+                    retryable=False,
+                )
+
+        # Attempt creds.json recovery: if the bridge took creds.json with
+        # it (Baileys corruption on unclean shutdown), restore from backup
+        # so the next bridge start reconnects without manual re-pairing.
+        _restore_creds(self._session_path)
+
         return self.fatal_error_message or message
 
     async def disconnect(self) -> None:
