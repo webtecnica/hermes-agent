@@ -248,6 +248,15 @@ _SKILL_REVIEW_PROMPT = (
     "skill that governs that task needs to carry the lesson.\n\n"
     "If you notice two existing skills that overlap, note it in your "
     "reply — the background curator handles consolidation at scale.\n\n"
+    "Read-before-write requirement (MANDATORY — the tool enforces this): "
+    "Before you call skill_manage with action='patch', 'edit', 'write_file', "
+    "or 'remove_file' on any skill, you MUST first call skill_view(name) to "
+    "load its current content. The tool refuses writes from the background "
+    "review fork until the content has been loaded in this turn. "
+    "If the tool returns a response with '_read_before_write_required: true', "
+    "it means the content was not yet loaded. Call skill_view(name) to get "
+    "the current content, then re-issue the skill_manage call. Do NOT skip "
+    "or abort — just read first, then write.\n\n"
     "Protected skills (DO NOT edit these):\n"
     "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
     "  • Hub-installed skills (installed via 'hermes skills install').\n"
@@ -334,6 +343,15 @@ _COMBINED_REVIEW_PROMPT = (
     "should carry user-preference lessons when relevant.\n\n"
     "If you notice overlapping existing skills, mention it — the "
     "background curator handles consolidation.\n\n"
+    "Read-before-write requirement (MANDATORY — the tool enforces this): "
+    "Before you call skill_manage with action='patch', 'edit', 'write_file', "
+    "or 'remove_file' on any skill, you MUST first call skill_view(name) to "
+    "load its current content. The tool refuses writes from the background "
+    "review fork until the content has been loaded in this turn. "
+    "If the tool returns a response with '_read_before_write_required: true', "
+    "it means the content was not yet loaded. Call skill_view(name) to get "
+    "the current content, then re-issue the skill_manage call. Do NOT skip "
+    "or abort — just read first, then write.\n\n"
     "Protected skills (DO NOT edit these):\n"
     "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
     "  • Hub-installed skills (installed via 'hermes skills install').\n"
@@ -817,7 +835,10 @@ def _run_review_in_thread(
                 review_whitelist,
                 deny_msg_fmt=(
                     "Background review denied non-whitelisted tool: "
-                    "{tool_name}. Only memory/skill tools are allowed."
+                    '"{tool_name}". Review mode only permits memory and '
+                    "skill management tools. Use `skill_view` to read a "
+                    "skill, `skill_manage` to modify one, `skills_list` "
+                    "to discover skills, and `memory` for notes."
                 ),
             )
             try:
@@ -839,8 +860,11 @@ def _run_review_in_thread(
                     user_message=(
                         prompt
                         + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
+                        "management tools. Use `skill_view` to read a "
+                        "skill, `skill_manage` to modify one, "
+                        "`skills_list` to discover skills, and `memory` "
+                        "for notes. Other tools will be denied at "
+                        "runtime — do not attempt them."
                     ),
                     conversation_history=_review_history,
                 )
