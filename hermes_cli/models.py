@@ -1904,6 +1904,7 @@ def _resolve_static_model_alias(
 def detect_static_provider_for_model(
     model_name: str,
     current_provider: str,
+    custom_providers: list | None = None,
 ) -> Optional[tuple[str, str]]:
     """Auto-detect a provider from static catalogs only.
 
@@ -1921,6 +1922,51 @@ def detect_static_provider_for_model(
     alias_match = _resolve_static_model_alias(name_lower, current_keys)
     if alias_match:
         return alias_match
+
+    # --- Step 0b: check custom_providers BEFORE built-in catalogs ---
+    # If the user has configured a custom provider that explicitly declares
+    # this model name, prefer that over the built-in PROVIDER_MODELS.
+    # Without this, a model name like "gpt-5.5" that exists in both a
+    # custom_providers entry and the built-in openai-api catalog would
+    # silently route to the built-in provider with wrong credentials (#62240).
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            cp_name = entry.get("name")
+            if not isinstance(cp_name, str) or not cp_name.strip():
+                continue
+            cp_slug = f"custom:{cp_name}"
+            if cp_slug in current_keys:
+                continue
+            # Check if any of the entry's declared models match the input name.
+            # Handles the same config shapes as _configured_provider_matches:
+            #   model: "gpt-5.5"
+            #   models: {"gpt-5.5": {...}}
+            #   models: ["gpt-5.5"]
+            #   default_model: "gpt-5.5"
+            for key in ("models", "model", "default_model"):
+                val = entry.get(key)
+                if val is None:
+                    continue
+                # String: single model name
+                if isinstance(val, str) and val.strip().lower() == name_lower:
+                    return (cp_slug, name)
+                # Dict: {"model-id": {...}}
+                if isinstance(val, dict):
+                    for mid in val:
+                        if isinstance(mid, str) and mid.lower() == name_lower:
+                            return (cp_slug, name)
+                # List: ["model-a"] or [{"id": "model-a"}, {"name": "model-b"}]
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str) and item.lower() == name_lower:
+                            return (cp_slug, name)
+                        if isinstance(item, dict):
+                            for sub_key in ("id", "name"):
+                                sub = item.get(sub_key)
+                                if isinstance(sub, str) and sub.lower() == name_lower:
+                                    return (cp_slug, name)
 
     # --- Step 0: bare provider name typed as model ---
     # If someone types `/model nous` or `/model anthropic`, treat it as a
@@ -1977,15 +2023,16 @@ def detect_static_provider_for_model(
 def detect_provider_for_model(
     model_name: str,
     current_provider: str,
+    custom_providers: list | None = None,
 ) -> Optional[tuple[str, str]]:
     """Auto-detect the best provider for a model name.
 
     Returns ``(provider_id, model_name)`` — the model name may be remapped
     (e.g. bare ``deepseek-chat`` → ``deepseek/deepseek-chat`` for OpenRouter).
-    Returns ``None`` when no confident match is found.
 
     Priority:
     0. Bare provider name → switch to that provider's default model
+    0b. Custom providers with matching declared model (before built-in catalogs)
     1. Direct provider static catalog match
     2. OpenRouter catalog match
     """
@@ -1993,7 +2040,7 @@ def detect_provider_for_model(
     if not name:
         return None
 
-    static_match = detect_static_provider_for_model(name, current_provider)
+    static_match = detect_static_provider_for_model(name, current_provider, custom_providers=custom_providers)
     if static_match:
         return static_match
     if _model_in_provider_catalog(name.lower(), _provider_keys(current_provider)):
@@ -3866,6 +3913,16 @@ def validate_requested_model(
         }
 
     if normalized == "custom" or normalized.startswith("custom:"):
+        # Check if the requested model is a MoA preset name before probing
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.moa_config import normalize_moa_config
+            moa_cfg = normalize_moa_config(load_config().get("moa") or {})
+            if requested in moa_cfg.get("presets", {}):
+                return {"accepted": True, "persist": True, "recognized": True, "message": None}
+        except Exception:
+            pass
+
         # Try probing with correct auth for the api_mode.
         if api_mode == "anthropic_messages":
             probe = probe_api_models(api_key, base_url, api_mode=api_mode)
