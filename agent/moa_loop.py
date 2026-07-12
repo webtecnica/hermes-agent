@@ -723,6 +723,10 @@ class MoAChatCompletions:
         # caller to stitch in the live session_id + resolved aggregator output
         # and flush to the trace file (only when moa.save_traces is on).
         self._pending_trace: Any = None
+        # Tool-call batch cadence counter. Incremented on every create() call.
+        # When tool_call_batch_cadence > 0, the reference fan-out runs only
+        # every N tool iterations, reducing cost/latency for rapid tool chains.
+        self._tool_call_batch_count = 0
 
     def consume_reference_usage(self) -> tuple[Any, Any]:
         """Pop pending reference-fan-out usage + cost, resetting both to empty.
@@ -837,6 +841,16 @@ class MoAChatCompletions:
         # configured aggregator act alone — it is the preset's acting model, so
         # a disabled MoA preset is simply "use the aggregator directly."
         if not preset.get("enabled", True):
+            reference_models = []
+
+        # Tool-call batch cadence. When > 0, thin the reference fan-out to run
+        # only every N tool-call iterations. On off-cadence iterations we skip
+        # references entirely — the aggregator runs alone with its own context,
+        # avoiding the cost/latency of re-running advisors on every tool step.
+        # Default 0 = run every iteration (current behavior unchanged).
+        tool_call_batch_cadence = preset.get("tool_call_batch_cadence", 0)
+        self._tool_call_batch_count += 1
+        if tool_call_batch_cadence > 0 and (self._tool_call_batch_count - 1) % tool_call_batch_cadence != 0:
             reference_models = []
 
         from agent.usage_pricing import CanonicalUsage

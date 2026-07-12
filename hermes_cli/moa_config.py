@@ -101,6 +101,7 @@ def _default_preset() -> dict[str, Any]:
         "max_tokens": 4096,
         "reference_max_tokens": None,
         "fanout": "per_iteration",
+        "tool_call_batch_cadence": 0,
         "enabled": True,
     }
 
@@ -145,6 +146,7 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         # aggregator gets their upfront plan-level advice, then acts alone
         # for the rest of the tool loop.
         "fanout": _coerce_fanout(raw.get("fanout")),
+        "tool_call_batch_cadence": _coerce_int(raw.get("tool_call_batch_cadence"), 0),
     }
 
 
@@ -192,6 +194,7 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "max_tokens": active["max_tokens"],
         "reference_max_tokens": active.get("reference_max_tokens"),
         "fanout": active.get("fanout", "per_iteration"),
+        "tool_call_batch_cadence": active.get("tool_call_batch_cadence", 0),
         "enabled": active["enabled"],
     }
 
