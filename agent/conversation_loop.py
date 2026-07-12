@@ -5093,8 +5093,12 @@ def run_conversation(
                 # switch notice (if a fallback activated this turn) before
                 # dropping the noisy retry buffer, so a provider/model switch
                 # stays visible even when the fallback succeeds.
-                agent._emit_pending_fallback_notice()
-                agent._clear_status_buffer()
+                _emit = getattr(agent, "_emit_pending_fallback_notice", None)
+                if callable(_emit):
+                    _emit()
+                _clear = getattr(agent, "_clear_status_buffer", None)
+                if callable(_clear):
+                    _clear()
 
                 from agent.agent_runtime_helpers import (
                     intent_ack_continuation_mode,
