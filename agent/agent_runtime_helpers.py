@@ -37,6 +37,7 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
+from agent.message_sanitization import _normalize_assistant_tool_call_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -2513,6 +2514,16 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "assistant message(s)",
             dropped_empty_tool_calls,
         )
+
+    # --- Normalize assistant messages: tool_calls + content:"" -> content:None ---
+    # DeepSeek (and other strict OpenAI-compatible providers) return assistant
+    # messages with tool_calls and content:"" on the initial response.  When
+    # these messages are re-sent in a subsequent turn, the API rejects them
+    # with HTTP 400 "An assistant message with 'tool_calls' must be followed
+    # by tool messages responding to each 'tool_call_id'."  Normalizing to
+    # content:None avoids this while preserving the message's intent (the model
+    # produced no text, only tool calls).  (#63200)
+    _normalize_assistant_tool_call_content(messages)
 
     # --- Repair tool_calls whose function.name is empty/missing ---
     # Some providers (and partially-streamed responses) emit a tool_call with

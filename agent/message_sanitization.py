@@ -269,6 +269,27 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
+    # Repair pass 5: concatenated JSON objects (Gemini OpenAI-compat).
+    # When the payload is ≥2 complete objects glued together, return the
+    # first one rather than giving up entirely.
+    try:
+        decoder = json.JSONDecoder()
+        first_obj, end = decoder.raw_decode(raw_stripped)
+        tail = raw_stripped[end:].strip()
+        if tail:
+            # At least one more complete object follows — try to decode
+            # it to confirm; if it works we have ≥2 objects.
+            decoder.raw_decode(tail)
+            result = json.dumps(first_obj, separators=(",", ":"))
+            logger.warning(
+                "Repaired concatenated tool_call arguments for %s — "
+                "split ≥2 objects, returning first (was: %s)",
+                tool_name, raw_stripped[:80],
+            )
+            return result
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
     # Last resort: replace with empty object so the API request doesn't
     # crash the entire session.
     logger.warning(
@@ -461,6 +482,34 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
     return found
 
 
+def _normalize_assistant_tool_call_content(messages: list) -> bool:
+    """Normalize assistant messages that have ``tool_calls`` and ``content: ""`` to ``content: None``.
+
+    Some providers (notably DeepSeek via the OpenAI-compatible endpoint) return
+    assistant messages with ``content: ""`` alongside ``tool_calls``.  When these
+    messages are later re-sent in a followup turn the API strictly validates
+    message structure and rejects the empty-string content with::
+
+        HTTP 400: An assistant message with 'tool_calls' must be followed by
+        tool messages responding to each 'tool_call_id'.
+
+    Normalizing ``content: ""`` → ``content: None`` avoids this rejection while
+    preserving the message's semantic intent (the model produced no text, only
+    tool calls).  Other providers (GLM/Zhipu) silently accept both formats, so
+    this is a universal safety net applied before every API call.
+
+    Mutates messages in place. Returns True if any messages were normalized.
+    """
+    found = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls") and msg.get("content") == "":
+            msg["content"] = None
+            found = True
+    return found
+
+
 __all__ = [
     "_SURROGATE_RE",
     "close_interrupted_tool_sequence",
@@ -474,4 +523,5 @@ __all__ = [
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
+    "_normalize_assistant_tool_call_content",
 ]
