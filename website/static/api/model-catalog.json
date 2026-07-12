@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-07-09T18:38:59Z",
+  "updated_at": "2026-07-12T13:32:50Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -137,6 +137,10 @@
           "description": ""
         },
         {
+          "id": "nvidia/nemotron-3-nano-30b-a3b",
+          "description": ""
+        },
+        {
           "id": "nvidia/nemotron-3-super-120b-a12b",
           "description": ""
         },
@@ -158,6 +162,10 @@
         },
         {
           "id": "tencent/hy3:free",
+          "description": "free"
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-30b-a3b:free",
           "description": "free"
         },
         {
@@ -269,6 +277,9 @@
         },
         {
           "id": "stepfun/step-3.7-flash"
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-30b-a3b"
         },
         {
           "id": "nvidia/nemotron-3-super-120b-a12b"

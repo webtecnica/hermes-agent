@@ -82,6 +82,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # StepFun
     ("stepfun/step-3.7-flash",                 ""),
     # NVIDIA
+    ("nvidia/nemotron-3-nano-30b-a3b",         ""),
     ("nvidia/nemotron-3-super-120b-a12b",      ""),
     # Sakana
     ("sakana/fugu-ultra",                      ""),
@@ -91,6 +92,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("openrouter/elephant-alpha",              "free"),
     ("poolside/laguna-m.1:free",               "free"),
     ("tencent/hy3:free",                       "free"),
+    ("nvidia/nemotron-3-nano-30b-a3b:free",    "free"),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
     ("nvidia/nemotron-3-ultra-550b-a55b:free", "free"),
     ("inclusionai/ring-2.6-1t:free",           "free"),
@@ -233,6 +235,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # StepFun
         "stepfun/step-3.7-flash",
         # NVIDIA
+        "nvidia/nemotron-3-nano-30b-a3b",
         "nvidia/nemotron-3-super-120b-a12b",
         # Sakana
         "sakana/fugu-ultra",
@@ -311,6 +314,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # NVIDIA flagship reasoning models
         "nvidia/nemotron-3-ultra-550b-a55b",
         "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/nemotron-3-nano-30b-a3b",
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         # Third-party agentic models hosted on build.nvidia.com
         # (map to OpenRouter defaults — users get familiar picks on NIM)
