@@ -44,26 +44,26 @@ const TRANSLATIONS: Record<Locale, Translations> = {
 // can share the same list.
 //
 // We intentionally do NOT pair locales with country flags. Languages are not
-// countries (English = GB, Portuguese = PT, Spanish = ES, Chinese variants =
+// countries (English ≠ GB, Portuguese ≠ PT, Spanish ≠ ES, Chinese variants ≠
 // any single jurisdiction). Endonyms are unambiguous and avoid the political
 // mismapping that flag pairings inevitably create.
 export const LOCALE_META: Record<Locale, { name: string }> = {
   en: { name: "English" },
-  zh: { name: "简体中文" },
-  "zh-hant": { name: "繁體中文" },
-  ja: { name: "日本語" },
+  zh: { name: "\u7b80\u4f53\u4e2d\u6587" },
+  "zh-hant": { name: "\u7e41\u9ad4\u4e2d\u6587" },
+  ja: { name: "\u65e5\u672c\u8a9e" },
   de: { name: "Deutsch" },
-  es: { name: "Español" },
-  fr: { name: "Français" },
-  tr: { name: "Türkçe" },
-  uk: { name: "Українська" },
+  es: { name: "Espa\u00f1ol" },
+  fr: { name: "Fran\u00e7ais" },
+  tr: { name: "T\u00fcrk\u00e7e" },
+  uk: { name: "\u0423\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430" },
   af: { name: "Afrikaans" },
-  ko: { name: "한국어" },
+  ko: { name: "\ud55c\uad6d\uc5b4" },
   it: { name: "Italiano" },
   ga: { name: "Gaeilge" },
-  pt: { name: "Português" },
-  "pt-BR": { name: "Português (Brasil)" },
-  ru: { name: "Русский" },
+  pt: { name: "Portugu\u00eas" },
+  "pt-BR": { name: "Portugu\u00eas (Brasil)" },
+  ru: { name: "\u0420\u0443\u0441\u0441\u043a\u0438\u0439" },
   hu: { name: "Magyar" },
 };
 

@@ -109,7 +109,7 @@ export interface Translations {
     webUi: string;
   };
 
-  // ── Gateway status strip ──
+  // ── Status strip ──
   status: {
     actionFailed: string;
     actionFinished: string;
@@ -143,7 +143,7 @@ export interface Translations {
     waitingForOutput: string;
   };
 
-  // ── Sessions page ──
+  // ── Sessions ──
   sessions: {
     title: string;
     history: string;
@@ -185,7 +185,7 @@ export interface Translations {
     };
   };
 
-  // ── Analytics page ──
+  // ── Analytics ──
   analytics: {
     period: string;
     totalTokens: string;
@@ -212,7 +212,7 @@ export interface Translations {
     inOut: string;
   };
 
-  // ── Model usage page ──
+  // ── Models ──
   models: {
     modelsUsed: string;
     estimatedCost: string;
@@ -225,7 +225,7 @@ export interface Translations {
     startSession: string;
   };
 
-  // ── Logs page ──
+  // ── Logs ──
   logs: {
     title: string;
     autoRefresh: string;
@@ -236,7 +236,7 @@ export interface Translations {
     noLogLines: string;
   };
 
-  // ── Cron page ──
+  // ── Cron ──
   cron: {
     confirmDeleteMessage: string;
     confirmDeleteTitle: string;
@@ -298,7 +298,7 @@ export interface Translations {
     };
   };
 
-  // ── Profiles page ──
+  // ── Profiles ──
   profiles: {
     newProfile: string;
     name: string;
@@ -370,7 +370,7 @@ export interface Translations {
     hideFromSidebar: string;
   };
 
-  // ── Skills page ──
+  // ── Skills ──
   skills: {
     title: string;
     searchPlaceholder: string;
@@ -432,7 +432,7 @@ export interface Translations {
     };
   };
 
-  // ── Environment / API keys page ──
+  // ── Env vars (keys) ──
   env: {
     changesNote: string;
     confirmClearMessage: string;
@@ -462,7 +462,7 @@ export interface Translations {
     invalidKeyName: string;
   };
 
-  // ── OAuth page ──
+  // ── OAuth ──
   oauth: {
     title: string;
     providerLogins: string;
