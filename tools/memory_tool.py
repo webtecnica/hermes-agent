@@ -58,6 +58,11 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 
+# Hard cap on memory.char_limit to prevent abuse (issue #63107).
+# The config value is clamped to this maximum regardless of what the
+# user writes in config.yaml.
+MAX_MEMORY_CHAR_LIMIT = 10000
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -130,7 +135,9 @@ class MemoryStore:
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
-        self.memory_char_limit = memory_char_limit
+        # Clamp to hard cap (issue #63107) — applies whether called from
+        # load_on_disk_store, agent_init, or directly in tests.
+        self.memory_char_limit = min(memory_char_limit, MAX_MEMORY_CHAR_LIMIT)
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
@@ -794,9 +801,13 @@ def load_on_disk_store() -> "MemoryStore":
     Use this from any context that has no live agent (the messaging gateway, the
     Desktop GUI, the bare CLI ``/memory`` handler) but still needs to read or
     apply approved memory writes. Mirrors how the live agent constructs its store
-    in ``agent/agent_init.py`` — including the user's ``memory.memory_char_limit``
-    / ``memory.user_char_limit`` overrides — so an approval applied without a live
+    in ``agent/agent_init.py`` — including the user's ``memory.char_limit`` and
+    ``memory.memory_char_limit`` overrides — so an approval applied without a live
     agent enforces the SAME caps as one applied with one.
+
+    Supports two config keys (new ``memory.char_limit`` preferred, old
+    ``memory.memory_char_limit`` as fallback for backward compat).  Both are
+    clamped to :data:`MAX_MEMORY_CHAR_LIMIT` (10 000).
 
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
@@ -807,7 +818,11 @@ def load_on_disk_store() -> "MemoryStore":
         from hermes_cli.config import load_config
 
         mem_cfg = (load_config() or {}).get("memory", {}) or {}
-        memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
+        # Prefer short ``char_limit`` key over legacy ``memory_char_limit``
+        memory_char_limit = int(
+            mem_cfg.get("char_limit",
+                        mem_cfg.get("memory_char_limit", memory_char_limit))
+        )
         user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
     except Exception:
         pass  # config optional — fall back to defaults rather than break /memory
