@@ -1107,7 +1107,19 @@ def build_environment_hints() -> str:
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
+            # Check freeze-flag for cross-session prefix caching (DeepSeek).
+            _freeze_env = False
+            try:
+                from hermes_cli.config import load_config
+                _freeze_env = bool(
+                    (load_config().get("agent", {}) or {}).get("freeze_environment_hints", False)
+                )
+            except Exception:
+                pass
+            if _freeze_env:
+                host_lines.append("Current working directory: (working directory)")
+            else:
+                host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
         except OSError:
             pass
 
