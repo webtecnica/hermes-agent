@@ -90,6 +90,21 @@ except Exception:
 import threading
 import queue
 
+import _thread
+
+_R_LOCK_TYPE = _thread.RLock  # isinstance-able type (threading.RLock is a factory)
+
+
+def _is_rlock(obj) -> bool:
+    """Return True when *obj* is a real ``threading.RLock`` instance.
+
+    ``threading.RLock`` is a factory function, not a class — ``isinstance``
+    rejects it.  The underlying ``_thread.RLock`` *is* a class.  This helper
+    also filters out MagicMock auto-created attributes, which are RLock-ish
+    enough to cause truthiness-based bugs but are not real locks.
+    """
+    return isinstance(obj, _R_LOCK_TYPE)
+
 def CanonicalUsage(*args, **kwargs):
     from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
 
@@ -8458,6 +8473,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if canonical not in {"resume", "sessions"}:
             self._pending_resume_sessions = None
 
+        # Opt-in plugin override check: if a plugin has registered an override
+        # for this built-in command, route to the plugin handler instead of the
+        # built-in dispatch chain below. The opt-in gate
+        # (plugins.entries.<id>.allow_slash_override) is enforced at plugin
+        # registration time in PluginContext.register_command(override=True).
+        if canonical not in {"quit", "exit"}:
+            _override_entry = None
+            try:
+                from hermes_cli.plugins import get_plugin_commands as _get_plugin_cmds
+                _override_entry = _get_plugin_cmds().get(canonical)
+            except Exception:
+                pass
+            if _override_entry and _override_entry.get("overrides_builtin"):
+                _handler = _override_entry.get("handler")
+                if _handler:
+                    _user_args = cmd_original.split(None, 1)
+                    _args_str = _user_args[1] if len(_user_args) > 1 else ""
+                    try:
+                        from hermes_cli.plugins import resolve_plugin_command_result
+                        _result = resolve_plugin_command_result(_handler(_args_str))
+                        if _result:
+                            _cprint(str(_result))
+                    except Exception as e:
+                        _cprint(f"\033[1;31mPlugin command error: {e}\033[0m")
+                    return True
+
         if canonical in {"quit", "exit"}:
             # Parse --delete flag: /exit --delete also removes the current
             # session's transcripts + SQLite history. Ported from
@@ -11730,15 +11771,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         return ""
 
     def _approval_callback(self, command: str, description: str,
-                           *, allow_permanent: bool = True,
-                           smart_denied: bool = False) -> str:
+                           *, allow_permanent: bool = True) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
         Called from the agent thread. Shows a selection UI similar to clarify
-        with choices: once / session / always / deny. Smart DENY owner
-        overrides show only once / deny. When allow_permanent is False for
-        another reason (for example tirith), only 'always' is hidden.
+        with choices: once / session / always / deny. When allow_permanent
+        is False (tirith warnings present), the 'always' option is hidden.
         Long commands also get a 'view' option so the full command can be
         expanded before deciding.
 
@@ -11755,11 +11794,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._approval_state = {
                 "command": command,
                 "description": description,
-                "choices": self._approval_choices(
-                    command,
-                    allow_permanent=allow_permanent,
-                    smart_denied=smart_denied,
-                ),
+                "choices": self._approval_choices(command, allow_permanent=allow_permanent),
                 "selected": 0,
                 "response_queue": response_queue,
             }
@@ -11805,13 +11840,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
 
-    def _approval_choices(self, command: str, *, allow_permanent: bool = True,
-                          smart_denied: bool = False) -> list[str]:
+    def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        if smart_denied:
-            choices = ["once", "deny"]
-        else:
-            choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+        choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
         if len(command) > 70:
             choices.append("view")
         return choices
@@ -12899,6 +12930,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         the agent thread still holds the current turn only in memory.  Flush the
         agent's live ``_session_messages`` before ``end_session()`` so resume,
         session_search, and state.db do not lose the interrupted turn.
+
+        Serializes with ``build_turn_context``'s crash-resilience persist via
+        ``agent._persist_lock`` to prevent a terminal-close race from persisting
+        the same staged user message twice (issue #63766).
         """
         agent = getattr(self, "agent", None)
         if not agent or not hasattr(agent, "_persist_session"):
@@ -12962,17 +12997,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if getattr(agent, "_cached_system_prompt", None) is None:
                 return
 
-            agent._ensure_db_session()
-            agent._persist_session(messages, conversation_history)
-            if getattr(agent, "session_id", None):
-                self.session_id = agent.session_id
-
         try:
-            if persist_lock is None:
-                _snapshot_and_persist()
-            else:
-                with persist_lock:
-                    _snapshot_and_persist()
+            lock = getattr(agent, "_persist_lock", None)
+            if not _is_rlock(lock):
+                # Agent without persist lock — legacy path.
+                agent._persist_session(messages, conversation_history)
+                if getattr(agent, "session_id", None):
+                    self.session_id = agent.session_id
+                return
+
+            with lock:
+                # Turn setup is already running — build_turn_context handles
+                # persistence atomically under the same lock, so skip here
+                # to avoid writing the staged message a second time.
+                if getattr(agent, "_turn_active", False):
+                    return
+
+                # Record the staged user message so build_turn_context can
+                # transfer its _db_persisted marker to the new agent-owned
+                # user dict, preventing duplicate writes (issue #63766).
+                agent._staged_user_content = None
+                if isinstance(conversation_history, list) and conversation_history:
+                    for i in range(len(conversation_history) - 1, -1, -1):
+                        msg = conversation_history[i]
+                        if isinstance(msg, dict) and msg.get("role") == "user":
+                            agent._staged_user_content = msg.get("content")
+                            break
+
+                agent._persist_session(messages, conversation_history)
+                if getattr(agent, "session_id", None):
+                    self.session_id = agent.session_id
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Could not persist active CLI session before close: %s", e)
 
@@ -15324,14 +15378,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                 from tools.approval import get_current_session_key
                                 _drain_sk = get_current_session_key(default="")
                                 for _evt, _synth in process_registry.drain_notifications(session_key=_drain_sk):
-                                    from tools.async_delegation import (
-                                        claim_event_delivery, complete_event_delivery,
-                                    )
-                                    _claim = claim_event_delivery(_evt, "cli-idle")
-                                    if _claim is None:
-                                        continue
                                     self._pending_input.put(_synth)
-                                    complete_event_delivery(_evt, _claim)
                             except Exception:
                                 pass
                         continue
@@ -15493,14 +15540,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         try:
                             from tools.process_registry import process_registry
                             for _evt, _synth in process_registry.drain_notifications():
-                                from tools.async_delegation import (
-                                    claim_event_delivery, complete_event_delivery,
-                                )
-                                _claim = claim_event_delivery(_evt, "cli-post-turn")
-                                if _claim is None:
-                                    continue
                                 self._pending_input.put(_synth)
-                                complete_event_delivery(_evt, _claim)
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 
