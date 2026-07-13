@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -393,7 +394,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            _result = agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            if asyncio.iscoroutine(_result):
+                asyncio.run(_result)
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
