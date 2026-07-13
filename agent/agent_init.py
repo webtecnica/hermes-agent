@@ -187,26 +187,10 @@ def _normalized_custom_base_url(value: Any) -> str:
 
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
-    agent_model_norm = str(agent_model or "").strip().lower()
-    # Multi-model entries (v12+ `providers.<name>.models` mapping / legacy
-    # `models:` list): the agent's model matching ANY catalog entry counts.
-    # Without this, a provider whose `model`/`default_model` differs from the
-    # session model silently fails to match and per-provider request settings
-    # (extra_body, e.g. OpenAI service_tier) are dropped — billing the whole
-    # session at the wrong tier (July 2026 sweeper incident: flex config
-    # ignored, ~2.3x overbilling).
-    models = entry.get("models")
-    catalog: List[str] = []
-    if isinstance(models, dict):
-        catalog = [str(k).strip().lower() for k in models.keys()]
-    elif isinstance(models, (list, tuple)):
-        catalog = [str(m).strip().lower() for m in models]
-    if catalog and agent_model_norm in catalog:
-        return True
     provider_model = str(entry.get("model", "") or "").strip().lower()
-    if not provider_model and not catalog:
+    if not provider_model:
         return True
-    return provider_model == agent_model_norm
+    return provider_model == str(agent_model or "").strip().lower()
 
 
 def _custom_provider_extra_body_for_agent(
@@ -428,13 +412,13 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
+    agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
-    agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
