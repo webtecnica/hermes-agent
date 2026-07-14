@@ -134,6 +134,7 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
+    "pre_tool_use",
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
@@ -172,19 +173,17 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
-    # command needs an approval decision -- fires for CLI-interactive prompts,
-    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
+    # command needs user approval -- fires BOTH for CLI-interactive prompts
+    # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
     # Observers only: return values are ignored. Plugins cannot veto or
     # pre-answer an approval from these hooks (use pre_tool_call to block
     # a tool before it reaches approval).
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway" | "smart"
+    #   session_key: str, surface: "cli" | "gateway"
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
-    #           | "smart_approve" | "smart_deny"
-    #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
@@ -471,6 +470,32 @@ class PluginContext:
         entry = entries.get(plugin_id) or {}
         return bool(entry.get("allow_tool_override", False))
 
+    # -- slash-command override trust gate -----------------------------------
+
+    def _slash_override_allowed(self) -> bool:
+        """Return True if this plugin is configured to override built-in slash commands.
+
+        Bundled plugins (shipped with Hermes core) are trusted by default —
+        an override there is a deliberate maintainer choice, not a third-party
+        plugin trying to hijack a command like ``/help`` or ``/model``. For
+        every other source, require ``allow_slash_override: true`` under
+        ``plugins.entries.<plugin_id>`` in config.yaml.
+        """
+        source = getattr(self.manifest, "source", "") or ""
+        if source == "bundled":
+            return True
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+        except Exception:
+            # If we can't load config, fail closed — better to break the
+            # override than silently grant it.
+            return False
+        plugin_id = self.manifest.key or self.manifest.name
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        entry = entries.get(plugin_id) or {}
+        return bool(entry.get("allow_slash_override", False))
+
     # -- message injection --------------------------------------------------
 
     def inject_message(self, content: str, role: str = "user") -> bool:
@@ -532,6 +557,7 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        override: bool = False,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -549,7 +575,17 @@ class PluginContext:
         parameterless in Discord and still accept trailing text when invoked
         as free-form chat.
 
-        Names conflicting with built-in commands are rejected with a warning.
+        Pass ``override=True`` to replace an existing built-in slash command
+        with the same name (e.g. swap the default ``/help`` for a custom
+        implementation). Without it, names conflicting with built-in commands
+        are rejected with a warning.
+
+        ``override=True`` against a built-in command requires the operator to
+        opt in via ``plugins.entries.<plugin_id>.allow_slash_override: true``
+        in config.yaml — mirrors the trust gate pattern used for
+        ``register_tool(override=True)`` and ``ctx.llm`` provider/model
+        overrides. Without that gate, any enabled plugin could silently replace
+        a privileged built-in command.
         """
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
@@ -559,26 +595,46 @@ class PluginContext:
             )
             return
 
-        # Reject if it conflicts with a built-in command
+        # Check if the name conflicts with a built-in command
+        is_builtin = False
         try:
             from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
+            is_builtin = resolve_command(clean) is not None
+        except Exception:
+            pass  # If commands module isn't available, skip the check
+
+        if is_builtin:
+            if not override:
                 logger.warning(
                     "Plugin '%s' tried to register command '/%s' which conflicts "
-                    "with a built-in command. Skipping.",
+                    "with a built-in command. Skipping. Pass override=True to "
+                    "override the built-in command (requires "
+                    "plugins.entries.<plugin_id>.allow_slash_override: true).",
                     self.manifest.name, clean,
                 )
                 return
-        except Exception:
-            pass  # If commands module isn't available, skip the check
+            if not self._slash_override_allowed():
+                raise PermissionError(
+                    f"Plugin {self.manifest.name!r} cannot override built-in "
+                    f"slash command {clean!r}. Set "
+                    f"plugins.entries.{self.manifest.key or self.manifest.name}."
+                    f"allow_slash_override: true "
+                    f"in config.yaml to allow this plugin to replace built-in "
+                    f"slash commands."
+                )
 
         self._manager._plugin_commands[clean] = {
             "handler": handler,
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "overrides_builtin": is_builtin,
         }
-        logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
+        logger.debug(
+            "Plugin %s registered command: /%s%s",
+            self.manifest.name, clean,
+            " (overrides built-in)" if is_builtin else "",
+        )
 
     # -- tool dispatch -------------------------------------------------------
 
