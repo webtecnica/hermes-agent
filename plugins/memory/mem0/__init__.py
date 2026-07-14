@@ -411,6 +411,14 @@ class Mem0MemoryProvider(MemoryProvider):
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        # Per-turn user_id refresh (#64340).  In shared-group-chat sessions where
+        # a cached agent serves multiple senders (group_sessions_per_user=False or
+        # shared threads), the agent's _user_id is refreshed each turn, and we
+        # must also refresh our own copy to keep sync_turn / prefetch scoped to
+        # the actual sender rather than the user who initialized the session.
+        turn_user_id = kwargs.get("user_id")
+        if turn_user_id:
+            self._user_id = turn_user_id
         self._start_prefetch(message)
 
     def _consume_prefetch_result(self, query: str) -> str | None:

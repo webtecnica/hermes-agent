@@ -28,6 +28,16 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import _thread
+
+_R_LOCK_TYPE = _thread.RLock
+
+
+def _is_rlock(obj) -> bool:
+    """Return True when *obj* is a real thread.RLock instance (filters out
+    MagicMock auto-created attributes)."""
+    return isinstance(obj, _R_LOCK_TYPE)
+
 from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
 from agent.model_metadata import (
@@ -381,12 +391,33 @@ def build_turn_context(
         agent._persist_session(messages, conversation_history)
 
     # Crash-resilience: persist the inbound user turn as soon as the session row exists.
+    # Serialized with _persist_active_session_before_close() via agent._persist_lock
+    # to prevent duplicating the staged CLI user message on terminal close (issue #63766).
     try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
-                _ensure_and_persist()
+        _lock = getattr(agent, "_persist_lock", None)
+        _has_lock = _is_rlock(_lock)
+        if _has_lock:
+            _lock.acquire()
+        try:
+            agent._turn_active = True
+            # If the close path already persisted a staged user message with
+            # the same content, transfer its _db_persisted marker to the new
+            # agent-owned user dict so _flush_messages_to_session_db skips it.
+            _staged = getattr(agent, "_staged_user_content", None)
+            if _staged is not None:
+                _matches = [
+                    m for m in messages
+                    if isinstance(m, dict)
+                    and m.get("role") == "user"
+                    and m.get("content") == _staged
+                ]
+                if _matches:
+                    _matches[-1]["_db_persisted"] = True
+                agent._staged_user_content = None
+            agent._persist_session(messages, conversation_history)
+        finally:
+            if _has_lock:
+                _lock.release()
     except Exception:
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
@@ -590,7 +621,13 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            agent._memory_manager.on_turn_start(
+                agent._user_turn_count, _turn_msg,
+                # Pass per-turn user context so providers in shared-group-chat
+                # sessions can scope memory sync/prefetch to the actual sender
+                # rather than the user who initialized the session (#64340).
+                user_id=getattr(agent, "_user_id", None) or "",
+            )
         except Exception:
             pass
 
