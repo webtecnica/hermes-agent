@@ -558,11 +558,6 @@ memory:
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
 
-  # Memory flush: give the agent one turn to save memories before context is
-  # lost (compression, /new, /reset, exit). Set to 0 to disable.
-  # For exit/reset, only fires if the session had at least this many user turns.
-  flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
-
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================
@@ -1185,6 +1180,24 @@ display:
   #              images are attached (steer only carries text).
   # Ctrl+C (or /stop in gateway) always interrupts regardless of this setting.
   # Toggle at runtime with /busy <interrupt|queue|steer>.
+  # Per-scope and per-group-chat overrides are supported under
+  # display.platforms.<platform>:
+  #
+  #   display:
+  #     platforms:
+  #       feishu:
+  #         # Per-scope: dm vs group default
+  #         dm:
+  #           busy_input_mode: interrupt
+  #         group:
+  #           busy_input_mode: steer
+  #         # Per-chat override (group_overrides):
+  #         group_overrides:
+  #           oc_chat_ops_group:
+  #             busy_input_mode: steer
+  #           oc_chat_notice_group:
+  #             busy_input_mode: queue
+  #
   busy_input_mode: interrupt
 
   # Background process notifications (gateway/messaging only).

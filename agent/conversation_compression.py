@@ -28,7 +28,7 @@ these paths see no behavioural change.
 
 from __future__ import annotations
 
-import inspect
+import asyncio
 import logging
 import os
 import tempfile
@@ -766,20 +766,6 @@ def compress_context(
         finally:
             _release_lock()
 
-    # A compressor that returns the exact input object made no structural
-    # progress. Do not rotate/rewrite the session or arm post-compression
-    # deferral in that case; its own anti-thrash counter records the no-op.
-    if compressed is messages:
-        logger.info(
-            "Compression made no progress (session=%s) — skipping boundary rewrite.",
-            agent.session_id or "none",
-        )
-        _existing_sp = getattr(agent, "_cached_system_prompt", None)
-        if not _existing_sp:
-            _existing_sp = agent._build_system_prompt(system_message)
-        _release_lock()
-        return messages, _existing_sp
-
     try:
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:
@@ -960,7 +946,9 @@ def compress_context(
                 # in-place keeps and rotation has already reassigned to the new id):
                 # refresh the stored system prompt and reset the flush cursor so the
                 # next turn re-bases its append diff.
-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+                _result = agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+                if asyncio.iscoroutine(_result):
+                    asyncio.run(_result)
                 agent._last_flushed_db_idx = 0
             except Exception as e:
                 # If the rotation rolled back to the parent (orphan-avoidance
@@ -1008,6 +996,16 @@ def compress_context(
         # continues. See #6672. Fires in BOTH modes: in-place uses the same id as
         # parent (the conversation didn't fork, but the buffer must still be told
         # the transcript was compacted so it doesn't double-count dropped turns).
+        #
+        # Flush pending memory retains FIRST so async syncs dispatched before the
+        # boundary clear (Hindsight turn buffer, etc.) don't get orphaned. The
+        # flush is best-effort — if it times out or the manager is absent, proceed
+        # with the switch anyway. See #64315.
+        try:
+            if _is_boundary and agent._memory_manager:
+                agent._memory_manager.flush_pending(timeout=5.0)
+        except Exception as _fp_err:
+            logger.debug("memory flush before compaction boundary: %s", _fp_err)
         try:
             if _is_boundary and agent._memory_manager:
                 agent._memory_manager.on_session_switch(
@@ -1068,23 +1066,6 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
-        # Arm the effectiveness verdict only after a completed rewrite crosses
-        # the full compaction boundary. Exceptions, aborts, and no-op attempts
-        # leave this false, so unrelated later usage cannot be charged to an
-        # attempt that never changed the transcript.
-        if _compression_made_progress:
-            record_boundary = getattr(
-                type(agent.context_compressor),
-                "record_completed_compaction",
-                None,
-            )
-            if callable(record_boundary):
-                record_boundary(
-                    agent.context_compressor,
-                    used_fallback=_compression_used_fallback,
-                )
-            else:
-                agent.context_compressor._verify_compaction_cleared_threshold = True
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same
@@ -1178,7 +1159,7 @@ def _compress_context_via_codex_app_server(
             pass
         agent._codex_session = None
 
-    if getattr(result, "interrupted", False) or getattr(result, "error", None):
+    if getattr(result, "error", None):
         try:
             agent._emit_warning(
                 f"⚠ Codex app-server compaction failed: {result.error}"
@@ -1202,11 +1183,7 @@ def _compress_context_via_codex_app_server(
             approx_tokens=approx_tokens,
             force=True,
         )
-        # An empty usage report must consume the pending post-compaction verdict
-        # rather than leaving preflight deferral armed until some unrelated later
-        # Codex turn supplies usage. Minimal external test engines may not expose
-        # the ContextEngine update hook; preserve their existing bookkeeping.
-        if hasattr(agent.context_compressor, "update_from_response"):
+        if getattr(result, "token_usage_last", None):
             _record_codex_app_server_usage(agent, result)
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
