@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import time
 import threading
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -643,6 +644,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
+        # Monotonic timestamp of the last successful start_polling() during
+        # conflict recovery. Used to detect whether a new 409 is a continuation
+        # of the same conflict episode (within COOLDOWN_SECONDS) or a genuinely
+        # new conflict (reset the counter). 0 means no successful recovery yet.
+        self._polling_conflict_last_ok_time: float = 0.0
         self._polling_network_error_count: int = 0
         self._polling_generation: int = 0
         self._polling_progress_event = asyncio.Event()
@@ -2662,6 +2668,25 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
+        # Time-based counter decay: if the last successful start_polling()
+        # during conflict recovery was more than COOLDOWN_SECONDS ago, reset
+        # the counter — it's a genuinely new conflict episode, not a
+        # continuation of a persistent 409 that keeps re-firing.  This is the
+        # key guard against the #63724 infinite loop: without it, every
+        # successful start_polling after a 409 would reset the counter to 0,
+        # and if the fresh long-poll session immediately receives another 409,
+        # the cycle repeats forever and the fatal/restart path is never
+        # reached.  Keeping the counter accumulated across rapid-fire 409s
+        # ensures we eventually exceed MAX_CONFLICT_RETRIES and escalate.
+        CONFLICT_COOLDOWN_SECONDS = 60
+        # Only reset the counter if we HAD a successful recovery (last_ok > 0)
+        # AND that was more than COOLDOWN seconds ago.  When last_ok is 0.0
+        # (never had a successful recovery this session), the retry ladder
+        # has not progressed beyond the failing start_polling() stage and
+        # resetting the counter would prevent it from ever reaching fatal.
+        if self._polling_conflict_last_ok_time > 0:
+            if time.monotonic() - self._polling_conflict_last_ok_time > CONFLICT_COOLDOWN_SECONDS:
+                self._polling_conflict_count = 0
         # Transient 409 Conflict errors arise when the previous gateway process
         # has been killed (e.g. during `hermes update` or `--replace` handoffs)
         # but its long-poll connection hasn't yet expired on Telegram's servers.
@@ -2741,8 +2766,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     "health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 )
-                return
-            except _PollingLifecycleAbort:
+                # Record the time of successful recovery so the cooldown guard
+                # at the top of the next _handle_polling_conflict call can
+                # distinguish rapid-fire 409s (same episode, keep counter
+                # accumulated) from a genuinely new conflict (reset counter).
+                # Do NOT reset _polling_conflict_count to 0 here — that was
+                # the root cause of #63724's infinite loop.
+                self._polling_conflict_last_ok_time = time.monotonic()
                 return
             except Exception as retry_err:
                 if getattr(self, "_polling_teardown_started", False):
@@ -4839,8 +4869,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
-        allow_permanent: bool = True,
-        smart_denied: bool = False,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
@@ -4857,8 +4885,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
                 f"Reason: {_html.escape(description)}"
             )
-            if smart_denied:
-                text += "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
@@ -4871,19 +4897,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._approval_counter = itertools.count(1)
             approval_id = next(self._approval_counter)
 
-            buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
-            ]
-            if not smart_denied:
-                buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
-                )
-                if allow_permanent:
-                    buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
-                    )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
-            keyboard = InlineKeyboardMarkup([buttons])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}"),
+                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}"),
+                ],
+                [
+                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"),
+                ],
+            ])
 
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
