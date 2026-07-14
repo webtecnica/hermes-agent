@@ -5493,7 +5493,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         running_agent = self._running_agents.get(session_key)
 
-        effective_mode = self._busy_input_mode
+        # --- Resolve effective busy_input_mode with per-scope / per-chat overrides ---
+        # Resolution order:
+        #   1. group_overrides.<chat_id>  (per-chat, #64289)
+        #   2. scope (dm/group)           (per-scope, #64289)
+        #   3. per-platform override      (existing per-platform)
+        #   4. display.busy_input_mode    (global config)
+        #   5. HERMES_GATEWAY_BUSY_INPUT_MODE env var (external override)
+        #   6. "interrupt"                (built-in default)
+        from gateway.display_config import resolve_display_setting
+        chat_type = (event.source.chat_type or "dm").lower()
+        scope = "group" if chat_type in {"group", "channel", "forum"} else "dm"
+        effective_mode = str(
+            resolve_display_setting(
+                _load_gateway_config(),
+                _platform_config_key(event.source.platform),
+                "busy_input_mode",
+                None,  # no fallback yet — try env var next
+                scope=scope,
+                chat_id=str(event.source.chat_id) if event.source.chat_id else None,
+            )
+        )
+        if not effective_mode or effective_mode == "None":
+            # Fallback to env var (external override from service managers, etc.)
+            effective_mode = os.environ.get("HERMES_GATEWAY_BUSY_INPUT_MODE", "interrupt").strip().lower()
+        if effective_mode not in {"queue", "steer", "interrupt"}:
+            effective_mode = "interrupt"
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
         if (
             event.message_type == MessageType.TEXT
@@ -5537,6 +5562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             effective_mode = "queue"
         steered = False
+        steer_fell_back = False  # #63944: track late-steer fallback for ack message
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
             can_steer = (
@@ -5552,8 +5578,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
             if not steered:
-                # Fall back to queue (merge into pending messages, no interrupt)
+                # #63944: Fall back to queue — the follow-up arrived too late
+                # for steer injection (e.g. during the final model call).
+                # The message is queued and will be processed AFTER the
+                # current run completes and delivers its response, ensuring
+                # context-aware serial continuation (Option B).
                 effective_mode = "queue"
+                steer_fell_back = True
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -5677,6 +5708,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message = (
                 f"⏳ Compressing context{status_detail} — your message is queued for "
                 f"when it finishes (use /stop to cancel everything)."
+            )
+        elif is_queue_mode and steer_fell_back:
+            # #63944: late-steer fallback — the follow-up arrived after
+            # steer could no longer inject it (e.g. during the final model
+            # call). The current run will complete and deliver its response
+            # first, then the follow-up will be processed with full context.
+            message = (
+                f"⏳ Arrived near the end of the current run{status_detail}. "
+                f"I'll finish what I'm doing, then respond to your "
+                f"message with full context."
             )
         elif is_queue_mode:
             message = (
@@ -9565,15 +9606,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_version_command(event)
 
             # Catch-all: any other recognized slash command reached the
-            # running-agent guard. Reject gracefully rather than falling
-            # through to interrupt + discard. Without this, commands
-            # like /model, /reasoning, /voice, /insights, /title,
-            # /resume, /retry, /undo, /compress, /usage,
-            # /reload-mcp, /sethome, /reset (all registered as Discord
-            # slash commands) would interrupt the agent AND get
-            # silently discarded by the slash-command safety net,
-            # producing a zero-char response. See #5057, #6252, #10370.
+            # running-agent guard. Before rejecting, check if a plugin has
+            # overridden this command — if so, dispatch to the plugin handler
+            # instead.
             if _cmd_def_inner:
+                _override_entry = None
+                try:
+                    from hermes_cli.plugins import get_plugin_commands as _get_plugin_cmds
+                    _override_entry = _get_plugin_cmds().get(_cmd_def_inner.name)
+                except Exception:
+                    pass
+                if _override_entry and _override_entry.get("overrides_builtin"):
+                    _handler = _override_entry.get("handler")
+                    if _handler:
+                        _user_args = event.get_command_args().strip()
+                        try:
+                            _result = _handler(_user_args)
+                            if asyncio.iscoroutine(_result):
+                                _result = await _result
+                            return str(_result) if _result else None
+                        except Exception as e:
+                            logger.warning(
+                                "Plugin override for /%s failed: %s",
+                                _cmd_def_inner.name, e,
+                            )
+                            return f"Plugin command /{_cmd_def_inner.name} failed: {e}"
                 return (
                     f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
                     f"mid-turn. Wait for the current response or `/stop` first."
@@ -9804,6 +9861,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
                     break
+
+        # Opt-in plugin override check: if a plugin has registered an override
+        # for this built-in command, route to the plugin handler instead of
+        # the built-in dispatch chain below. The opt-in gate
+        # (plugins.entries.<id>.allow_slash_override) is enforced at plugin
+        # registration time in PluginContext.register_command(override=True).
+        if _cmd_def and canonical:
+            _override_entry = None
+            try:
+                from hermes_cli.plugins import get_plugin_commands as _get_plugin_cmds
+                _override_entry = _get_plugin_cmds().get(canonical)
+            except Exception:
+                pass
+            if _override_entry and _override_entry.get("overrides_builtin"):
+                _handler = _override_entry.get("handler")
+                if _handler:
+                    _user_args = event.get_command_args().strip()
+                    try:
+                        _result = _handler(_user_args)
+                        if asyncio.iscoroutine(_result):
+                            _result = await _result
+                        return str(_result) if _result else None
+                    except Exception as e:
+                        logger.warning(
+                            "Plugin override for /%s failed: %s",
+                            canonical, e,
+                        )
+                        return f"Plugin command /{canonical} failed: {e}"
 
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
@@ -18452,6 +18537,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # Refresh agent max_iterations from current config
                             # (cached agent may have been created with old config)
                             agent.max_iterations = max_iterations
+                            # Per-turn user identity refresh (#64340).  In shared
+                            # group/thread sessions (group_sessions_per_user=False
+                            # or thread_sessions_per_user=False) the cached agent
+                            # may have been initialized with a different sender's
+                            # user_id.  Update per-turn so memory providers and
+                            # plugin hooks read the correct sender as the agent
+                            # processes this message.
+                            if source.user_id:
+                                agent._user_id = source.user_id
+                            if source.user_id_alt:
+                                agent._user_id_alt = source.user_id_alt
+                            if source.user_name:
+                                agent._user_name = source.user_name
                             logger.debug("Reusing cached agent for session %s", session_key)
                             reused_cached_agent = True
 

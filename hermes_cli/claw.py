@@ -706,6 +706,7 @@ def _print_migration_report(report: dict, dry_run: bool):
     migrated = summary.get("migrated", 0)
     skipped = summary.get("skipped", 0)
     conflicts = summary.get("conflict", 0)
+    invalid = summary.get("invalid", 0)
     errors = summary.get("error", 0)
 
     print()
@@ -724,6 +725,7 @@ def _print_migration_report(report: dict, dry_run: bool):
         migrated_items = [i for i in items if i.get("status") == "migrated"]
         skipped_items = [i for i in items if i.get("status") == "skipped"]
         conflict_items = [i for i in items if i.get("status") == "conflict"]
+        invalid_items = [i for i in items if i.get("status") == "invalid"]
         error_items = [i for i in items if i.get("status") == "error"]
 
         if migrated_items:
@@ -745,6 +747,19 @@ def _print_migration_report(report: dict, dry_run: bool):
                 kind = item.get("kind", "unknown")
                 reason = item.get("reason", "already exists")
                 print(f"      {kind:<22s}  {reason}")
+            print()
+
+        if invalid_items:
+            print(color("  ✗ Invalid (quarantined — fix before import):", Colors.RED))
+            for item in invalid_items:
+                kind = item.get("kind", "unknown")
+                reason = item.get("reason", "")
+                source = item.get("source", "")
+                detail = kind
+                if source:
+                    src_short = str(source).replace(str(Path.home()), "~")
+                    detail = f"{kind} ({src_short})"
+                print(f"      {detail:<22s}  {reason}")
             print()
 
         if skipped_items:
@@ -774,6 +789,8 @@ def _print_migration_report(report: dict, dry_run: bool):
         parts.append(f"{skipped} skipped")
     if errors:
         parts.append(f"{errors} error(s)")
+    if invalid:
+        parts.append(f"{invalid} invalid (quarantined)")
 
     if parts:
         print_info(f"Summary: {', '.join(parts)}")

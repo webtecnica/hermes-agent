@@ -36,7 +36,9 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     each individual HTTP request; the overall wall-clock cap is enforced by
     the caller via a future timeout.
     """
-    from ddgs import DDGS  # type: ignore
+    from plugins.web._vendor_import import _import_vendor
+    ddgs_mod = _import_vendor("ddgs", __file__)
+    DDGS = ddgs_mod.DDGS
 
     results: list[dict[str, Any]] = []
     with DDGS(timeout=10) as client:

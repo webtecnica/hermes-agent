@@ -594,7 +594,13 @@ class BaseEnvironment(ABC):
         an orphan with ``PPID=1`` when python is shut down mid-tool — the
         ``sleep 300``-survives-30-min bug Physikal and I both hit.
         """
-        output_chunks: list[str] = []
+        # Bounded collector: O(max_bytes) memory regardless of producer size.
+        # Prevents a verbose foreground subprocess from OOM-ing the gateway
+        # before the configurable tool_output.max_bytes truncation runs in
+        # terminal_tool.py (issue #64435).
+        from tools.bounded_output_collector import BoundedOutputCollector
+        from tools.tool_output_limits import get_max_bytes as _get_max_bytes
+        collector = BoundedOutputCollector(max_bytes=_get_max_bytes())
 
         # Non-blocking drain via select().
         #
@@ -635,16 +641,16 @@ class BaseEnvironment(ABC):
                     if piece is None:
                         continue
                     if isinstance(piece, bytes):
-                        output_chunks.append(decoder.decode(piece))
+                        collector.append(decoder.decode(piece))
                     else:
-                        output_chunks.append(str(piece))
+                        collector.append(str(piece))
             except Exception:
                 pass
             finally:
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output_chunks.append(tail)
+                        collector.append(tail)
                 except Exception:
                     pass
 
@@ -675,14 +681,14 @@ class BaseEnvironment(ABC):
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output_chunks.append(decoder.decode(chunk))
+                        collector.append(decoder.decode(chunk))
                 except (ValueError, OSError):
                     pass
                 finally:
                     try:
                         tail = decoder.decode(b"", final=True)
                         if tail:
-                            output_chunks.append(tail)
+                            collector.append(tail)
                     except Exception:
                         pass
                 return
@@ -700,7 +706,7 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output_chunks.append(decoder.decode(chunk))
+                        collector.append(decoder.decode(chunk))
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -716,7 +722,7 @@ class BaseEnvironment(ABC):
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output_chunks.append(tail)
+                        collector.append(tail)
                 except Exception:
                     pass
 
@@ -762,7 +768,7 @@ class BaseEnvironment(ABC):
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     return {
-                        "output": "".join(output_chunks) + "\n[Command interrupted]",
+                        "output": collector.get_output() + "\n[Command interrupted]",
                         "returncode": 130,
                     }
                 if time.monotonic() > deadline:
@@ -774,7 +780,7 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
-                    partial = "".join(output_chunks)
+                    partial = collector.get_output()
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return {
                         "output": partial + timeout_msg
@@ -855,7 +861,7 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
-        return {"output": "".join(output_chunks), "returncode": proc.returncode}
+        return {"output": collector.get_output(), "returncode": proc.returncode}
 
     def _kill_process(self, proc: ProcessHandle):
         """Terminate a process. Subclasses may override for process-group kill."""

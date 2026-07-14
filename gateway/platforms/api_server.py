@@ -1871,12 +1871,28 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+        min_message_count = self._parse_nonnegative_int(
+            request.query.get("min_messages"), default=0, maximum=1_000_000
+        )
+        archived_raw = (request.query.get("archived") or "exclude").lower()
+        archived_only = archived_raw == "only"
+        include_archived = archived_raw == "include"
+        order = (request.query.get("order") or "recent").lower()
+        order_by_last_active = order == "recent"
         sessions = db.list_sessions_rich(
             source=source,
             limit=limit,
             offset=offset,
             include_children=include_children,
-            order_by_last_active=True,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            order_by_last_active=order_by_last_active,
+            # compact_rows omits the system_prompt blob from the SQL SELECT,
+            # avoiding unnecessary I/O — the blob is stripped by _session_response
+            # anyway. On large databases with many sessions this saves tens of KB
+            # per row of SQLite B-tree page I/O.
+            compact_rows=True,
         )
         return web.json_response({
             "object": "list",
@@ -1986,11 +2002,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = self._ensure_session_db()
         resolved_id = db.resolve_resume_session_id(session_id)
-        messages = db.get_messages(resolved_id)
+        limit = self._parse_nonnegative_int(request.query.get("limit"), default=None, maximum=500)
+        offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
+        messages = db.get_messages(resolved_id, limit=limit, offset=offset)
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+            "limit": limit,
+            "offset": offset,
+            "has_more": limit is not None and len(messages) == limit,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
