@@ -290,6 +290,148 @@ def _apply_tool_request_middleware_for_agent(
         return function_args, []
 
 
+# Tools that fetch or interact with external platform data.  The agent MUST
+# call skill_view() at least once before using these — the system prompt
+# already instructs the agent to load relevant skills first, and this gate
+# provides programmatic enforcement when recency bias makes the prompt
+# instruction unreliable.
+_SKILL_REQUIRED_TOOLS = frozenset({
+    "web_search",
+    "web_extract",
+})
+
+
+def _check_skill_require_gate(
+    agent,
+    *,
+    function_name: str,
+) -> Optional[str]:
+    """Return a block message when *function_name* requires skill_view() first.
+
+    Prompt-level skill-loading instructions become unreliable as the
+    conversation grows.  This gate enforces the requirement
+    *programmatically* at the dispatch layer: if the tool is in
+    ``_SKILL_REQUIRED_TOOLS`` and the agent has not called ``skill_view()``
+    via the tool interface (or had skills preloaded at session start), the
+    call is blocked with a message directing the agent to load relevant
+    skills first.
+
+    Returns ``None`` when the gate does not apply (tool not in the require
+    set, or skill_view has already been called).
+    """
+    if function_name not in _SKILL_REQUIRED_TOOLS:
+        return None
+    skill_view_called = getattr(agent, "_skill_view_called", False)
+    if skill_view_called:
+        return None
+    return (
+        "You must call skill_view() to load a relevant skill before using "
+        f"{function_name}(). Check the available skills with skills_list(), "
+        "load the most relevant one with skill_view(name), and follow its "
+        "instructions. Only proceed without loading a skill if none are "
+        "relevant to the task."
+    )
+
+
+def _apply_pre_tool_use_enforcement(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    tool_call_id: str,
+    middleware_trace: Optional[list[dict[str, Any]]] = None,
+) -> tuple[Optional[str], str]:
+    """Enforce PreToolUse rules before tool execution.
+
+    Invokes the ``pre_tool_use`` lifecycle hook — a system-level enforcement
+    point that fires BEFORE every tool call, regardless of whether any plugin
+    registered for the hook. Unlike the ``pre_tool_call`` plugin hook (which
+    is opt-in and plugin-driven), this is a mandatory enforcement seam that
+    lives in the core tool dispatch pipeline.
+
+    Purpose
+    -------
+    Prompt-level rules (instructions in the system prompt) become unreliable
+    as the conversation grows due to recency bias — the model pays more
+    attention to recent messages than to early instructions. The PreToolUse
+    enforcement hook enforces those rules *programmatically* at the dispatch
+    layer, before the tool executes, so they are never dependent on the
+    model's attention.
+
+    Also checks the built-in skill-require gate (`_check_skill_require_gate`)
+    which runs before plugin hooks so system-level enforcement always comes
+    first.
+
+    Callback return values
+    ----------------------
+    Each registered callback may return one of:
+
+    * ``{"action": "block", "message": "..."}`` — blocks the tool call
+      (Hermes-canonical shape).
+    * ``{"decision": "block", "reason": "..."}`` — same, Claude-Code style.
+    * ``{"action": "block", "message": "...", "enforcement": "rule_name"}``
+      — same, with an enforcement rule identifier for telemetry/tracing.
+
+    The first valid block directive wins. ``None`` or other return values
+    are silently ignored.
+
+    Returns
+    -------
+    ``(block_message, enforcement_rule)`` tuple:
+    - ``block_message``: when not ``None``, the tool should be blocked with
+      this message as its tool-result error (JSON-encoded by the caller).
+    - ``enforcement_rule``: the identifier of the enforcement rule that
+      triggered the block, or ``""`` if none.
+    """
+    block_message: Optional[str] = None
+    enforcement_rule = ""
+
+    # ── Built-in skill-require gate (BEFORE plugin hooks) ────────
+    # System-level enforcement of the prompt-level "load skills first"
+    # rule. Runs before plugin hooks so skill requirements are always
+    # the first programmatic gate.
+    if block_message is None:
+        _sr_block = _check_skill_require_gate(
+            agent,
+            function_name=function_name,
+        )
+        if _sr_block is not None:
+            block_message = _sr_block
+            enforcement_rule = "skill_require_gate"
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        hook_results = invoke_hook(
+            "pre_tool_use",
+            tool_name=function_name,
+            args=function_args if isinstance(function_args, dict) else {},
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            middleware_trace=list(middleware_trace or []),
+        )
+        for result in hook_results:
+            if not isinstance(result, dict):
+                continue
+            # Hermes-canonical shape: {"action": "block", "message": "..."}
+            action = result.get("action")
+            # Claude-Code-style shape: {"decision": "block", "reason": "..."}
+            decision = result.get("decision")
+            if action == "block" or decision == "block":
+                message = result.get("message") or result.get("reason") or ""
+                if isinstance(message, str) and message:
+                    block_message = message
+                    enforcement_rule = result.get("enforcement", "")
+                    break
+    except Exception as exc:
+        logger.debug("pre_tool_use enforcement error: %s", exc)
+
+    return block_message, enforcement_rule
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -374,11 +516,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
-        # Reset nudge counters only for a structurally valid invocation.
+        # Reset nudge counters / tracking only for a structurally valid invocation.
         if function_name == "memory":
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
+        elif function_name == "skill_view":
+            agent._skill_view_called = True
 
         # ── Tool Search unwrap ────────────────────────────────────────
         # When the model invokes the tool_call bridge, peel it open so
@@ -423,12 +567,41 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
 
+        # ── PreToolUse enforcement (BEFORE block evaluation) ─────────
+        # System-level enforcement of prompt-level rules. Fires before
+        # plugin hooks, guardrails, and checkpoint preflight so
+        # enforcement is always the first gate — not subject to recency
+        # bias in the model's attention.
+        _ptu_block_msg, _ptu_enforcement_rule = _apply_pre_tool_use_enforcement(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tool_call, "id", "") or "",
+            middleware_trace=list(middleware_trace),
+        )
+
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
-        if _ts_scope_block is not None:
+        if _ptu_block_msg is not None:
+            # PreToolUse enforcement block — system-level rules first.
+            block_result = json.dumps({"error": _ptu_block_msg}, ensure_ascii=False)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="pre_tool_use_enforcement",
+                error_message=_ptu_block_msg,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
             _emit_terminal_post_tool_call(
@@ -1095,10 +1268,27 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
 
+        # ── PreToolUse enforcement (BEFORE block evaluation) ─────────
+        # System-level enforcement of prompt-level rules. Unlike the
+        # plugin-driven pre_tool_call hook, this is a mandatory system
+        # gate that fires on every tool dispatch.
+        _ptu_block_msg, _ptu_enforcement_rule = _apply_pre_tool_use_enforcement(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tool_call, "id", "") or "",
+            middleware_trace=list(middleware_trace),
+        )
+
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
+        if _ptu_block_msg is not None:
+            # PreToolUse enforcement block — system-level rules first.
+            _block_msg = _ptu_block_msg
+            _block_error_type = "pre_tool_use_enforcement"
+        elif _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
@@ -1134,6 +1324,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
+        elif function_name == "skill_view":
+            agent._skill_view_called = True
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
