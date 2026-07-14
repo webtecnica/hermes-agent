@@ -319,6 +319,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.session import build_session_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -2286,27 +2287,6 @@ def cmd_chat(args):
         # If resolution fails, keep the original value — _init_agent will
         # report "Session not found" with the original input
 
-    # Session<->workspace binding: cd back into a resumed session's recorded cwd
-    # so it resumes in the repo it belonged to. Opt out with --no-restore-cwd;
-    # skipped under --worktree (that path owns its own dir). Best-effort — a
-    # missing dir warns and stays put rather than failing the resume.
-    if (
-        getattr(args, "resume", None)
-        and not getattr(args, "no_restore_cwd", False)
-        and not getattr(args, "worktree", False)
-    ):
-        try:
-            from hermes_state import SessionDB
-
-            _saved_cwd = ((SessionDB().get_session(args.resume) or {}).get("cwd") or "").strip()
-            if _saved_cwd and not os.path.isdir(_saved_cwd):
-                print(f"⚠ session's recorded dir is gone ({_saved_cwd}); staying in {os.getcwd()}")
-            elif _saved_cwd and os.path.realpath(_saved_cwd) != os.path.realpath(os.getcwd()):
-                os.chdir(_saved_cwd)
-                print(f"↪ restored workspace dir: {_saved_cwd}")
-        except Exception:
-            pass  # never let cwd-restore break a resume
-
     # xAI retirement warning — one-shot, non-blocking, never fails startup
     try:
         from hermes_cli.xai_retirement import (
@@ -3946,7 +3926,7 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
             str(effort).strip().lower() for effort in efforts if str(effort).strip()
         )
     )
-    canonical_order = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+    canonical_order = ("minimal", "low", "medium", "high", "xhigh")
     ordered = [effort for effort in canonical_order if effort in deduped]
     ordered.extend(effort for effort in deduped if effort not in canonical_order)
     if not ordered:
@@ -4384,6 +4364,22 @@ def cmd_import(args):
     from hermes_cli.backup import run_import
 
     run_import(args)
+
+
+def cmd_session(args):
+    """Dispatch `hermes session <subcmd>`."""
+    from hermes_cli.subcommands.session import cmd_export, cmd_import as cmd_session_import
+
+    sub = getattr(args, "session_command", None)
+    if sub == "export":
+        code = cmd_export(args)
+        sys.exit(int(code or 0))
+    elif sub == "import":
+        code = cmd_session_import(args)
+        sys.exit(int(code or 0))
+    else:
+        print(f"unknown session subcommand: {sub!r}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _print_version_info(*, check_updates: bool = True) -> None:
@@ -4929,7 +4925,7 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # would pull in desktop on every web build. See #38772.
     # When web/ has its own package-lock.json, _workspace_root() returns
     # web_dir itself and --workspace would fail.  See #42973.
-    npm_workspace_args: tuple[str, ...] = () if npm_cwd == web_dir else ("--workspace", "web")
+    npm_workspace_args: tuple[str, ...] = () if npm_cwd == web_dir else ("--workspace", "web", "--include-workspace-root")
     if _is_termux_startup_environment():
         npm_cwd, npm_workspace_args = _termux_workspace_install_context(web_dir)
     r1 = _run_npm_install_deterministic(
@@ -8126,88 +8122,43 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     return resolve_uv() or shutil.which("uv")
 
 
-def _npm_manifest_paths() -> tuple[Path, ...]:
-    """Manifests whose changes must defeat the update-skip.
+def _validate_root_node_deps_installed(repo_root: Path, npm: str) -> None:
+    """Verify every dependency in root ``package.json`` is present in
+    ``node_modules/`` after an npm install.
 
-    The lockfile alone is NOT a sufficient key: on a local checkout a dev
-    can edit package.json (root or a workspace) without running npm — the
-    lockfile is then unchanged but `hermes update` is exactly the step
-    expected to sync node_modules (via the `npm install` fallback in
-    _run_npm_install_deterministic).
-
-    The workspace list is pulled from the root package.json's `workspaces`
-    globs (npm's own source of truth) rather than hardcoded, so adding a
-    workspace can never silently escape the skip key. The root install
-    (step 1, --workspaces=false) still hoists shared deps for EVERY
-    workspace — desktop included — so all of them belong in the key, not
-    just the ones step 2 installs. Falls back to hashing just root
-    manifests if package.json is unreadable (never skips more than main
-    would have installed).
+    ``npm ci`` with ``--workspace`` flags can silently prune root-only deps
+    because it deletes ``node_modules/`` before reifying the workspace-scoped
+    tree.  This guard catches that class of bug even when the fix above
+    (``--include-workspace-root``) is in place — e.g. if a future refactor or
+    npm version change undermines the flag's effect.  Non-fatal: prints a
+    warning so the user knows their install is incomplete without aborting
+    the entire update.
     """
-    root_pkg = PROJECT_ROOT / "package.json"
-    paths = [PROJECT_ROOT / "package-lock.json", root_pkg]
-    try:
-        workspaces = json.loads(root_pkg.read_text(encoding="utf-8")).get(
-            "workspaces", []
-        )
-        if isinstance(workspaces, dict):  # legacy {"packages": [...]} form
-            workspaces = workspaces.get("packages", [])
-        for pattern in workspaces:
-            for match in sorted(PROJECT_ROOT.glob(str(pattern))):
-                manifest = match / "package.json"
-                if manifest.is_file():
-                    paths.append(manifest)
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
-    return tuple(paths)
-
-
-def _npm_manifests_digest() -> str | None:
-    """Combined sha256 over the lockfile + all workspace package.json files.
-
-    Returns None when the lockfile is missing (never skip then).
-    """
-    if not (PROJECT_ROOT / "package-lock.json").exists():
-        return None
-    h = hashlib.sha256()
-    for p in _npm_manifest_paths():
-        h.update(str(p.relative_to(PROJECT_ROOT)).encode())
-        try:
-            h.update(p.read_bytes())
-        except OSError:
-            h.update(b"<missing>")
-    return h.hexdigest()
-
-
-def _npm_lockfile_changed(hermes_root: Path) -> bool:
-    current = _npm_manifests_digest()
-    if current is None:
-        return True
-    # Also check that node_modules exists; a matching hash with missing
-    # node_modules means the cache was recorded by another checkout.
-    if not (PROJECT_ROOT / "node_modules").is_dir():
-        return True
-    try:
-        # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
-        cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        if not cache_file.exists():
-            return True
-        return cache_file.read_text(encoding="utf-8").strip() != current
-    except OSError:
-        return True
-
-
-def _record_npm_lockfile_hash(hermes_root: Path) -> None:
-    digest = _npm_manifests_digest()
-    if digest is None:
+    pkg_json = repo_root / "package.json"
+    if not pkg_json.exists():
         return
     try:
-        cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        cache_file.write_text(digest, encoding="utf-8")
-    except OSError:
-        logger.debug("Could not write npm lockfile hash cache")
+        pkg = json.loads(pkg_json.read_text())
+    except Exception:
+        return
+    root_deps = pkg.get("dependencies", {})
+    if not root_deps:
+        return
+    missing = [
+        name
+        for name in root_deps
+        if not (repo_root / "node_modules" / name).exists()
+    ]
+    if not missing:
+        return
+    print(
+        f"  ⚠ Post-install check: {len(missing)} root dep(s) missing from"
+        f" node_modules/ — npm may have pruned them: {', '.join(missing)}"
+    )
+    print(
+        "    Run manually: npm install --include-workspace-root"
+        f" {' '.join(f'--workspace {w}' for w in ('ui-tui', 'web'))}"
+    )
 
 
 def _update_node_dependencies() -> None:
@@ -8220,52 +8171,29 @@ def _update_node_dependencies() -> None:
     if not (PROJECT_ROOT / "package.json").exists():
         return
 
-    from hermes_constants import get_default_hermes_root
-
-    # This cache describes PROJECT_ROOT/node_modules, which is shared by every
-    # Hermes profile using this checkout. Keep one per-checkout cache under the
-    # shared Hermes root rather than rerunning npm once per named profile.
-    shared_hermes_root = get_default_hermes_root()
-    if not _npm_lockfile_changed(shared_hermes_root):
-        logger.info("npm lockfile unchanged, skipping npm install")
-        return
-
-    # With a single workspace lockfile the root install would cover ALL
-    # workspaces — but apps/desktop pulls in Electron as a devDependency,
-    # and its postinstall downloads a ~200MB binary.  Most users don't
-    # need desktop during `hermes update`, so we install root-only first
-    # then add just the workspaces the CLI/TUI/web build actually requires.
-    # Desktop deps are installed on demand by the desktop launcher
-    # (see _desktop_build_needed).
+    # Single pass with --workspace scoping: install root deps + the workspaces the
+    # CLI/TUI/web build actually require in one tree.  --workspace ui-tui --workspace web
+    # selects only those workspaces; --include-workspace-root ensures root-only deps
+    # (agent-browser, @streamdown/math) survive npm ci's destructive node_modules wipe.
+    # Desktop/Electron is intentionally skipped — its deps (~200MB) are installed on
+    # demand by the desktop launcher (see _desktop_build_needed).
     print("→ Updating Node.js dependencies...")
     extra_args = ["--no-fund", "--no-audit", "--progress=false"]
 
     nixos_env = with_hermes_node_path(_nixos_build_env())
 
-    # Step 1: root install (no workspace recursion).
-    # NOTE: capture_output=False here is deliberate (#18840) — optional
-    # postinstall scripts (e.g. @askjo/camofox-browser's browser-binary fetch)
-    # print download progress, and capturing it makes a long download look
-    # hung. The chatty npm-deprecation noise during `hermes update` comes from
-    # the *desktop* build, not this step; that one is captured to update.log.
-    root_args = [*extra_args, "--workspaces=false"]
-    root_result = _run_npm_install_deterministic(
-        npm,
-        PROJECT_ROOT,
-        extra_args=tuple(root_args),
-        capture_output=False,
-        env=nixos_env,
-    )
-    if root_result.returncode != 0:
-        print("  ⚠ npm install failed in repo root")
-        stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        return
-
-    # Step 2: install only the workspaces update needs (ui-tui, web).
-    # --workspace selects specific workspaces; the rest (desktop) are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
+    # Single pass: install root deps + selected workspaces in one tree.
+    # --workspace scopes to ui-tui/web so desktop/Electron stays skipped;
+    # --include-workspace-root ensures root-only deps (agent-browser,
+    # @streamdown/math) survive npm ci's destructive node_modules wipe.
+    # This avoids the two-pass bug where step 2's npm ci deleted what
+    # step 1 installed but never restored root-only deps (#64354).
+    ws_args = [
+        *extra_args,
+        "--workspace", "ui-tui",
+        "--workspace", "web",
+        "--include-workspace-root",
+    ]
     ws_result = _run_npm_install_deterministic(
         npm,
         PROJECT_ROOT,
@@ -8276,8 +8204,12 @@ def _update_node_dependencies() -> None:
     if ws_result.returncode == 0:
         _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
+        # Post-install guard: verify root-only deps survived npm ci's
+        # destructive node_modules wipe.  A scoped npm ci may silently
+        # prune root-only deps — catch it here (#64354).
+        _validate_root_node_deps_installed(PROJECT_ROOT, npm)
     else:
-        print("  ⚠ npm workspace install failed")
+        print("  ⚠ npm install failed")
         stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
@@ -13251,6 +13183,12 @@ def main():
     build_import_cmd_parser(subparsers, cmd_import=cmd_import)
 
     # =========================================================================
+    # session command — checkpoint export/import (parser built in
+    #                  hermes_cli/subcommands/session.py)
+    # =========================================================================
+    build_session_parser(subparsers, cmd_session_export=cmd_session, cmd_session_import=cmd_session)
+
+    # =========================================================================
     # config command  (parser built in hermes_cli/subcommands/config.py)
     # =========================================================================
     build_config_parser(subparsers, cmd_config=cmd_config)
@@ -13630,12 +13568,6 @@ def main():
     sessions_list.add_argument(
         "--limit", type=int, default=20, help="Max sessions to show"
     )
-    sessions_list.add_argument(
-        "--workspace",
-        metavar="NEEDLE",
-        help="Only sessions in one workspace: a git repo root or project dir "
-        "(matched by path substring or basename).",
-    )
 
     def _add_session_filter_args(p, default_older_help):
         p.add_argument(
@@ -13962,58 +13894,13 @@ def main():
         _exclude = None if _source else ["tool"]
 
         if action == "list":
-            from hermes_state import workspace_key as _ws_key
-
             sessions = db.list_sessions_rich(
                 source=args.source, exclude_sources=_exclude, limit=args.limit
             )
-
-            # Workspace filter: match a session by its workspace key (git repo
-            # root, else cwd) — path substring or exact basename.
-            _ws_filter = (getattr(args, "workspace", None) or "").strip()
-            if _ws_filter:
-                _needle = _ws_filter.lower()
-
-                def _in_workspace(s):
-                    key = (_ws_key(s) or "").lower()
-                    return bool(key) and (
-                        _needle in key or _needle == os.path.basename(key.rstrip("/\\"))
-                    )
-
-                sessions = [s for s in sessions if _in_workspace(s)]
-
             if not sessions:
                 print("No sessions found.")
                 return
-
-            # Short workspace label: the repo/dir basename, "—" when unbound. The
-            # Workspace column only appears once at least one session carries one
-            # (or when filtering), so all-unbound listings read as before.
-            def _ws_label(s):
-                key = _ws_key(s)
-                return (os.path.basename(key.rstrip("/\\")) or key) if key else "—"
-
-            has_ws = bool(_ws_filter) or any(_ws_key(s) for s in sessions)
             has_titles = any(s.get("title") for s in sessions)
-
-            if has_ws:
-                if has_titles:
-                    print(f"{'Title':<28} {'Workspace':<18} {'Last Active':<13} {'ID'}")
-                    print("─" * 110)
-                else:
-                    print(f"{'Preview':<38} {'Workspace':<18} {'Last Active':<13} {'Src':<6} {'ID'}")
-                    print("─" * 100)
-                for s in sessions:
-                    last_active = _relative_time(s.get("last_active"))
-                    ws = _ws_label(s)[:16]
-                    if has_titles:
-                        title = (s.get("title") or "—")[:26]
-                        print(f"{title:<28} {ws:<18} {last_active:<13} {s['id']}")
-                    else:
-                        preview = s.get("preview", "")[:36]
-                        print(f"{preview:<38} {ws:<18} {last_active:<13} {s['source']:<6} {s['id']}")
-                return
-
             if has_titles:
                 print(f"{'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
                 print("─" * 110)
