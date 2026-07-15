@@ -20740,7 +20740,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     try:
         from tools.skills_sync import sync_skills, has_bundled_skills_opt_out
         if not has_bundled_skills_opt_out():
+            if not has_bundled_skills_opt_out():
             sync_skills(quiet=True)
+        else:
+            logger.info("Skipping bundled-skill seeding (.no-bundled-skills marker present)")
         else:
             logger.info("Skipping bundled-skill seeding (.no-bundled-skills marker present)")
     except Exception:
