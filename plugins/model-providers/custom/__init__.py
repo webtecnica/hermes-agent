@@ -23,6 +23,7 @@ class CustomProfile(ProviderProfile):
         self,
         *,
         reasoning_config: dict | None = None,
+        supports_reasoning: bool = False,
         ollama_num_ctx: int | None = None,
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -38,6 +39,13 @@ class CustomProfile(ProviderProfile):
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
         #
+        # Only emit reasoning parameters when the API is known to support them.
+        # Custom endpoints can be any OpenAI-compatible API — sending
+        # ``reasoning_effort`` or ``think`` to an endpoint that doesn't
+        # understand them causes HTTP 400. Gate on the ``supports_reasoning``
+        # flag resolved upstream from base_url / provider metadata.
+        #
+        # When supported:
         #   - disabled  → extra_body.think = False (Ollama's thinking-off flag)
         #   - enabled + effort set → TOP-LEVEL reasoning_effort string, the
         #     format GLM-5.2/ARK and other OpenAI-compatible reasoning APIs
@@ -49,7 +57,7 @@ class CustomProfile(ProviderProfile):
         # Ollama-only flag and thinking is already server-default-on for these
         # backends, so forcing it risks a 400 on GLM/vLLM endpoints that don't
         # recognize it. Mirrors the DeepSeek/Zai profile precedent.
-        if reasoning_config and isinstance(reasoning_config, dict):
+        if supports_reasoning and reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:

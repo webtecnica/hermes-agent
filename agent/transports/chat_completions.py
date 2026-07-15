@@ -453,15 +453,26 @@ class ChatCompletionsTransport(ProviderTransport):
         # Reasoning. LM Studio is handled above via top-level reasoning_effort,
         # so skip emitting extra_body.reasoning for it.
         if params.get("supports_reasoning", False) and not params.get("is_lmstudio", False):
-            if is_github_models:
+            # When reasoning is explicitly disabled, omit the reasoning field
+            # entirely so the API doesn't receive a parameter it may not
+            # support or that a disabled config would send as "enabled: True"
+            # with a default effort (which defeats the user's intent).
+            if reasoning_config and isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    pass  # skip reasoning entirely
+                elif is_github_models:
+                    gh_reasoning = params.get("github_reasoning_extra")
+                    if gh_reasoning is not None:
+                        extra_body["reasoning"] = gh_reasoning
+                else:
+                    _effort = reasoning_config.get("effort", "medium") or "medium"
+                    extra_body["reasoning"] = {"enabled": True, "effort": _effort}
+            elif is_github_models:
                 gh_reasoning = params.get("github_reasoning_extra")
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
             else:
-                _effort = "medium"
-                if reasoning_config and isinstance(reasoning_config, dict):
-                    _effort = reasoning_config.get("effort", "medium") or "medium"
-                extra_body["reasoning"] = {"enabled": True, "effort": _effort}
+                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
 
         if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
