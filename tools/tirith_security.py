@@ -750,7 +750,13 @@ def check_command_security(command: str) -> dict:
     # → fail-open → agent retry loop, hanging the user for 20+ minutes
     # (issue #41400).
     if _circuit_open:
-        return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        fail_open = cfg["tirith_fail_open"]
+        if fail_open:
+            return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker; fail-open)"}
+        logger.warning(
+            "tirith circuit breaker open — blocking command (fail_closed=true)"
+        )
+        return {"action": "block", "findings": [], "summary": "tirith disabled (circuit breaker; fail-closed)"}
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
     # never will. Skip the resolver entirely so we don't even try to spawn.
