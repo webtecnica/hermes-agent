@@ -923,12 +923,14 @@ def inspect_skill(identifier: str) -> Optional[dict]:
 
 def do_list(source_filter: str = "all",
             enabled_only: bool = False,
+            search: str = "",
             console: Optional[Console] = None) -> None:
     """List installed skills, distinguishing hub, builtin, and local skills.
 
     Args:
         source_filter: ``all`` | ``hub`` | ``builtin`` | ``local``.
         enabled_only: If True, hide disabled skills from the output.
+        search: If non-empty, filter skills by case-insensitive name substring match.
 
     Enabled/disabled state is resolved against the currently active profile's
     config — ``hermes -p <profile> skills list`` reads that profile's
@@ -986,6 +988,10 @@ def do_list(source_filter: str = "all",
             trust = "local"
 
         if source_filter != "all" and source_filter != source_type:
+            continue
+
+        # Search filter: case-insensitive name substring match
+        if search and search.lower() not in name.lower():
             continue
 
         is_enabled = name not in disabled_names
@@ -1718,6 +1724,7 @@ def skills_command(args) -> None:
         do_list(
             source_filter=args.source,
             enabled_only=getattr(args, "enabled_only", False),
+            search=getattr(args, "search", ""),
         )
     elif action == "check":
         do_check(name=getattr(args, "name", None))

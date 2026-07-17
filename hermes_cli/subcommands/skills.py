@@ -123,6 +123,11 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         help="Hide disabled skills. Use with -p <profile> to see exactly "
         "which skills will load for that profile.",
     )
+    skills_list.add_argument(
+        "--search",
+        default="",
+        help="Filter installed skills by name (case-insensitive substring match)",
+    )
 
     skills_check = skills_subparsers.add_parser(
         "check", help="Check installed hub skills for updates"
