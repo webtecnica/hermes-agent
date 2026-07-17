@@ -669,6 +669,16 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     return resolved_command, resolved_env
 
 
+# Launcher commands that manage their own child process lifecycle.
+# These tools (uvx, npx, bunx, deno) already isolate their subprocesses
+# and the watchdog's intermediate pipe relay can break their startup,
+# especially for slow-starting tools like uvx resolving @latest over the
+# network.  The watchdog's orphan-prevention is redundant here.
+_LAUNCHER_COMMANDS: frozenset[str] = frozenset({
+    "uvx", "uv", "npx", "bunx", "deno", "yarn", "pnpm",
+})
+
+
 def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     """Wrap a stdio MCP server command in the parent-death watchdog supervisor.
 
@@ -676,6 +686,10 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     rationale. Returns the (command, args) unchanged on any platform/failure
     where the wrap can't safely apply, so this can never be the reason a
     previously-working MCP server stops starting.
+
+    Launcher commands (uvx, npx, bunx, deno, etc.) are returned unwrapped
+    because they already manage their own subprocess lifecycle and the
+    watchdog's intermediate pipe relay can break their startup sequence.
     """
     if os.name != "posix":
         # Relies on process groups (os.getpgid/os.killpg); no POSIX
@@ -683,6 +697,12 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
         # orphan cleanup's platform scope (Windows falls back to plain
         # os.kill there too).
         return command, args
+
+    # Extract the base command name (without path) for launcher detection.
+    base_command = os.path.basename(command)
+    if base_command in _LAUNCHER_COMMANDS:
+        return command, args
+
     try:
         my_pid = os.getpid()
         try:
