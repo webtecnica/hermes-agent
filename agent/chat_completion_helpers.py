@@ -1091,6 +1091,11 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # directly in the content rather than returning separate API fields).
     if not reasoning_text:
         content = assistant_message.content or ""
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
         think_blocks = re.findall(r'<think>(.*?)</think>', content, flags=re.DOTALL)
         if think_blocks:
             combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
@@ -1117,6 +1122,11 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # Sanitize surrogates from API response — some models (e.g. Kimi/GLM via Ollama)
     # can return invalid surrogate code points that crash json.dumps() on persist.
     _raw_content = assistant_message.content or ""
+    if isinstance(_raw_content, list):
+        _raw_content = " ".join(
+            part.get("text", "") for part in _raw_content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
     _san_content = _sanitize_surrogates(_raw_content)
     if reasoning_text:
         reasoning_text = _sanitize_surrogates(reasoning_text)
