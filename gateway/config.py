@@ -1161,6 +1161,20 @@ def load_gateway_config() -> GatewayConfig:
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
 
+            # gateway.api_server: read from top-level api_server or nested
+            # gateway.api_server (same fallback pattern as streaming above).
+            # Treat as if the user wrote gateway.platforms.api_server.{...}
+            # so it flows through the existing platform merge logic.
+            api_server_cfg = yaml_cfg.get("api_server")
+            if not isinstance(api_server_cfg, dict):
+                api_server_cfg = (
+                    gateway_cfg.get("api_server")
+                    if isinstance(gateway_cfg, dict)
+                    else None
+                )
+            if isinstance(api_server_cfg, dict):
+                _merge_platform_map({"api_server": api_server_cfg})
+
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
 
@@ -1836,7 +1850,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     api_server_cors_origins = getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = getenv("API_SERVER_PORT")
     api_server_host = getenv("API_SERVER_HOST")
-    if api_server_enabled or api_server_key:
+    if (
+        api_server_enabled
+        or api_server_key
+        or Platform.API_SERVER in config.platforms
+    ):
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
         config.platforms[Platform.API_SERVER].enabled = True
