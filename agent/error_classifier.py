@@ -269,7 +269,7 @@ _CONTEXT_OVERFLOW_PATTERNS = [
     "context window",
     "prompt is too long",
     "prompt exceeds max length",
-    "max_tokens",
+    "max_tokens limit",
     "maximum number of tokens",
     # vLLM / local inference server patterns
     "exceeds the max_model_len",
