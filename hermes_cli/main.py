@@ -8672,6 +8672,67 @@ def _finalize_update_output(state):
             pass
 
 
+def _resolve_git_cmd() -> list[str]:
+    """Resolve the git binary and return a ready-to-use command list.
+
+    Uses ``shutil.which("git")`` to find git on PATH first.  If that fails,
+    falls back to common install locations (``/usr/bin/git``,
+    ``/usr/local/bin/git``, ``~/.local/bin/git``) so the update path works
+    even when git is not on the default PATH (e.g. Homebrew on macOS,
+    custom PATH environments).
+
+    On Windows, appends ``-c windows.appendAtomically=false`` as a
+    workaround for filesystem atomicity issues.
+
+    Returns
+    -------
+    list[str]
+        A command list suitable for ``subprocess.run``, e.g. ``["/usr/bin/git"]``
+        or ``["/usr/bin/git", "-c", "windows.appendAtomically=false"]``.
+
+    Raises
+    ------
+    SystemExit
+        If git cannot be resolved at all.  Prints a helpful diagnostic
+        message before exiting.
+    """
+    import shutil
+
+    git_path = shutil.which("git")
+    if not git_path:
+        # Fall back to common locations not always on PATH
+        import os as _os
+
+        _common_locations = [
+            "/usr/bin/git",
+            "/usr/local/bin/git",
+            _os.path.expanduser("~/.local/bin/git"),
+            "/opt/homebrew/bin/git",  # Apple Silicon Homebrew
+            "/usr/local/opt/git/bin/git",  # Intel Homebrew (legacy cellar)
+        ]
+        for candidate in _common_locations:
+            if _os.path.isfile(candidate) and _os.access(candidate, _os.X_OK):
+                git_path = candidate
+                break
+
+    if not git_path:
+        print(
+            "✗ Git is required for hermes update, but no git executable was found.\n"
+            "  Install git:\n"
+            "    • macOS:  brew install git\n"
+            "    • Debian: sudo apt install git\n"
+            "    • Fedora: sudo dnf install git\n"
+            "    • Windows: https://git-scm.com/download/win\n"
+            "  Or add git to your PATH and try again."
+        )
+        sys.exit(1)
+
+    cmd = [git_path]
+    if sys.platform == "win32":
+        cmd.extend(["-c", "windows.appendAtomically=false"])
+    return cmd
+
+
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
@@ -8732,9 +8793,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print("✗ Not a git repository — cannot check for updates.")
         sys.exit(1)
 
-    git_cmd = ["git"]
-    if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    git_cmd = _resolve_git_cmd()
 
     # Fetch only the branch we compare against; prefer upstream as the canonical
     # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
@@ -9873,9 +9932,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # On Windows, git can fail with "unable to write loose object file: Invalid argument"
     # due to filesystem atomicity issues. Set the recommended workaround.
     if sys.platform == "win32" and git_dir.exists():
+        _win_git_cmd = _resolve_git_cmd()
         subprocess.run(
-            [
-                "git",
+            _win_git_cmd
+            + [
                 "-c",
                 "windows.appendAtomically=false",
                 "config",
@@ -9888,9 +9948,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
 
     # Build git command once — reused for fork detection and the update itself.
-    git_cmd = ["git"]
-    if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    git_cmd = _resolve_git_cmd()
 
     # Discard npm lockfile churn before any stash/branch logic. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build
