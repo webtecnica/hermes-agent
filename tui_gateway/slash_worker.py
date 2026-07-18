@@ -48,19 +48,30 @@ def _env_float(name: str, default: float) -> float:
 
 _WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
 _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
+# Tolerance for WSL2/VM btime drift after host-clock resync (issue #66518).
+# On WSL2, /proc/stat btime can shift by a few seconds after Windows
+# sleep/hibernate, causing exact create_time equality to falsely detect
+# PID reuse. Real PID reuse differs by minutes-to-days, so a small window
+# loses no protection.
+_CREATE_TIME_TOLERANCE_S = 30.0
 _in_flight = threading.Event()  # set while a command is executing
 
 
 def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
     """True once our spawning gateway is gone. Compare to the ORIGINAL ppid
     (never ==1: Linux reparents to a subreaper) and guard PID reuse via
-    create_time."""
+    create_time.
+
+    Uses a tolerance window (``_CREATE_TIME_TOLERANCE_S``) instead of exact
+    float equality to handle WSL2/VM clock resync where ``btime`` drifts
+    after host sleep — see issue #66518.
+    """
     if getppid() != original_ppid:
         return True
     try:
         if not psutil.pid_exists(original_ppid):
             return True
-        return psutil.Process(original_ppid).create_time() != parent_create_time
+        return abs(psutil.Process(original_ppid).create_time() - parent_create_time) > _CREATE_TIME_TOLERANCE_S
     except psutil.Error:
         return True
 

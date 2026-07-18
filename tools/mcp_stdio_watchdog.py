@@ -61,6 +61,12 @@ except ImportError:  # pragma: no cover - psutil is a hard dependency elsewhere
 
 _POLL_INTERVAL_S = 2.0
 _TERM_GRACE_S = 3.0
+# Tolerance for WSL2/VM btime drift after host-clock resync (issue #66518).
+# On WSL2, /proc/stat btime can shift by a few seconds after Windows
+# sleep/hibernate, causing exact create_time equality to falsely detect
+# PID reuse and kill healthy children. Real PID reuse differs by
+# minutes-to-days, so a small window loses no protection.
+_CREATE_TIME_TOLERANCE_S = 30.0
 
 
 def _is_orphaned(original_ppid: int, parent_create_time: float, getppid=os.getppid) -> bool:
@@ -70,6 +76,10 @@ def _is_orphaned(original_ppid: int, parent_create_time: float, getppid=os.getpp
     ``getppid() == 1`` check (Linux reparents orphans to a subreaper, not
     always PID 1), and guards against PID reuse via the recorded creation
     time of the original parent.
+
+    Uses a tolerance window (``_CREATE_TIME_TOLERANCE_S``) instead of exact
+    float equality to handle WSL2/VM clock resync where ``btime`` drifts
+    after host sleep — see issue #66518.
     """
     if getppid() != original_ppid:
         return True
@@ -80,7 +90,7 @@ def _is_orphaned(original_ppid: int, parent_create_time: float, getppid=os.getpp
     try:
         if not psutil.pid_exists(original_ppid):
             return True
-        return psutil.Process(original_ppid).create_time() != parent_create_time
+        return abs(psutil.Process(original_ppid).create_time() - parent_create_time) > _CREATE_TIME_TOLERANCE_S
     except psutil.Error:
         return True
 
