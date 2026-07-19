@@ -1129,7 +1129,14 @@ def _handle_create(args: dict, **kw) -> str:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.workspace_kind:
                         workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
+                        # Never inherit a scratch parent's materialized path:
+                        # each scratch child must resolve to its own workspace
+                        # directory (<board>/workspaces/<child-id>), not share
+                        # the parent's.  Dir / worktree children keep their
+                        # inherited path so follow-up work lands in the same
+                        # project checkout.
+                        if _self_task.workspace_kind != "scratch":
+                            workspace_path = _self_task.workspace_path
                         # Keep follow-up children inside the same project so the
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
