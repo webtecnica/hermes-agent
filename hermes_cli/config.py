@@ -5519,6 +5519,9 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "require_mention",       # top-level convenience form honored by the gateway (#3979)
     "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
     "signal",            # Signal settings bridged to env vars by gateway/config.py
+    # Keys read/written by Hermes flows but absent from DEFAULT_CONFIG:
+    "group_sessions_per_user",   # top-level form read by gateway/config.py (#67478)
+    "known_plugin_toolsets",     # written by `hermes tools` (tools_config.py) (#67478)
 }
 _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
