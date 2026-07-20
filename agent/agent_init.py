@@ -2059,6 +2059,36 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
+
+    # Rehydrate session cost accumulators from persisted DB row (#67762)
+    # so a gateway restart mid-session doesn't reset the running cost to $0.
+    # The persisted data (sessions.estimated_cost_usd) is correct; this just
+    # copies it back into the agent's in-memory accumulators.  Subsequent API
+    # calls will += on top of the rehydrated baseline.
+    #
+    # The cost *value* stays correct across restarts.  The cost *status* is
+    # still overwritten by the very next API call (conversation_loop.py:2321 /
+    # codex_runtime.py:150) — that's tracked separately by the priority-ladder
+    # issue and doesn't affect the correctness of the dollar amount.
+    if session_db is not None and session_id:
+        try:
+            _saved = session_db.get_session_cost_summary(session_id)
+            if _saved is not None:
+                _est, _act, _status, _source = _saved
+                # Prefer actual cost when available, fall back to estimated.
+                _cost = _act if _act is not None and _act > 0 else _est
+                if _cost is not None and _cost > 0:
+                    agent.session_estimated_cost_usd = float(_cost)
+                if _status and _status not in ("unknown", None):
+                    agent.session_cost_status = _status
+                if _source and _source not in ("none", None):
+                    agent.session_cost_source = _source
+        except Exception:
+            # Non-fatal: if the DB read fails (locked, threading race, etc.)
+            # the agent starts from 0.0 and the cost-display undercounts the
+            # pre-restart spend — the same bug this fix addresses.  The DB
+            # still has the truth.
+            pass
     
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.

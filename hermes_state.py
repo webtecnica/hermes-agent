@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -875,6 +875,15 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS turn_leases (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    surface TEXT NOT NULL DEFAULT '',
+    run_generation INTEGER NOT NULL DEFAULT 0,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -902,6 +911,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_turn_leases_expires ON turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
@@ -2766,6 +2776,187 @@ class SessionDB:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
+    # ── Turn leases (cross-process turn serialization) ────────────────
+    #
+    # CLI-continuity sessions share a ``session_id`` across a gateway
+    # process and a CLI process.  No in-process lock can serialize them
+    # because the two processes don't share memory.  A DB-level lease
+    # keyed by ``session_id`` bridges that gap.
+    #
+    # Contract:
+    # - Acquire before transcript load, release at turn-end persist.
+    # - Holders are ``pid:surface:run_generation`` triples for
+    #   diagnostics.
+    # - Expired leases are reclaimed transparently (fail-open) so a
+    #   crashed holder never wedges the session.  A race that sneaks
+    #   through emits an ERROR and proceeds — never block a turn
+    #   forever.
+    # - The fast path (single-surface sessions) is a cheap read: if no
+    #   row exists, or the existing row's ``surface`` already matches
+    #   the would-be holder, skip the write and proceed immediately.
+    #
+    # Design: #64934 (forensics + thread), #67401 (in-process lease,
+    # closed), #67442 (this work).
+
+    TURN_LEASE_TTL_SECONDS = 120.0
+
+    def try_acquire_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        surface: str = "",
+        run_generation: int = 0,
+        ttl_seconds: float = TURN_LEASE_TTL_SECONDS,
+    ) -> bool:
+        """Try to atomically acquire a cross-process turn lease.
+
+        Returns ``True`` on success (caller now owns the lease and must
+        release via :meth:`release_turn_lease`).  Returns ``False`` if
+        another holder already owns a non-expired lease on this session
+        with a *different* surface — the caller MUST wait or back off.
+
+        Expired leases (``expires_at < now``) are reclaimed transparently:
+        the stale row is deleted and the new holder acquires it.  This
+        prevents a crashed turn-holder from permanently wedging the
+        session.
+
+        Fast path: if the current holder has the same ``surface``, the
+        lease is refreshed in-place without a contested acquire.  This
+        is the common case (re-entrant turns on the same surface).
+        """
+        if not session_id:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            # Fast path: same surface already holds the lease, just
+            # bump the expiry.  No lock contention, no diagnostics.
+            cur = conn.execute(
+                "UPDATE turn_leases SET holder = ?, acquired_at = ?, "
+                "expires_at = ? "
+                "WHERE session_id = ? AND surface = ? AND expires_at >= ?",
+                (holder, now, expires_at, session_id, surface, now),
+            )
+            if cur.rowcount > 0:
+                return True
+
+            # Reclaim any expired lease for this session_id.
+            conn.execute(
+                "DELETE FROM turn_leases "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            # Try to insert.  INSERT OR IGNORE + SELECT verify pattern.
+            conn.execute(
+                "INSERT OR IGNORE INTO turn_leases "
+                "(session_id, holder, surface, run_generation, "
+                " acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, holder, surface, run_generation,
+                 now, expires_at),
+            )
+            row = conn.execute(
+                "SELECT holder, surface FROM turn_leases "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            _holder = row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            _surface = row["surface"] if isinstance(row, sqlite3.Row) else row[1]
+            if _holder == holder:
+                return True
+            # Different surface holds the lease — contention.
+            logger.error(
+                "turn-lease contention on session %s: "
+                "rejected %s (surface=%s) in favour of %s (surface=%s)",
+                session_id, holder, surface, _holder, _surface,
+            )
+            return False
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "try_acquire_turn_lease(%s) failed: %s",
+                session_id, exc,
+            )
+            # Fail open: a broken lease subsystem must not block turns.
+            return False
+
+    def release_turn_lease(self, session_id: str, holder: str) -> None:
+        """Release the turn lease for ``session_id`` iff we own it.
+
+        Idempotent: no-op when the lock has already expired and been
+        reclaimed by a different holder, or when no lock exists.  The
+        ``holder`` check prevents a late-returning turn from clobbering
+        a fresh lease held by someone else.
+        """
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM turn_leases "
+                "WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_turn_lease(%s) failed: %s",
+                session_id, exc,
+            )
+
+    def refresh_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = TURN_LEASE_TTL_SECONDS,
+    ) -> bool:
+        """Extend the turn lease expiry if ``holder`` still owns it."""
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE turn_leases SET expires_at = ? "
+                "WHERE session_id = ? AND holder = ? AND expires_at >= ?",
+                (expires_at, session_id, holder, now),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "refresh_turn_lease(%s) failed: %s",
+                session_id, exc,
+            )
+            return False
+
+    def get_turn_lease_holder(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current (non-expired) lease info or None.
+
+        Diagnostic helper — not used by the locking protocol itself.
+        """
+        if not session_id:
+            return None
+        now = time.time()
+        row = self._conn.execute(
+            "SELECT holder, surface, run_generation, acquired_at, expires_at "
+            "FROM turn_leases WHERE session_id = ? AND expires_at >= ?",
+            (session_id, now),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
     def update_session_meta(
         self,
         session_id: str,
@@ -3107,6 +3298,33 @@ class SessionDB:
                 now,
                 now,
             ),
+        )
+
+    def get_session_cost_summary(self, session_id: str):
+        """Read the persisted session cost fields so ``init_agent`` can
+        rehydrate the in-memory accumulators after a gateway restart.
+
+        Returns ``(estimated_cost_usd, actual_cost_usd, cost_status,
+        cost_source)`` as a 4-tuple, or ``None`` when the session row
+        doesn't exist or has no cost data.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT estimated_cost_usd,
+                          actual_cost_usd,
+                          cost_status,
+                          cost_source
+                   FROM sessions
+                   WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            row["estimated_cost_usd"],
+            row["actual_cost_usd"],
+            row["cost_status"],
+            row["cost_source"],
         )
 
     def ensure_session(

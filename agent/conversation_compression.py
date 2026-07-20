@@ -339,6 +339,27 @@ def check_compression_model_feasibility(agent: Any) -> None:
                     new_threshold / main_ctx
                 )
             safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
+
+            # Models under 512K context have their compression threshold
+            # floored at 75% (raise-only) by _effective_threshold_percent.
+            # If the recommended value is below the floor, setting it in
+            # config.yaml would have no effect — it gets raised back on the
+            # next session and the warning repeats.  Clamp the recommendation
+            # and, when the aux model cannot even reach the floor, omit the
+            # threshold suggestion (#67422).
+            from agent.context_compressor import (
+                _SMALL_CTX_WINDOW_LIMIT,
+                _SMALL_CTX_THRESHOLD_PERCENT,
+            )
+            _min_floor_pct = int(_SMALL_CTX_THRESHOLD_PERCENT * 100)
+            _threshold_below_floor = (
+                main_ctx
+                and main_ctx < _SMALL_CTX_WINDOW_LIMIT
+                and safe_pct < _min_floor_pct
+            )
+            if _threshold_below_floor:
+                safe_pct = _min_floor_pct
+
             # Build human-readable "model (provider)" labels for both
             # the main model and the compression model so users can
             # tell at a glance which provider each side is actually
@@ -365,6 +386,21 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 else _main_model
             )
             _aux_label = f"{aux_model} ({_aux_provider_label})"
+
+            if _threshold_below_floor:
+                _threshold_suggestion = (
+                    f"     (The compression threshold cannot be set below "
+                    f"{_min_floor_pct}% for models with context windows under "
+                    f"{_SMALL_CTX_WINDOW_LIMIT // 1000}K — a larger auxiliary "
+                    f"compression model is required.)"
+                )
+            else:
+                _threshold_suggestion = (
+                    f"  2. Lower the compression threshold:\n"
+                    f"       compression:\n"
+                    f"         threshold: 0.{safe_pct:02d}"
+                )
+
             msg = (
                 f"⚠ Compression model {_aux_label} context is "
                 f"{aux_context:,} tokens, but the main model "
@@ -377,9 +413,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 f"       auxiliary:\n"
                 f"         compression:\n"
                 f"           model: <model-with-{old_threshold:,}+-context>\n"
-                f"  2. Lower the compression threshold:\n"
-                f"       compression:\n"
-                f"         threshold: 0.{safe_pct:02d}"
+                f"{_threshold_suggestion}"
             )
             agent._compression_warning = msg
             agent._emit_status(msg)
