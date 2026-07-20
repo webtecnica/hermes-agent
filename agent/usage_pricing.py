@@ -26,6 +26,25 @@ CostSource = Literal[
     "none",
 ]
 
+_COST_STATUS_PRIORITY: dict[str, int] = {
+    "actual": 3,
+    "included": 2,
+    "estimated": 1,
+    "unknown": 0,
+}
+
+
+def sticky_cost_status(current: str | None, incoming: str | None) -> str:
+    """Return the most-confident status, favoring accuracy over recency.
+
+    Priority ladder: actual > included > estimated > unknown.
+    Once any call reports ``"actual"`` the row stays ``"actual"`` forever;
+    once ``"included"`` it stays ``"included"`` unless an ``"actual"`` arrives.
+    """
+    cur_rank = _COST_STATUS_PRIORITY.get(current or "", 0)
+    inc_rank = _COST_STATUS_PRIORITY.get(incoming or "", 0)
+    return incoming if inc_rank > cur_rank else (current or "unknown")
+
 
 @dataclass(frozen=True)
 class CanonicalUsage:

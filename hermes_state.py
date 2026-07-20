@@ -2884,7 +2884,13 @@ class SessionDB:
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE ?
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN cost_status = 'actual' THEN 'actual'
+                       WHEN ? = 'actual' THEN 'actual'
+                       WHEN cost_status = 'included' THEN 'included'
+                       WHEN ? = 'included' THEN 'included'
+                       ELSE COALESCE(?, cost_status)
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -2905,7 +2911,13 @@ class SessionDB:
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE COALESCE(actual_cost_usd, 0) + ?
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN cost_status = 'actual' THEN 'actual'
+                       WHEN ? = 'actual' THEN 'actual'
+                       WHEN cost_status = 'included' THEN 'included'
+                       WHEN ? = 'included' THEN 'included'
+                       ELSE COALESCE(?, cost_status)
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -2928,6 +2940,8 @@ class SessionDB:
             estimated_cost_usd,
             actual_cost_usd,
             actual_cost_usd,
+            cost_status,
+            cost_status,
             cost_status,
             cost_source,
             pricing_version,
@@ -3084,7 +3098,13 @@ class SessionDB:
                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
                    estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   cost_status = CASE
+                       WHEN cost_status = 'actual' THEN 'actual'
+                       WHEN excluded.cost_status = 'actual' THEN 'actual'
+                       WHEN cost_status = 'included' THEN 'included'
+                       WHEN excluded.cost_status = 'included' THEN 'included'
+                       ELSE COALESCE(excluded.cost_status, cost_status)
+                   END,
                    cost_source = COALESCE(excluded.cost_source, cost_source),
                    last_seen = excluded.last_seen""",
             (
@@ -3107,6 +3127,33 @@ class SessionDB:
                 now,
                 now,
             ),
+        )
+
+    def get_session_cost_summary(self, session_id: str):
+        """Read the persisted session cost fields so ``init_agent`` can
+        rehydrate the in-memory accumulators after a gateway restart.
+
+        Returns ``(estimated_cost_usd, actual_cost_usd, cost_status,
+        cost_source)`` as a 4-tuple, or ``None`` when the session row
+        doesn't exist or has no cost data.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT estimated_cost_usd,
+                          actual_cost_usd,
+                          cost_status,
+                          cost_source
+                   FROM sessions
+                   WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            row["estimated_cost_usd"],
+            row["actual_cost_usd"],
+            row["cost_status"],
+            row["cost_source"],
         )
 
     def ensure_session(
