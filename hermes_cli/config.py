@@ -131,16 +131,49 @@ def _warn_config_parse_failure(
 
     backup_path = _backup_corrupt_config(config_path)
 
+    # Try to extract line info from YAML ScannerError for a clearer message.
+    line_info = ""
+    suggestion = ""
+    if isinstance(exc, yaml.scanner.ScannerError):
+        line_match = re.search(r"line (\d+)", str(exc))
+        col_match = re.search(r"column (\d+)", str(exc))
+        if line_match:
+            line_no = line_match.group(1)
+            col_no = col_match.group(1) if col_match else None
+            line_info = f"\n  Location: line {line_no}"
+            if col_no:
+                line_info += f", column {col_no}"
+            try:
+                lines = config_path.read_text(encoding="utf-8").splitlines()
+                idx = int(line_no) - 1
+                if 0 <= idx < len(lines):
+                    bad_line = lines[idx].strip()
+                    if bad_line:
+                        line_info += f"\n  Content: {bad_line}"
+                    # Offer specific fix suggestion for triple-quote issues.
+                    if "'''" in bad_line or "\"\"\"" in bad_line.replace('"', "'"):
+                        suggestion = (
+                            "\n  Suggestion: Replace triple quotes ''' with '' "
+                            "(a valid empty single-quoted string). "
+                            "Python-style triple-quoting is not valid YAML."
+                        )
+            except Exception:
+                pass
+
     if fallback == "last-known-good":
         msg = (
-            f"Failed to parse {config_path}: {exc}. "
-            f"Keeping the previously loaded config for this process — "
+            f"Failed to parse {config_path}: {exc}."
+            f"{line_info}"
+            f"{suggestion}"
+            f" Keeping the previously loaded config for this process — "
             f"edits to config.yaml are being IGNORED until the YAML is fixed."
         )
     else:
         msg = (
-            f"Failed to parse {config_path}: {exc}. "
-            f"Falling back to default config — every user override "
+            f"Failed to parse {config_path}: {exc}."
+            f"{line_info}"
+            f"{suggestion}"
+            f" Falling back to default config — every user override "
             f"(auxiliary providers, fallback chain, model settings) is being IGNORED. "
             f"Fix the YAML and restart."
         )
@@ -152,6 +185,60 @@ def _warn_config_parse_failure(
         sys.stderr.flush()
     except Exception:
         pass
+
+def _try_repair_yaml_triple_quotes(raw_text: str) -> Optional[str]:
+    """Detect and repair unclosed triple-single-quote patterns in YAML.
+
+    When a user writes something like::
+
+        public_url: '''
+
+    PyYAML interprets the first ``'`` as opening a single-quoted string,
+    then ``''`` as an escaped single quote, leaving the string unclosed
+    (ScannerError: while scanning a quoted scalar).  This function tries
+    replacing **every occurrence** of ``'''`` with ``''`` (an empty
+    single-quoted string literal) and re-parsing.  ``'''`` cannot appear
+    in valid YAML single-quoted scalars — three consecutive ``'`` always
+    means a closed scalar followed by an unclosed one — so a global
+    replace is safe: it either fixes the broken string or turns an
+    already-broken file into one that still fails (no silent data loss).
+
+    Returns the corrected raw text on success, or *None* if either the
+    original was already valid or the repair didn't help.
+    """
+    # Already valid — nothing to repair.
+    try:
+        fast_safe_load(raw_text)
+        return None
+    except Exception:
+        pass
+
+    if "'''" not in raw_text and '"""' not in raw_text:
+        return None
+
+    import yaml.scanner
+
+    try:
+        fast_safe_load(raw_text)
+    except yaml.scanner.ScannerError as scan_err:
+        err_str = str(scan_err)
+        # Only attempt repair when the scanner itself reports an
+        # unclosed quoted scalar — other failures (bad anchors,
+        # duplicate keys, …) are not quote related.
+        if "while scanning a quoted scalar" not in err_str:
+            return None
+        if "found unexpected end" not in err_str:
+            return None
+    except Exception:
+        return None  # Non-scanner error; don't attempt repair.
+
+    corrected = raw_text.replace("'''", "''").replace('"""', '""')
+    try:
+        fast_safe_load(corrected)
+        return corrected
+    except Exception:
+        return None
+
 
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -7343,9 +7430,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         config = copy.deepcopy(DEFAULT_CONFIG)
 
         if user_sig is not None:
+            raw_text: Optional[str] = None
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                    raw_text = f.read()
+                user_config = fast_safe_load(raw_text) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -7356,45 +7445,91 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
-                # Last-known-good fallback (port of openai/codex#31188's
-                # invariant: a parse failure in a policy/config file must not
-                # silently replace the effective policy with an empty/default
-                # one). Falling through to DEFAULT_CONFIG here drops EVERY user
-                # override — including security-critical ``approvals.deny``
-                # rules, which are supposed to block commands even under yolo.
-                # A long-running gateway whose user mid-edits config.yaml into
-                # broken YAML would silently lose those rules on the next load.
-                # Within a running process we still have the last successfully
-                # loaded config — keep serving it until the file is fixed.
-                # Fresh processes with no last-known-good keep the existing
-                # DEFAULT_CONFIG fallback.
-                lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
-                _warn_config_parse_failure(
-                    config_path,
-                    e,
-                    fallback="last-known-good" if lkg is not None else "defaults",
-                )
-                if lkg is not None:
-                    # save_config() stores the pre-expansion normalized dict
-                    # (env-ref templates preserved); the load path stores the
-                    # expanded one. Expand defensively — idempotent when the
-                    # stored value is already expanded.
-                    from typing import cast as _cast
-                    lkg_copy: Dict[str, Any] = _cast(
-                        Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
+                # ── Auto-correction attempt ────────────────────────────
+                # Some common YAML mistakes (e.g. Python-style triple
+                # quotes ''' in a value) are detectable and fixable.  Try
+                # before falling back to defaults / last-known-good.
+                _auto_correction_handled = False
+                if raw_text is not None and ("'''" in raw_text or '"""' in raw_text):
+                    corrected = _try_repair_yaml_triple_quotes(raw_text)
+                    if corrected is not None:
+                        try:
+                            user_config = fast_safe_load(corrected) or {}
+
+                            if "max_turns" in user_config:
+                                agent_user_config = dict(
+                                    user_config.get("agent") or {}
+                                )
+                                if agent_user_config.get("max_turns") is None:
+                                    agent_user_config["max_turns"] = (
+                                        user_config["max_turns"]
+                                    )
+                                user_config["agent"] = agent_user_config
+                                user_config.pop("max_turns", None)
+
+                            config = _deep_merge(config, user_config)
+                            logger.warning(
+                                "Auto-corrected YAML in %s: replaced "
+                                "triple quotes ''' with '' (original "
+                                "error: %s).  To silence this warning, "
+                                "fix config.yaml directly.",
+                                config_path,
+                                e,
+                            )
+                            try:
+                                sys.stderr.write(
+                                    "⚠️  hermes config: Auto-corrected YAML "
+                                    f"in {config_path}: replaced triple "
+                                    f"quotes with ''.  Original error: "
+                                    f"{e}.  Please fix config.yaml.\n"
+                                )
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                            _auto_correction_handled = True
+                        except Exception:
+                            pass  # auto-correction didn't help; fall through
+
+                if not _auto_correction_handled:
+                    # Last-known-good fallback (port of openai/codex#31188's
+                    # invariant: a parse failure in a policy/config file must not
+                    # silently replace the effective policy with an empty/default
+                    # one). Falling through to DEFAULT_CONFIG here drops EVERY user
+                    # override — including security-critical ``approvals.deny``
+                    # rules, which are supposed to block commands even under yolo.
+                    # A long-running gateway whose user mid-edits config.yaml into
+                    # broken YAML would silently lose those rules on the next load.
+                    # Within a running process we still have the last successfully
+                    # loaded config — keep serving it until the file is fixed.
+                    # Fresh processes with no last-known-good keep the existing
+                    # DEFAULT_CONFIG fallback.
+                    lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                    _warn_config_parse_failure(
+                        config_path,
+                        e,
+                        fallback="last-known-good" if lkg is not None else "defaults",
                     )
-                    if cache_sig is not None:
-                        # Cache under the corrupt file's signature (empty env
-                        # snapshot: always valid) so repeated loads don't
-                        # re-parse the broken file; fixing the file changes the
-                        # signature and triggers a normal reload.
-                        _empty_env: Dict[str, Optional[str]] = {}
-                        _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig[0], cache_sig[1],
-                            cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env,
+                    if lkg is not None:
+                        # save_config() stores the pre-expansion normalized dict
+                        # (env-ref templates preserved); the load path stores the
+                        # expanded one. Expand defensively — idempotent when the
+                        # stored value is already expanded.
+                        from typing import cast as _cast
+                        lkg_copy: Dict[str, Any] = _cast(
+                            Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
                         )
-                    return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                        if cache_sig is not None:
+                            # Cache under the corrupt file's signature (empty env
+                            # snapshot: always valid) so repeated loads don't
+                            # re-parse the broken file; fixing the file changes the
+                            # signature and triggers a normal reload.
+                            _empty_env: Dict[str, Optional[str]] = {}
+                            _LOAD_CONFIG_CACHE[path_key] = (
+                                cache_sig[0], cache_sig[1],
+                                cache_sig[2], cache_sig[3],
+                                lkg_copy, _empty_env,
+                            )
+                        return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
