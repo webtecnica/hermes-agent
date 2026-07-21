@@ -334,6 +334,20 @@ export interface ModelOptionsResponse {
   providers?: ModelOptionProvider[]
 }
 
+export interface SessionMigrateRequest {
+  source_profile: string
+  target_profile: string
+  session_ids?: string[]
+}
+
+export interface SessionMigrateResponse {
+  migrated: number
+  skipped: number
+  errors: string[]
+  source: string
+  target: string
+}
+
 export interface PaginatedSessions {
   limit: number
   offset: number

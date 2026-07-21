@@ -4572,6 +4572,178 @@ def get_profiles_sessions_sidebar(
     }
 
 
+@app.post("/api/profiles/sessions/migrate")
+async def migrate_sessions_endpoint(body: SessionMigrateRequest):
+    """Copy sessions from one profile's state.db to another.
+
+    Reads sessions (and their messages) from the source profile's state.db and
+    inserts them into the target profile's state.db, setting ``profile_name``
+    to the target profile so they appear in that profile's session list.
+
+    When ``session_ids`` is omitted **all** sessions from the source profile's
+    DB are migrated. Accepts a specific list of session IDs for selective
+    migration.
+
+    This is a **copy** operation — source sessions are preserved. To remove
+    them from the source after migration, delete them separately via
+    ``DELETE /api/sessions/{id}?profile=source_profile``.
+    """
+    from hermes_cli import profiles as profiles_mod
+    from hermes_state import SessionDB
+
+    source = (body.source_profile or "").strip()
+    target = (body.target_profile or "").strip()
+
+    if not source:
+        raise HTTPException(status_code=400, detail="source_profile is required")
+    if not target:
+        raise HTTPException(status_code=400, detail="target_profile is required")
+
+    # Resolve profile home directories
+    try:
+        source_home = profiles_mod.get_profile_dir(source)
+        target_home = profiles_mod.get_profile_dir(target)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    source_db_path = source_home / "state.db"
+    target_db_path = target_home / "state.db"
+
+    if not source_db_path.exists():
+        raise HTTPException(status_code=404, detail=f"No state.db found for profile '{source}'")
+    if not target_db_path.exists():
+        raise HTTPException(status_code=404, detail=f"No state.db found for profile '{target}' (create the profile first)")
+
+    migrate_ids = body.session_ids  # None means "all"
+    migrated_count = 0
+    skip_count = 0
+    errors_list: List[str] = []
+
+    def _do_migrate():
+        nonlocal migrated_count, skip_count
+        source_db = SessionDB(db_path=source_db_path, read_only=True)
+        try:
+            # Read all sessions from the source profile
+            all_sessions = source_db.list_sessions_rich(
+                limit=5000,
+                offset=0,
+                include_children=True,
+                include_archived=True,
+                compact_rows=False,  # full rows including system_prompt/model_config
+            )
+        finally:
+            source_db.close()
+
+        if not all_sessions:
+            return
+
+        # Filter by requested session_ids if provided
+        if migrate_ids is not None:
+            id_set = set(migrate_ids)
+            target_sessions = [s for s in all_sessions if s["id"] in id_set]
+        else:
+            target_sessions = all_sessions
+
+        if not target_sessions:
+            return
+
+        # Open target DB for writing
+        target_db = SessionDB(db_path=target_db_path)
+        source_db_read = SessionDB(db_path=source_db_path, read_only=True)
+        try:
+            for session in target_sessions:
+                sid = session["id"]
+                try:
+                    # Check if session already exists in target
+                    existing = target_db.get_session(sid)
+                    if existing:
+                        skip_count += 1
+                        continue
+
+                    # Insert the session row
+                    target_db._insert_session_row(
+                        session_id=sid,
+                        source=session.get("source", "migrated"),
+                        model=session.get("model"),
+                        model_config=(
+                            json.loads(session["model_config"])
+                            if isinstance(session.get("model_config"), str)
+                            else session.get("model_config")
+                        ),
+                        system_prompt=session.get("system_prompt"),
+                        user_id=session.get("user_id"),
+                        session_key=session.get("session_key"),
+                        chat_id=session.get("chat_id"),
+                        chat_type=session.get("chat_type"),
+                        thread_id=session.get("thread_id"),
+                        parent_session_id=session.get("parent_session_id"),
+                        cwd=session.get("cwd"),
+                        profile_name=target,
+                    )
+
+                    # Copy messages
+                    messages = source_db_read.get_messages(sid, include_inactive=True)
+                    for msg in messages:
+                        target_db.append_message(
+                            session_id=sid,
+                            role=msg["role"],
+                            content=msg.get("content"),
+                            tool_name=msg.get("tool_name"),
+                            tool_calls=(
+                                json.loads(msg["tool_calls"])
+                                if isinstance(msg.get("tool_calls"), str)
+                                else msg.get("tool_calls")
+                            ),
+                            tool_call_id=msg.get("tool_call_id"),
+                            token_count=msg.get("token_count"),
+                            finish_reason=msg.get("finish_reason"),
+                            reasoning=msg.get("reasoning"),
+                            reasoning_content=msg.get("reasoning_content"),
+                            reasoning_details=(
+                                json.loads(msg["reasoning_details"])
+                                if isinstance(msg.get("reasoning_details"), str)
+                                else msg.get("reasoning_details")
+                            ),
+                            codex_reasoning_items=(
+                                json.loads(msg["codex_reasoning_items"])
+                                if isinstance(msg.get("codex_reasoning_items"), str)
+                                else msg.get("codex_reasoning_items")
+                            ),
+                            codex_message_items=(
+                                json.loads(msg["codex_message_items"])
+                                if isinstance(msg.get("codex_message_items"), str)
+                                else msg.get("codex_message_items")
+                            ),
+                            platform_message_id=msg.get("platform_message_id"),
+                            observed=bool(msg.get("observed", 0)),
+                            effect_disposition=msg.get("effect_disposition"),
+                            timestamp=msg.get("timestamp"),
+                            api_content=msg.get("api_content"),
+                        )
+
+                    migrated_count += 1
+                except Exception as exc:
+                    _log.exception("Failed to migrate session %s", sid)
+                    errors_list.append(f"Session {sid}: {exc}")
+        finally:
+            target_db.close()
+            source_db_read.close()
+
+    try:
+        await asyncio.to_thread(_do_migrate)
+    except Exception as exc:
+        _log.exception("Session migration failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "migrated": migrated_count,
+        "skipped": skip_count,
+        "errors": errors_list,
+        "source": source,
+        "target": target,
+    }
+
+
 @app.get("/api/sessions/search")
 async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
@@ -14077,6 +14249,12 @@ class ProfileSoulUpdate(BaseModel):
 
 class ProfileActiveUpdate(BaseModel):
     name: str
+
+
+class SessionMigrateRequest(BaseModel):
+    source_profile: str
+    target_profile: str
+    session_ids: Optional[List[str]] = None
 
 
 class ProfileDescriptionUpdate(BaseModel):
