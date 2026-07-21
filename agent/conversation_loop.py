@@ -3328,6 +3328,9 @@ def run_conversation(
                 # the primary provider won't recover within the retry window.
                 # Transport errors: allow 1 retry first (transient hiccups
                 # recover), then fall back if the provider is truly unreachable.
+                # Retryable 5xx (overloaded/server_error): allow 1 quick retry
+                # for blips, then fall back — functionally identical to a 429
+                # from the user's perspective.  Fixes #68771.
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
@@ -3336,6 +3339,11 @@ def run_conversation(
                 _is_transport_failure = classified.reason in {
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
+                    FailoverReason.server_error,
+                }
+                _is_retryable_5xx = classified.reason in {
+                    FailoverReason.overloaded,
+                    FailoverReason.server_error,
                 }
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
@@ -3352,6 +3360,7 @@ def run_conversation(
                 _should_fallback = (
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
+                    or (_is_retryable_5xx and retry_count >= 1)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
