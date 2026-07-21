@@ -93,11 +93,11 @@ const overlay = (screen: BillingOverlayState['screen']): BillingOverlayState => 
   state: billState()
 })
 
-describe('BillingOverlay — step-up screen (Allow Remote Spending)', () => {
+describe('BillingOverlay — step-up screen (Enable terminal billing)', () => {
   it('renders the one-time-setup prompt with the held amount, never leaking the raw scope', () => {
     const out = render(overlay('stepup'))
     expect(out).toContain('One-time setup')
-    expect(out).toContain('Allow Remote Spending')
+    expect(out).toContain('Enable terminal billing')
     expect(out).toContain('$100') // resumes the held purchase
     expect(out).toContain('Not now')
     expect(out).not.toContain('billing:manage')
@@ -112,8 +112,8 @@ describe('BillingOverlay — overview (reordered, dollars)', () => {
     expect(out).toContain('Auto-reload')
     expect(out).toContain('Manage on portal')
     expect(out.toLowerCase()).not.toContain('credits') // dollars only
-    // No standalone "Allow Remote Spending" item — discovered at pay time.
-    expect(out).not.toContain('Allow Remote Spending')
+    // No standalone "Enable terminal billing" item — discovered at pay time.
+    expect(out).not.toContain('Enable terminal billing')
   })
 
   it('renders the two-bar dollar usage when a usage model is present', () => {

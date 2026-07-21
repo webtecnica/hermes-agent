@@ -121,7 +121,7 @@ export function useStepUpFlow() {
     if (!result.data.granted) {
       setMessage({
         kind: 'error',
-        text: 'Verification finished without allowing Remote Spending for this terminal.',
+        text: 'Verification finished without granting billing management access.',
         title: 'Verification was not approved'
       })
 
@@ -134,7 +134,7 @@ export function useStepUpFlow() {
     ])
     setMessage({
       kind: 'success',
-      text: 'Remote Spending is allowed for this terminal.',
+      text: 'Billing management access was verified.',
       title: 'Verification complete'
     })
   }, [api, gateway, queryClient, unsubscribe])

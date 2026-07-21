@@ -551,7 +551,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        sys('💳 Open this link to allow Remote Spending:')
+        sys('💳 Open this link to grant terminal billing access:')
         sys(url)
 
         if (code) {
