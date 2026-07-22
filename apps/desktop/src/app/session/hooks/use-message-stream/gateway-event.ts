@@ -15,7 +15,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, normalizeChoices, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
@@ -621,12 +621,25 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // over; the inline ClarifyTool reads the active session's entry.
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
         const question = typeof payload?.question === 'string' ? payload.question : ''
+        const rawChoices = payload?.choices
+        const choices = normalizeChoices(rawChoices)
 
         if (requestId && question) {
+          // Diagnostic: log when gateway choices are malformed.
+          if (rawChoices !== undefined && rawChoices !== null && choices.length === 0) {
+            console.warn('[clarify] gateway choices dropped after normalization', {
+              source: 'gateway',
+              dropped_fields: ['choices'],
+              fallback_path: 'missing',
+              question_length: question.length,
+              choices_count: Array.isArray(rawChoices) ? rawChoices.length : 0
+            })
+          }
+
           setClarifyRequest({
             requestId,
             question,
-            choices: Array.isArray(payload?.choices) ? payload!.choices!.filter(c => typeof c === 'string') : null,
+            choices: choices.length > 0 ? choices : null,
             sessionId: sessionId ?? null
           })
 

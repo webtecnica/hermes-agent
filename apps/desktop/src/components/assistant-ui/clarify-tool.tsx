@@ -22,7 +22,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { clearClarifyRequest, sessionClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, normalizeChoices, sessionClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 
@@ -32,6 +32,16 @@ import { parseMaybeObject } from './tool/fallback-model/format'
 interface ClarifyArgs {
   question?: string
   choices?: string[] | null
+}
+
+/** Structured diagnostic payload for malformed clarify tool data. */
+interface ClarifyDiagnostic {
+  tool_call_id?: string
+  source: 'gateway' | 'tool_args'
+  dropped_fields: string[]
+  fallback_path: 'markdown' | 'missing' | 'none'
+  question_length: number
+  choices_count: number
 }
 
 interface ClarifyResult {
@@ -52,11 +62,27 @@ function stringField(row: Record<string, unknown>, ...keys: string[]): string | 
 
 function readClarifyArgs(args: unknown): ClarifyArgs {
   const row = parseMaybeObject(args)
-  const choices = Array.isArray(row.choices) ? row.choices.filter((c): c is string => typeof c === 'string') : null
+  const rawChoices = row.choices
+  const choices = normalizeChoices(rawChoices)
+
+  const question = stringField(row, 'question')
+
+  // Diagnostic: log when choices are missing or malformed.
+  if (rawChoices !== undefined && rawChoices !== null && choices.length === 0 && question) {
+    const diag: ClarifyDiagnostic = {
+      source: 'tool_args',
+      dropped_fields: ['choices'],
+      fallback_path: 'missing',
+      question_length: question.length,
+      choices_count: Array.isArray(rawChoices) ? rawChoices.length : 0
+    }
+
+    console.warn('[clarify] choices dropped after normalization', diag)
+  }
 
   return {
-    question: stringField(row, 'question'),
-    choices: choices && choices.length > 0 ? choices : null
+    question,
+    choices: choices.length > 0 ? choices : null
   }
 }
 
@@ -398,7 +424,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 type="button"
               >
                 <KeyBadge char={letterFor(index)} selected={selectedChoice === choice} />
-                <span className="flex-1 wrap-anywhere">{choice}</span>
+                <span className="flex-1 [overflow-wrap:anywhere]">{choice}</span>
               </button>
             ))}
             <label className={cn(OPTION_ROW_CLASS, 'items-center')}>

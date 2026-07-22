@@ -9,6 +9,28 @@ export interface ClarifyRequest {
   sessionId: string | null
 }
 
+/**
+ * Validate and normalize a choices array.
+ *
+ * Returns cleaned choices with non-blank, non-newline strings of length
+ * 1..200. Drops garbage items and returns an empty array when nothing
+ * usable survives — the caller should then fall back to a marker row.
+ */
+export function normalizeChoices(choices: unknown): string[] {
+  if (!Array.isArray(choices)) {
+    return []
+  }
+
+  return choices.filter(
+    (c): c is string =>
+      typeof c === 'string' &&
+      c.length >= 1 &&
+      c.length <= 200 &&
+      !c.includes('\n') &&
+      c.trim().length > 0
+  )
+}
+
 // Pending clarify requests keyed by the runtime session id that raised them.
 // Storing per-session (instead of one shared slot) lets a *background* session
 // park its clarify request while the user is looking at a different chat, then
