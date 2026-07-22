@@ -65,6 +65,125 @@ import os
 import sys
 
 
+def _exit_after_oneshot(rc: object) -> None:
+    """Exit one-shot mode without letting late native finalizers change rc.
+
+    The SIGABRT this guards against (#30387, #43055) fires in a
+    native-extension finalizer during CPython's ``Py_FinalizeEx``, *after*
+    the response has printed. Flush streams, shut down file logging, then
+    ``os._exit`` past interpreter finalization. The ``atexit`` chain is
+    deliberately skipped — several handlers re-enter native code that may
+    be the abort source. Stateful cleanup is handled in ``_run_agent`` and
+    ``_cleanup_oneshot_runtime``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    if rc is None:
+        exit_code = 0
+    elif isinstance(rc, int):
+        exit_code = rc
+    else:
+        exit_code = 1
+    os._exit(exit_code)
+
+
+_oneshot_cleanup_done = False
+
+
+def _cleanup_oneshot_runtime() -> None:
+    """Best-effort process-global cleanup before one-shot hard exit.
+
+    ``run_oneshot`` owns the agent-local cleanup (memory provider, agent.close,
+    session_db.close — all in ``_run_agent``'s finally block). This mirrors the
+    process-global pieces from ``cli.py:_run_cleanup()`` that would otherwise
+    be skipped by ``os._exit``.
+    """
+    global _oneshot_cleanup_done
+    if _oneshot_cleanup_done:
+        return
+    _oneshot_cleanup_done = True
+    try:
+        from tools.terminal_tool import cleanup_all_environments
+        cleanup_all_environments()
+    except Exception:
+        pass
+    try:
+        from tools.async_delegation import interrupt_all
+        interrupt_all(reason="oneshot shutdown")
+    except Exception:
+        pass
+    try:
+        from tools.browser_tool import _emergency_cleanup_all_sessions
+        _emergency_cleanup_all_sessions()
+    except Exception:
+        pass
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
+    except BaseException:
+        pass
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+        shutdown_cached_clients()
+    except Exception:
+        pass
+
+
+def _run_and_exit_oneshot(
+    prompt: str,
+    *,
+    model: object = None,
+    provider: object = None,
+    toolsets: object = None,
+    usage_file: object = None,
+) -> None:
+    try:
+        from hermes_cli.oneshot import run_oneshot
+
+        rc = run_oneshot(
+            prompt,
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            usage_file=usage_file,
+        )
+    except KeyboardInterrupt:
+        rc = 130
+    except SystemExit as exc:
+        if exc.code is not None and not isinstance(exc.code, int):
+            print(exc.code, file=sys.stderr)
+            rc = 1
+        else:
+            rc = exc.code
+    except BaseException:
+        # Defense-in-depth. ``run_oneshot`` already converts agent failures
+        # into an int return code and only re-raises KeyboardInterrupt /
+        # SystemExit (handled above). Anything still escaping here means
+        # ``run_oneshot`` itself malfunctioned — surface it on stderr but never
+        # fall through to normal interpreter teardown, which is the exact path
+        # that aborts with SIGABRT on AL2023 (the bug this routine fixes).
+        import traceback
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+        rc = 1
+    try:
+        _cleanup_oneshot_runtime()
+    finally:
+        # The hard exit is the safety boundary for #43055. Even an interrupt
+        # during best-effort cleanup must not fall back into interpreter
+        # finalization, where the reported native SIGABRT occurs.
+        _exit_after_oneshot(rc)
+
+
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
     'htop' show the app name instead of 'python3.xx'.
@@ -468,9 +587,21 @@ def _apply_profile_override() -> None:
     # `hermes profile use` and the gateway should honour that choice.
     # See issue #22502.
     hermes_home_env = os.environ.get("HERMES_HOME", "")
+    hermes_profile_env = os.environ.get("HERMES_PROFILE", "").strip()
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
             return
+
+    # 1.6 No explicit flag or profile-path HERMES_HOME — check HERMES_PROFILE
+    # env var (systemd override.conf, Docker Compose, etc.).  This gives
+    # sysadmins a clean way to pin the gateway to a profile without needing
+    # the active_profile file or --profile flag.  See the PR description for context
+    if profile_name is None and hermes_profile_env:
+        import re as _profile_re
+
+        if _profile_re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", hermes_profile_env):
+            profile_name = hermes_profile_env
+            consume = 0  # not in argv, nothing to strip
 
     # 2. If no flag, check active_profile in the hermes root.
     #
@@ -3048,6 +3179,7 @@ def select_provider_and_model(args=None):
     from hermes_cli.models import (
         CANONICAL_PROVIDERS,
         _PROVIDER_LABELS,
+        _PROVIDER_ALIASES,
         group_providers,
         provider_group_for_slug,
     )
@@ -3071,7 +3203,30 @@ def select_provider_and_model(args=None):
     # resolves back to a concrete slug, so the dispatch chain below is
     # unchanged. Custom providers and the trailing actions stay flat.
     canonical_descs = {p.slug: p.tui_desc for p in CANONICAL_PROVIDERS}
-    grouped_rows = group_providers([p.slug for p in CANONICAL_PROVIDERS])
+    # Honor ``model_catalog.excluded_providers`` so the CLI ``hermes model``
+    # picker hides the same providers the gateway/TUI pickers do. A canonical
+    # provider is hidden if its slug OR any of its aliases appears in the
+    # exclusion list (case-insensitive), matching list_authenticated_providers'
+    # matching against hermes_id / alias / canonical slug.
+    _cli_excluded = {
+        str(p).strip().lower()
+        for p in (config.get("model_catalog", {}) or {}).get("excluded_providers") or []
+        if p
+    }
+    if _cli_excluded:
+        _alias_to_canon = _PROVIDER_ALIASES
+        _names_for: dict[str, set[str]] = {}
+        for _p in CANONICAL_PROVIDERS:
+            _names_for[_p.slug] = {_p.slug.lower()}
+        for _alias, _canon in _alias_to_canon.items():
+            _names_for.setdefault(_canon, {_canon.lower()}).add(_alias.lower())
+        _visible_slugs = [
+            p.slug for p in CANONICAL_PROVIDERS
+            if not _names_for.get(p.slug, {p.slug.lower()}) & _cli_excluded
+        ]
+    else:
+        _visible_slugs = [p.slug for p in CANONICAL_PROVIDERS]
+    grouped_rows = group_providers(_visible_slugs)
 
     # The group/slug that should be pre-selected: the active provider's group
     # if it's grouped, otherwise the active slug itself.
@@ -11506,6 +11661,33 @@ def _coalesce_session_name_args(argv: list) -> list:
     return result
 
 
+def _try_add_root_skills_external_dir(profile_dir: Path) -> None:
+    """Add the root skills directory to the profile's skills.external_dirs.
+
+    Profiles use distinct skills/ directories; without this, skills
+    installed at the root level (e.g. delegation, subagent-dispatch)
+    are invisible to the new profile.
+    """
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return
+    try:
+        import yaml
+        from hermes_constants import get_default_hermes_root
+
+        raw = config_path.read_text()
+        config = yaml.safe_load(raw) or {}
+        skills_cfg = config.setdefault("skills", {})
+        external = skills_cfg.setdefault("external_dirs", [])
+        root_skills = str(get_default_hermes_root() / "skills")
+
+        if root_skills not in external:
+            external.append(root_skills)
+            config_path.write_text(yaml.dump(config, default_flow_style=False))
+    except Exception:
+        pass  # best-effort — the profile still works without it
+
+
 def cmd_profile(args):
     """Profile management — create, delete, list, switch, alias."""
     from hermes_cli.profiles import (
@@ -11592,11 +11774,29 @@ def cmd_profile(args):
     elif action == "use":
         name = args.profile_name
         try:
+            old_name = get_active_profile_name()
             set_active_profile(name)
             if name == "default":
                 print("Switched to: default (~/.hermes)")
             else:
                 print(f"Switched to: {name}")
+            # Warn about per-profile data when switching away from default
+            # to a named profile.  Several data stores (webhook subscriptions,
+            # user-installed plugins, PR watch state) are scoped to
+            # HERMES_HOME and don't follow the profile switch.  See the PR description for context
+            if old_name != name and old_name != "custom":
+                print()
+                print(
+                    "  ⚠  Per-profile data does not follow the switch."
+                )
+                print(
+                    "     Webhook subscriptions, user plugins, and"
+                )
+                print(
+                    "     PR watch state live under the previous profile."
+                )
+                print(f"     Run:  hermes profile migrate {old_name} {name}")
+                print()
         except (ValueError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -11666,6 +11866,29 @@ def cmd_profile(args):
                             name
                         )
                     )
+
+            # Auto-activate the profile if it's the first non-default profile.
+            # Without this, the user creates a profile but the gateway keeps
+            # running under the default profile — a silent no-op that looks
+            # like the profile wasn't created at all. See the PR description for context
+            if not (clone_config or clone_all):
+                current_active = get_active_profile_name()
+                profiles = list_profiles()
+                non_default = [p for p in profiles if not p.is_default]
+                if current_active == "default" and len(non_default) == 1:
+                    set_active_profile(name)
+                    print(
+                        f"✔ Profile '{name}' set as active "
+                        "(first non-default profile)"
+                    )
+
+            # Auto-populate skills.external_dirs so the new profile inherits
+            # skills installed at the root level (delegation, subagent-dispatch,
+            # my-prs-status, etc.). Without this, each profile has its own
+            # isolated skills/ directory and skills from the root are invisible.
+            # See the PR description for context
+            if not (clone_config or clone_all):
+                _try_add_root_skills_external_dir(profile_dir)
 
             # Create wrapper alias
             if not no_alias:
@@ -12973,16 +13196,12 @@ def _try_termux_fast_cli_launch() -> bool:
 
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
-        from hermes_cli.oneshot import run_oneshot
-
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-                usage_file=getattr(args, "usage_file", None),
-            )
+        _run_and_exit_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            usage_file=getattr(args, "usage_file", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -15130,16 +15349,12 @@ def main():
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
     if getattr(args, "oneshot", None):
-        from hermes_cli.oneshot import run_oneshot
-
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-                usage_file=getattr(args, "usage_file", None),
-            )
+        _run_and_exit_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            usage_file=getattr(args, "usage_file", None),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

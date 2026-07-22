@@ -652,6 +652,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Keep app data live while the gateway is open (on-connect reseed + the
   // cron / messaging / transcript visibility polls + fresh-draft reseed).
   useBackgroundSync({
+    activeGatewayProfile,
     activeIsMessaging,
     activeSessionId,
     freshDraftReady,
@@ -918,7 +919,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
               setCurrentProvider(provider)
               setCurrentModel(model)
               setCurrentModelSource('default')
-              updateModelOptionsCache(provider, model, true)
+              updateModelOptionsCache($activeSessionId.get(), provider, model, true)
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
