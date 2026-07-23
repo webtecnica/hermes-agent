@@ -5848,6 +5848,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
+            media_urls = getattr(event, "media_urls", None) or []
+            has_media = bool(media_urls)
+
+            # For media events (PHOTO, audio, video), build a media-aware
+            # steer text that includes image/file URLs so they aren't dropped
+            # from the current turn's context. Mirrors the interrupt path
+            # which uses _build_media_placeholder (#70253).
+            if has_media:
+                media_part = _build_media_placeholder(event)
+                if steer_text:
+                    steer_text = steer_text + "\n" + media_part
+                else:
+                    steer_text = media_part
+
             can_steer = (
                 steer_text
                 and running_agent is not None

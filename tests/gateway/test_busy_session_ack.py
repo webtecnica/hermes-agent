@@ -869,3 +869,192 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", agent, executor_task=live_task
         ) is True
+
+
+class TestBusySessionPhotoSteer:
+    """PHOTO events during a busy steer turn must include media in what gets steered."""
+
+    @pytest.mark.asyncio
+    async def test_steer_mode_photo_without_caption_includes_media_placeholder(self):
+        """PHOTO event with no caption in steer mode should steer media placeholder."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        src = SessionSource(
+            platform=MagicMock(value="telegram"), chat_id="123",
+            chat_type="dm", user_id="user1",
+        )
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=src,
+            message_id="photo1",
+            media_urls=["/tmp/test_image.png"],
+            media_types=["image/png"],
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        # Verify steer was called with a media placeholder, not empty text
+        args, _ = agent.steer.call_args
+        steer_text = args[0]
+        assert "[User sent an image: /tmp/test_image.png]" in steer_text
+        assert steer_text != ""  # not empty — media was preserved
+        agent.interrupt.assert_not_called()
+        # Event was NOT queued for next turn (successful steer skips queue)
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_steer_mode_photo_with_caption_includes_caption_and_media(self):
+        """PHOTO event with caption in steer mode should steer caption + media placeholder."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        src = SessionSource(
+            platform=MagicMock(value="telegram"), chat_id="123",
+            chat_type="dm", user_id="user1",
+        )
+        event = MessageEvent(
+            text="check this photo",
+            message_type=MessageType.PHOTO,
+            source=src,
+            message_id="photo2",
+            media_urls=["/tmp/test_image.png"],
+            media_types=["image/png"],
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        args, _ = agent.steer.call_args
+        steer_text = args[0]
+        # Caption is preserved
+        assert "check this photo" in steer_text
+        # Media placeholder is included
+        assert "[User sent an image: /tmp/test_image.png]" in steer_text
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_steer_mode_photo_falls_back_to_queue_when_steer_rejected(self):
+        """PHOTO event in steer mode falls back to queue when agent.steer() returns False."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        src = SessionSource(
+            platform=MagicMock(value="telegram"), chat_id="123",
+            chat_type="dm", user_id="user1",
+        )
+        event = MessageEvent(
+            text="check this",
+            message_type=MessageType.PHOTO,
+            source=src,
+            message_id="photo3",
+            media_urls=["/tmp/test_image.png"],
+            media_types=["image/png"],
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=False)  # rejected
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.steer.assert_called_once()
+        agent.interrupt.assert_not_called()
+        # Fell back to queue: event stored for next turn
+        pending = adapter._pending_messages.get(sk)
+        assert pending is event
+        assert pending.media_urls == ["/tmp/test_image.png"]
+        assert pending.text == "check this"
+
+    @pytest.mark.asyncio
+    async def test_steer_mode_photo_with_multiple_media_urls(self):
+        """Album/photo-burst with multiple images includes all URLs in steer text."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        src = SessionSource(
+            platform=MagicMock(value="telegram"), chat_id="123",
+            chat_type="dm", user_id="user1",
+        )
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=src,
+            message_id="album",
+            media_urls=["/tmp/img1.png", "/tmp/img2.png"],
+            media_types=["image/png", "image/png"],
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        args, _ = agent.steer.call_args
+        steer_text = args[0]
+        assert "[User sent an image: /tmp/img1.png]" in steer_text
+        assert "[User sent an image: /tmp/img2.png]" in steer_text
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_photo_still_queued_in_steer_mode_when_no_steer_attr(self):
+        """PHOTO event without steer() support falls back to queue like text does."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        src = SessionSource(
+            platform=MagicMock(value="telegram"), chat_id="123",
+            chat_type="dm", user_id="user1",
+        )
+        event = MessageEvent(
+            text="caption",
+            message_type=MessageType.PHOTO,
+            source=src,
+            message_id="photo4",
+            media_urls=["/tmp/test_image.png"],
+            media_types=["image/png"],
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        # Remove the steer attribute so `hasattr(agent, 'steer')` is False
+        del agent.steer
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        # Event queued for next turn
+        pending = adapter._pending_messages.get(sk)
+        assert pending is event
+        assert pending.media_urls == ["/tmp/test_image.png"]
+        assert pending.text == "caption"
