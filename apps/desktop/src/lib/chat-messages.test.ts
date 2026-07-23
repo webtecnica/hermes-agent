@@ -8,7 +8,8 @@ import {
   preserveLocalAssistantErrors,
   renderMediaTags,
   toChatMessages,
-  upsertToolPart
+  upsertToolPart,
+  withUniqueToolCallIds
 } from './chat-messages'
 
 describe('toChatMessages', () => {
@@ -783,5 +784,94 @@ describe('upsertToolPart', () => {
       data: { web: [{ title: 'Suva forecast' }] },
       summary: 'Did 1 search in 0.5s'
     })
+  })
+})
+
+describe('withUniqueToolCallIds', () => {
+  it('deduplicates tool-call parts with the same toolCallId across messages', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'msg-1',
+        role: 'assistant',
+        parts: [
+          { type: 'text', text: 'Let me check.' },
+          { type: 'tool-call', toolCallId: 'tc-1', toolName: 'read_file', args: {} as never, argsText: '{}' }
+        ]
+      },
+      {
+        id: 'msg-2',
+        role: 'assistant',
+        parts: [
+          { type: 'tool-call', toolCallId: 'tc-1', toolName: 'read_file', args: {} as never, argsText: '{}' },
+          { type: 'tool-call', toolCallId: 'tc-2', toolName: 'search_files', args: {} as never, argsText: '{}' }
+        ]
+      }
+    ]
+
+    const result = withUniqueToolCallIds(messages)
+
+    const allIds = result.flatMap(m =>
+      m.parts.filter((p): p is Extract<ChatMessagePart, { type: 'tool-call' }> => p.type === 'tool-call').map(p => p.toolCallId)
+    )
+
+    expect(allIds[0]).toBe('tc-1')
+    expect(allIds[1]).not.toBe('tc-1')
+    expect(allIds[2]).toBe('tc-2')
+    expect(new Set(allIds).size).toBe(allIds.length)
+  })
+
+  it('deduplicates tool-call parts with the same toolCallId within the same message', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'msg-same',
+        role: 'assistant',
+        parts: [
+          { type: 'tool-call', toolCallId: 'tc-dupe', toolName: 'web_search', args: {} as never, argsText: '{}' },
+          { type: 'tool-call', toolCallId: 'tc-dupe', toolName: 'web_search', args: {} as never, argsText: '{}' },
+          { type: 'tool-call', toolCallId: 'tc-unique', toolName: 'terminal', args: {} as never, argsText: '{}' }
+        ]
+      }
+    ]
+
+    const result = withUniqueToolCallIds(messages)
+
+    const toolParts = result[0].parts.filter(
+      (p): p is Extract<ChatMessagePart, { type: 'tool-call' }> => p.type === 'tool-call'
+    )
+
+    expect(toolParts).toHaveLength(3)
+    const ids = toolParts.map(p => p.toolCallId)
+    expect(new Set(ids).size).toBe(3)
+    expect(ids[0]).toBe('tc-dupe')
+    expect(ids[1]).not.toBe('tc-dupe')
+    expect(ids[2]).toBe('tc-unique')
+  })
+
+  it('preserves unique toolCallIds without modification', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'msg-a',
+        role: 'assistant',
+        parts: [
+          { type: 'tool-call', toolCallId: 'tc-a', toolName: 'read_file', args: {} as never, argsText: '{}' },
+          { type: 'tool-call', toolCallId: 'tc-b', toolName: 'terminal', args: {} as never, argsText: '{}' }
+        ]
+      },
+      {
+        id: 'msg-b',
+        role: 'assistant',
+        parts: [
+          { type: 'tool-call', toolCallId: 'tc-c', toolName: 'web_search', args: {} as never, argsText: '{}' }
+        ]
+      }
+    ]
+
+    const result = withUniqueToolCallIds(messages)
+
+    const allIds = result.flatMap(m =>
+      m.parts.filter((p): p is Extract<ChatMessagePart, { type: 'tool-call' }> => p.type === 'tool-call').map(p => p.toolCallId)
+    )
+
+    expect(allIds).toEqual(['tc-a', 'tc-b', 'tc-c'])
   })
 })

@@ -668,7 +668,7 @@ function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: numbe
   }
 }
 
-function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
+export function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   const seen = new Set<string>()
 
   return messages.map(message => {

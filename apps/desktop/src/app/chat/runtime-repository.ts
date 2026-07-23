@@ -1,7 +1,7 @@
 import { ExportedMessageRepository, type ThreadMessage } from '@assistant-ui/react'
 import { useMemo, useRef } from 'react'
 
-import type { ChatMessage } from '@/lib/chat-messages'
+import { type ChatMessage, withUniqueToolCallIds } from '@/lib/chat-messages'
 import { coalesceToolOnlyAssistants, createToolMergeCache, toRuntimeMessage } from '@/lib/chat-runtime'
 
 /**
@@ -20,7 +20,10 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
     let visibleParentId: string | null = null
     let headId: string | null = null
 
-    for (const message of coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)) {
+    const coalesced = coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)
+    const deduped = withUniqueToolCallIds(coalesced)
+
+    for (const message of deduped) {
       let parentId = visibleParentId
 
       if (message.role === 'assistant' && message.branchGroupId) {
