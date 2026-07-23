@@ -2765,17 +2765,21 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
-def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
-    """Drain gateway-owned watch events without spinning on requeued events.
+def _drain_gateway_watch_events(completion_queue) -> "tuple[list[dict], list[dict]]":
+    """Drain gateway-owned watch events and bg_completions without spinning.
 
-    Watch events are handled by the post-turn gateway drain. Process
-    completions are owned by their per-process watcher task, and async
-    delegation completions are owned by ``_async_delegation_watcher``.
-    Requeueing async events inside ``while not queue.empty()`` would make the
-    loop non-terminating, so detach the current batch first, then requeue any
-    events this drain does not own after the queue is empty.
+    Returns a two-tuple ``(watch_events, bg_completions)``.
+
+    Watch events are handled by the post-turn gateway drain. Background
+    process completions are coalesced into a single notification per
+    destination during the drain batch. Async delegation completions are
+    owned by ``_async_delegation_watcher``.  Requeueing async events inside
+    ``while not queue.empty()`` would make the loop non-terminating, so
+    detach the current batch first, then requeue any events this drain does
+    not own after the queue is empty.
     """
     watch_events: list[dict] = []
+    bg_completions: list[dict] = []
     requeue: list[dict] = []
     while not completion_queue.empty():
         try:
@@ -2787,10 +2791,51 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
             watch_events.append(evt)
         elif evt_type == "async_delegation":
             requeue.append(evt)
-        # else: process completion events are handled by the watcher task
+        elif evt_type == "bg_completion":
+            bg_completions.append(evt)
+        # else: agent_notify completions (type "completion") are handled
+        # by the per-process watcher task via _deliver_completion_notification
     for evt in requeue:
         completion_queue.put(evt)
-    return watch_events
+    return (watch_events, bg_completions)
+
+
+def _coalesce_bg_completions(events: "list[dict]") -> "list[dict]":
+    """Coalesce bg_completion events by destination into one notification per group.
+
+    Multiple background processes finishing in the same drain batch produce a
+    single message like ``[SYSTEM: 3 background processes finished]`` instead
+    of N individual messages.
+    """
+    groups: "dict[str, list[dict]]" = {}
+    for evt in events:
+        identity = "{}:{}:{}".format(
+            evt.get("platform", ""),
+            evt.get("chat_id", ""),
+            evt.get("thread_id", ""),
+        )
+        groups.setdefault(identity, []).append(evt)
+
+    coalesced: "list[dict]" = []
+    for _identity, group in groups.items():
+        platform = group[0].get("platform", "")
+        chat_id = group[0].get("chat_id", "")
+        thread_id = group[0].get("thread_id", "")
+        count = len(group)
+        session_ids = ", ".join(e.get("session_id", "?") for e in group)
+        message_text = "[SYSTEM: {} background processes finished ({})]".format(
+            count, session_ids
+        )
+        coalesced.append({
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "count": count,
+            "session_ids": session_ids,
+            "message_text": message_text,
+            "session_key": group[0].get("session_key", ""),
+        })
+    return coalesced
 
 
 # Module-level weak reference to the active GatewayRunner instance.
@@ -13105,9 +13150,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.error("Process watcher setup error: %s", e)
 
             # Drain watch pattern notifications that arrived during the agent run.
-            # Watch events and completions share the same queue; process
-            # completions are already handled by the per-process watcher task
-            # above, so we only inject watch-type events here.
+            # Watch events and completions share the same queue; non-agent_notify
+            # process completions are coalesced into a single notification per
+            # destination (bg_completion), and agent_notify completions are
+            # handled by the per-process watcher task.
             #
             # Async-delegation completions ALSO ride this shared queue but are
             # owned by the dedicated _async_delegation_watcher (started at
@@ -13115,7 +13161,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # single consumer — so we leave them on the queue here.
             try:
                 from tools.process_registry import process_registry as _pr
-                _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
+                _watch_events, _bg_completions = _drain_gateway_watch_events(_pr.completion_queue)
                 for evt in _watch_events:
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
@@ -13123,6 +13169,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await self._inject_watch_notification(synth_text, evt)
                         except Exception as e2:
                             logger.error("Watch notification injection error: %s", e2)
+                # Coalesce multiple background process completions that arrived
+                # in the same drain batch into a single notification per
+                # destination, preventing a flood of individual messages.
+                if _bg_completions:
+                    _coalesced = _coalesce_bg_completions(_bg_completions)
+                    for _cevt in _coalesced:
+                        _msg = _cevt.get("message_text", "")
+                        if not _msg:
+                            continue
+                        try:
+                            await self._send_bg_completion_coalesced(_cevt)
+                        except Exception as e2:
+                            logger.error("Coalesced bg completion send error: %s", e2)
             except Exception as e:
                 logger.debug("Watch queue drain error: %s", e)
 
@@ -16956,6 +17015,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _send_bg_completion_coalesced(self, evt: dict) -> None:
+        """Deliver a coalesced bg_completion notification to the user's chat.
+
+        Finds the adapter for the event's platform and sends the combined
+        message text via ``adapter.send()``, bypassing the agent loop entirely
+        (these are status notifications, not agent messages).
+        """
+        platform_name = evt.get("platform", "")
+        chat_id = evt.get("chat_id", "")
+        thread_id = evt.get("thread_id", "")
+        message_text = evt.get("message_text", "")
+        if not message_text or not chat_id or not platform_name:
+            return
+        adapter = None
+        for p, a in self.adapters.items():
+            if p.value == platform_name:
+                adapter = a
+                break
+        if adapter:
+            try:
+                send_meta = {"thread_id": thread_id} if thread_id else None
+                await adapter.send(
+                    chat_id,
+                    message_text,
+                    metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                )
+            except Exception as e:
+                logger.error("Coalesced bg completion send error: %s", e)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -16966,6 +17054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         subagent finishes while no agent turn is running, its result still
         re-enters the originating session promptly.
 
+        Also drains ``bg_completion`` events during idle periods, coalescing
+        multiple process completions into a single notification per destination.
+
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
         queue has nothing for us; ignores non-async event types (those are
         handled by ``_run_process_watcher`` / the post-turn drain).
@@ -16974,18 +17065,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.process_registry import process_registry as _pr
         while self._running:
             try:
-                # Peek the queue for async-delegation events. We must NOT
-                # consume watch/completion events here (other drains own them),
-                # so requeue anything that isn't ours.
-                requeue = []
-                async_events = []
+                # Peek the queue for events we own.  Async-delegation events
+                # are injected as new turns; bg_completion events are coalesced
+                # by destination into a single notification.  Everything else
+                # is requeued for the post-turn drain or process watcher.
+                requeue: list[dict] = []
+                async_events: list[dict] = []
+                bg_events: list[dict] = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
+                    evt_type = evt.get("type", "completion")
+                    if evt_type == "async_delegation":
                         async_events.append(evt)
+                    elif evt_type == "bg_completion":
+                        bg_events.append(evt)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
@@ -17002,6 +17098,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                # Coalesce idle bg_completion events — multiple processes
+                # finishing between turns fire a single combined notification.
+                if bg_events:
+                    try:
+                        _coalesced = _coalesce_bg_completions(bg_events)
+                        for _cevt in _coalesced:
+                            _msg = _cevt.get("message_text", "")
+                            if not _msg:
+                                continue
+                            await self._send_bg_completion_coalesced(_cevt)
+                    except Exception as e:
+                        logger.error("Idle bg completion coalesce error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -17114,38 +17222,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     break
 
-                # --- Normal text-only notification ---
+                # --- Normal text-only notification (coalesced via completion_queue) ---
                 # Decide whether to notify based on mode
                 should_notify = (
                     notify_mode in {"all", "result"}
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
-                    if new_output:
-                        from agent.redact import redact_terminal_output
-                        new_output = redact_terminal_output(
-                            new_output, getattr(session, "command", "") or ""
-                        )
-                    message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
-                    )
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p.value == platform_name:
-                            adapter = a
-                            break
-                    if adapter and chat_id:
-                        try:
-                            send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(
-                                chat_id,
-                                message_text,
-                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
-                            )
-                        except Exception as e:
-                            logger.error("Watcher delivery error: %s", e)
+                    # Push a bg_completion event onto the shared queue instead of
+                    # sending directly.  When multiple processes finish in the same
+                    # tick the post-turn drain coalesces them into one notification
+                    # per destination, preventing a session flood.
+                    _bg_evt = {
+                        "type": "bg_completion",
+                        "session_id": session_id,
+                        "session_key": session_key,
+                        "platform": platform_name,
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                    }
+                    try:
+                        process_registry.completion_queue.put(_bg_evt)
+                    except Exception as e:
+                        logger.error("Bg completion queue error: %s", e)
                 break
 
             elif has_new_output and notify_mode == "all" and not agent_notify:

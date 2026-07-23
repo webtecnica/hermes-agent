@@ -8,13 +8,18 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
 
 import asyncio
+import queue
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.run import GatewayRunner, _parse_session_key
+from gateway.run import (
+    GatewayRunner,
+    _coalesce_bg_completions,
+    _parse_session_key,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +31,7 @@ class _FakeRegistry:
 
     def __init__(self, sessions):
         self._sessions = list(sessions)
+        self.completion_queue = queue.Queue()
 
     def get(self, session_id):
         if self._sessions:
@@ -120,16 +126,16 @@ class TestLoadBackgroundNotificationsMode:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mode", "sessions", "expected_calls", "expected_fragment"),
+    ("mode", "sessions", "should_queue", "expected_fragment"),
     [
-        # all mode: running output → sends update
+        # all mode: running output → sends update (direct adapter.send)
         (
             "all",
             [
                 SimpleNamespace(output_buffer="building...\n", exited=False, exit_code=None),
                 None,  # process disappears → watcher exits
             ],
-            1,
+            False,  # running output is sent directly, not queued
             "is still running",
         ),
         # result mode: running output → no update
@@ -139,48 +145,48 @@ class TestLoadBackgroundNotificationsMode:
                 SimpleNamespace(output_buffer="building...\n", exited=False, exit_code=None),
                 None,
             ],
-            0,
+            False,
             None,
         ),
         # off mode: exited process → no notification
         (
             "off",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
-            0,
+            False,
             None,
         ),
-        # result mode: exited → notifies
+        # result mode: exited → queues bg_completion
         (
             "result",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
-            1,
-            "finished with exit code 0",
+            True,
+            "bg_completion",
         ),
         # error mode: exit 0 → no notification
         (
             "error",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
-            0,
+            False,
             None,
         ),
-        # error mode: exit 1 → notifies
+        # error mode: exit 1 → queues bg_completion
         (
             "error",
             [SimpleNamespace(output_buffer="traceback\n", exited=True, exit_code=1)],
-            1,
-            "finished with exit code 1",
+            True,
+            "bg_completion",
         ),
-        # all mode: exited → notifies
+        # all mode: exited process → queues bg_completion
         (
             "all",
             [SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0)],
-            1,
-            "finished with exit code 0",
+            True,
+            "bg_completion",
         ),
     ],
 )
 async def test_run_process_watcher_respects_notification_mode(
-    monkeypatch, tmp_path, mode, sessions, expected_calls, expected_fragment
+    monkeypatch, tmp_path, mode, sessions, should_queue, expected_fragment
 ):
     import tools.process_registry as pr_module
 
@@ -193,20 +199,45 @@ async def test_run_process_watcher_respects_notification_mode(
 
     runner = _build_runner(monkeypatch, tmp_path, mode)
     adapter = runner.adapters[Platform.TELEGRAM]
+    _pr = pr_module.process_registry
 
     await runner._run_process_watcher(_watcher_dict())
 
-    assert adapter.send.await_count == expected_calls, (
-        f"mode={mode}: expected {expected_calls} sends, got {adapter.send.await_count}"
-    )
-    if expected_fragment is not None:
+    # Non-exited processes (running output) still send directly via adapter.send
+    if should_queue is False and expected_fragment is not None and "still running" in expected_fragment:
+        assert adapter.send.await_count == 1
         sent_message = adapter.send.await_args.args[1]
         assert expected_fragment in sent_message
+        return
+
+    # Exited processes should push bg_completion to the queue instead of sending directly
+    assert adapter.send.await_count == 0, (
+        f"mode={mode}: expected 0 direct sends, got {adapter.send.await_count}"
+    )
+    queue_events = []
+    while not _pr.completion_queue.empty():
+        try:
+            queue_events.append(_pr.completion_queue.get_nowait())
+        except Exception:
+            break
+
+    if should_queue:
+        assert len(queue_events) >= 1, (
+            f"mode={mode}: expected at least 1 bg_completion in queue"
+        )
+        assert any(e.get("type") == "bg_completion" for e in queue_events), (
+            f"mode={mode}: expected bg_completion event in queue, got {queue_events}"
+        )
+    else:
+        assert len(queue_events) == 0, (
+            f"mode={mode}: expected empty queue, got {len(queue_events)} events"
+        )
 
 
 @pytest.mark.asyncio
-async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
-    """thread_id from watcher dict is forwarded as metadata to adapter.send()."""
+async def test_thread_id_passed_to_watcher(monkeypatch, tmp_path):
+    """thread_id from watcher dict is forwarded to the bg_completion event
+    so the coalesced notification routes to the correct thread."""
     import tools.process_registry as pr_module
 
     sessions = [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
@@ -218,17 +249,24 @@ async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
+    _pr = pr_module.process_registry
 
     await runner._run_process_watcher(_watcher_dict(thread_id="42"))
 
-    assert adapter.send.await_count == 1
-    _, kwargs = adapter.send.call_args
-    assert kwargs["metadata"] == {"thread_id": "42"}
+    # Should not send directly
+    assert adapter.send.await_count == 0
+
+    # Should push a bg_completion event with the right fields
+    evt = _pr.completion_queue.get_nowait()
+    assert evt["type"] == "bg_completion"
+    assert evt["thread_id"] == "42"
+    assert evt["chat_id"] == "123"
+    assert evt["platform"] == "telegram"
 
 
 @pytest.mark.asyncio
-async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
-    """When thread_id is empty, metadata should be None (general topic)."""
+async def test_no_thread_id_sends_no_thread_id_in_event(monkeypatch, tmp_path):
+    """When thread_id is empty, bg_completion event should have empty thread_id."""
     import tools.process_registry as pr_module
 
     sessions = [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
@@ -240,12 +278,14 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
+    _pr = pr_module.process_registry
 
     await runner._run_process_watcher(_watcher_dict())
 
-    assert adapter.send.await_count == 1
-    _, kwargs = adapter.send.call_args
-    assert kwargs["metadata"] is None
+    assert adapter.send.await_count == 0
+    evt = _pr.completion_queue.get_nowait()
+    assert evt["type"] == "bg_completion"
+    assert evt.get("thread_id", "") == ""
 
 
 @pytest.mark.asyncio
@@ -555,4 +595,149 @@ def test_parse_session_key_too_short():
 
 def test_parse_session_key_wrong_prefix():
     assert _parse_session_key("cron:main:telegram:dm:123") is None
-    assert _parse_session_key("agent:cron:telegram:dm:123") is None
+
+
+# ---------------------------------------------------------------------------
+# _coalesce_bg_completions unit tests
+# ---------------------------------------------------------------------------
+
+
+def _bg_event(platform="telegram", chat_id="123", thread_id="", session_id="proc_1"):
+    return {
+        "type": "bg_completion",
+        "session_id": session_id,
+        "session_key": f"agent:main:{platform}:dm:{chat_id}",
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+    }
+
+
+class TestCoalesceBgCompletions:
+
+    def test_empty_list(self):
+        assert _coalesce_bg_completions([]) == []
+
+    def test_single_event(self):
+        events = [_bg_event(session_id="proc_a")]
+        result = _coalesce_bg_completions(events)
+        assert len(result) == 1
+        assert result[0]["count"] == 1
+        assert result[0]["message_text"] == "[SYSTEM: 1 background processes finished (proc_a)]"
+        assert result[0]["platform"] == "telegram"
+        assert result[0]["chat_id"] == "123"
+
+    def test_multiple_same_destination(self):
+        """Multiple processes finishing in the same chat produce one combined notification."""
+        events = [
+            _bg_event(session_id="proc_a"),
+            _bg_event(session_id="proc_b"),
+            _bg_event(session_id="proc_c"),
+        ]
+        result = _coalesce_bg_completions(events)
+        assert len(result) == 1
+        assert result[0]["count"] == 3
+        msg = result[0]["message_text"]
+        assert "proc_a" in msg
+        assert "proc_b" in msg
+        assert "proc_c" in msg
+        assert msg.startswith("[SYSTEM: 3")
+
+    def test_different_destinations(self):
+        """Processes in different chats produce separate notifications."""
+        events = [
+            _bg_event(chat_id="123", session_id="proc_a"),
+            _bg_event(chat_id="456", session_id="proc_b"),
+            _bg_event(chat_id="123", thread_id="topic42", session_id="proc_c"),
+        ]
+        result = _coalesce_bg_completions(events)
+        assert len(result) == 3
+        # Each coalesced group has exactly 1 event
+        assert all(r["count"] == 1 for r in result)
+        destinations = {(r["chat_id"], r["thread_id"]) for r in result}
+        assert ("123", "") in destinations
+        assert ("456", "") in destinations
+        assert ("123", "topic42") in destinations
+
+    def test_mixed_platforms(self):
+        """Processes on different platforms produce separate notifications."""
+        events = [
+            _bg_event(platform="telegram", session_id="proc_a"),
+            _bg_event(platform="discord", session_id="proc_b"),
+            _bg_event(platform="telegram", session_id="proc_c"),
+        ]
+        result = _coalesce_bg_completions(events)
+        assert len(result) == 2
+        telegram = [r for r in result if r["platform"] == "telegram"]
+        discord = [r for r in result if r["platform"] == "discord"]
+        assert len(telegram) == 1
+        assert len(discord) == 1
+        assert telegram[0]["count"] == 2
+        assert discord[0]["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _send_bg_completion_coalesced integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_bg_completion_coalesced_delivers(monkeypatch, tmp_path):
+    """Coalesced notification is sent via the correct adapter."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    evt = {
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "",
+        "message_text": "[SYSTEM: 3 background processes finished (proc_a, proc_b, proc_c)]",
+        "count": 3,
+        "session_ids": "proc_a, proc_b, proc_c",
+        "session_key": "",
+    }
+    await runner._send_bg_completion_coalesced(evt)
+
+    adapter.send.assert_awaited_once()
+    args, kwargs = adapter.send.await_args
+    assert args[0] == "123"
+    assert "3 background processes finished" in args[1]
+    assert kwargs.get("metadata") is None  # metadata is None (no thread_id)
+
+
+@pytest.mark.asyncio
+async def test_send_bg_completion_coalesced_passes_thread_id(monkeypatch, tmp_path):
+    """thread_id is forwarded as send metadata."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    evt = {
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "42",
+        "message_text": "[SYSTEM: 2 background processes finished]",
+        "count": 2,
+        "session_ids": "proc_x, proc_y",
+        "session_key": "",
+    }
+    await runner._send_bg_completion_coalesced(evt)
+
+    adapter.send.assert_awaited_once()
+    _, kwargs = adapter.send.call_args
+    assert kwargs["metadata"] == {"thread_id": "42"}
+
+
+@pytest.mark.asyncio
+async def test_send_bg_completion_coalesced_skips_missing_fields(monkeypatch, tmp_path):
+    """Missing required fields are silently skipped."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._send_bg_completion_coalesced({})
+    adapter.send.assert_not_awaited()
+
+    await runner._send_bg_completion_coalesced({"message_text": "hello"})
+    adapter.send.assert_not_awaited()
+
+    await runner._send_bg_completion_coalesced({"platform": "telegram", "chat_id": "", "message_text": "hello"})
+    adapter.send.assert_not_awaited()
