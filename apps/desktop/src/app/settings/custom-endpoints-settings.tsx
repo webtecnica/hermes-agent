@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useStore } from '@nanostores/react'
 
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -14,6 +15,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Check, Globe, Loader2, Plus, Save, Trash2, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import type { CustomEndpoint, CustomEndpointUpdate } from '@/types/hermes'
 
 import { EmptyState, LoadingState, Pill, SectionHeading, SettingsContent } from './primitives'
@@ -83,6 +85,10 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   const [form, setForm] = useState<EndpointForm>(EMPTY_FORM)
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
 
+  // Re-fetch and clear local state when the active profile changes,
+  // preventing stale data from one profile leaking into another.
+  const profile = useStore($activeGatewayProfile)
+
   async function refresh() {
     const data = await getCustomEndpoints()
     setEndpoints(data.endpoints)
@@ -90,6 +96,13 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
 
   useEffect(() => {
     let cancelled = false
+
+    // Clear local state so the previous profile's data doesn't flash
+    // before the fetch completes.
+    setLoading(true)
+    setForm(EMPTY_FORM)
+    setDiscoveredModels([])
+    setEndpoints([])
 
     async function load() {
       try {
@@ -120,7 +133,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [normalizeProfileKey(profile)])
 
   async function handleSave() {
     try {

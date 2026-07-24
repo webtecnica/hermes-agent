@@ -7075,20 +7075,22 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
 
 
 @app.get("/api/providers/custom-endpoints")
-def list_custom_endpoints():
+def list_custom_endpoints(profile: Optional[str] = None):
     """Return configured OpenAI-compatible custom endpoints for Desktop."""
     try:
-        return _custom_endpoint_response(load_config())
+        with _profile_scope(profile):
+            return _custom_endpoint_response(load_config())
     except Exception:
         _log.exception("GET /api/providers/custom-endpoints failed")
         raise HTTPException(status_code=500, detail="Failed to list custom endpoints")
 
 
 @app.post("/api/providers/custom-endpoints")
-def upsert_custom_endpoint(body: CustomEndpointUpdate):
+def upsert_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
     """Create or update a v12+ ``providers`` custom endpoint entry."""
     try:
-        cfg = load_config()
+        with _profile_scope(profile):
+            cfg = load_config()
         endpoint_id, _entry = _write_custom_endpoint(cfg, body)
         save_config(cfg)
         response = _custom_endpoint_response(cfg)
@@ -7103,10 +7105,11 @@ def upsert_custom_endpoint(body: CustomEndpointUpdate):
 
 
 @app.post("/api/providers/custom-endpoints/{endpoint_id}/activate")
-def activate_custom_endpoint(endpoint_id: str):
+def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     """Set a configured custom endpoint as the default model provider."""
     try:
-        cfg = load_config()
+        with _profile_scope(profile):
+            cfg = load_config()
         provider_key = _custom_endpoint_id(endpoint_id)
         providers = cfg.get("providers")
         entry = providers.get(provider_key) if isinstance(providers, dict) else None
@@ -7133,10 +7136,11 @@ def activate_custom_endpoint(endpoint_id: str):
 
 
 @app.delete("/api/providers/custom-endpoints/{endpoint_id}")
-def delete_custom_endpoint(endpoint_id: str):
+def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     """Remove a configured custom endpoint from ``providers``."""
     try:
-        cfg = load_config()
+        with _profile_scope(profile):
+            cfg = load_config()
         provider_key = _custom_endpoint_id(endpoint_id)
         providers = cfg.get("providers")
         if not isinstance(providers, dict) or provider_key not in providers:
@@ -7155,7 +7159,7 @@ def delete_custom_endpoint(endpoint_id: str):
 
 
 @app.post("/api/providers/custom-endpoints/validate")
-async def validate_custom_endpoint(body: CustomEndpointUpdate):
+async def validate_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
     """Probe a custom endpoint by calling its OpenAI-compatible /models URL."""
     import httpx
 
