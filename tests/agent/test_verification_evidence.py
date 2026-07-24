@@ -4,6 +4,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from agent.verification_evidence import (
     classify_verification_command,
     mark_workspace_edited,
