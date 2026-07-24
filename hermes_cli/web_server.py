@@ -6992,8 +6992,15 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "models": models,
                 "context_length": raw_entry.get("context_length"),
                 "discover_models": bool(raw_entry.get("discover_models", True)),
-                "has_api_key": bool(str(raw_entry.get("api_key", "") or "").strip()),
-                "api_key_preview": redact_key(str(raw_entry.get("api_key", "") or "")) if raw_entry.get("api_key") else None,
+                "has_api_key": bool(str(raw_entry.get("api_key", "") or "").strip())
+                              or bool(str(raw_entry.get("key_env", "") or "").strip()),
+                "api_key_preview": (
+                    redact_key(str(raw_entry.get("api_key", "") or ""))
+                    if raw_entry.get("api_key")
+                    else f"${{{raw_entry['key_env']}}}"
+                    if raw_entry.get("key_env")
+                    else None
+                ),
                 "is_current": endpoint_id == current_provider,
                 "source": "providers",
             })
@@ -7021,6 +7028,16 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "base_url": current_base_url,
         },
     }
+
+
+def _custom_endpoint_env_var(endpoint_id: str) -> str:
+    """Generate an env var name for a custom endpoint's API key.
+
+    Returns a name like ``HERMES_CUSTOM_MY_ENDPOINT_API_KEY`` that the
+    runtime resolves at provider load time.
+    """
+    slug = endpoint_id.replace("-", "_").replace(".", "_").upper()
+    return f"HERMES_CUSTOM_{slug}_API_KEY"
 
 
 def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> Tuple[str, Dict[str, Any]]:
@@ -7056,10 +7073,22 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     if body.context_length and body.context_length > 0:
         entry["context_length"] = int(body.context_length)
         entry["models"][model]["context_length"] = int(body.context_length)
-    if body.api_key is not None and body.api_key.strip():
-        entry["api_key"] = body.api_key.strip()
-    elif isinstance(existing.get("api_key"), str) and existing.get("api_key"):
-        entry["api_key"] = existing["api_key"]
+    # ── API key security: store in .env, reference via key_env ──
+    # Never persist the raw key in config.yaml.  Follow the standard
+    # provider pattern: write the key to ~/.hermes/.env under a generated
+    # env var name and reference it from the config entry via key_env.
+    # The runtime (runtime_provider.py) resolves key_env at load time.
+    if body.api_key is not None:
+        env_var = _custom_endpoint_env_var(endpoint_id)
+        if body.api_key.strip():
+            save_env_value(env_var, body.api_key.strip())
+            entry["key_env"] = env_var
+            entry.pop("api_key", None)
+        else:
+            # Empty string means "clear the key"
+            remove_env_value(env_var)
+            entry.pop("key_env", None)
+            entry.pop("api_key", None)
 
     providers[endpoint_id] = entry
     cfg["providers"] = providers
@@ -7068,8 +7097,9 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         cfg["model"] = _apply_main_model_assignment(
             cfg.get("model", {}), endpoint_id, model, base_url
         )
-        if entry.get("api_key") and isinstance(cfg["model"], dict):
-            cfg["model"]["api_key"] = entry["api_key"]
+        if entry.get("key_env") and isinstance(cfg["model"], dict):
+            cfg["model"]["key_env"] = entry["key_env"]
+            cfg["model"].pop("api_key", None)
 
     return endpoint_id, entry
 
@@ -7120,8 +7150,9 @@ def activate_custom_endpoint(endpoint_id: str):
             raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
         model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
-        if entry.get("api_key"):
-            model_cfg["api_key"] = entry["api_key"]
+        if entry.get("key_env"):
+            model_cfg["key_env"] = entry["key_env"]
+            model_cfg.pop("api_key", None)
         cfg["model"] = model_cfg
         save_config(cfg)
         return {"ok": True, "provider": provider_key, "model": model}
@@ -7143,6 +7174,8 @@ def delete_custom_endpoint(endpoint_id: str):
             raise HTTPException(status_code=404, detail="custom endpoint not found")
         providers.pop(provider_key, None)
         cfg["providers"] = providers
+        # Clean up the API key from .env if stored via key_env
+        remove_env_value(_custom_endpoint_env_var(provider_key))
         save_config(cfg)
         response = _custom_endpoint_response(cfg)
         response["ok"] = True
