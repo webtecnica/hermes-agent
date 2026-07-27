@@ -137,6 +137,67 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
 
+    # ── Regression tests for #72737: compact description without relaxing gates ──
+
+    def test_description_size_ceiling(self):
+        """Delegate_task top-level description must be under 2000 chars."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertLessEqual(
+            len(desc), 2000,
+            f"Delegate description too large: {len(desc)} chars > 2000",
+        )
+
+    def test_description_contracts_background_semantics(self):
+        """Background semantics: all delegations run in the background."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("BACKGROUND", desc.upper())
+
+    def test_description_contracts_live_transcripts(self):
+        """Live transcript paths are referenced."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("live", desc.lower())
+        self.assertIn("delegation_id", desc)
+
+    def test_description_contracts_side_effect_verification(self):
+        """Side-effect verification: verifiable handle requirement is present."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("verifiable", desc.lower())
+
+    def test_description_contracts_blocked_child_tools(self):
+        """Blocked child tools: leaf subagents cannot call key tools."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        # Leaf and orchestrator restrictions
+        self.assertIn("Leaf", desc)
+        self.assertIn("delegate_task", desc)
+        self.assertIn("clarify", desc)
+        self.assertIn("memory", desc)
+        self.assertIn("send_message", desc)
+
+    def test_description_contracts_model_inheritance(self):
+        """Model/fallback inheritance: children inherit parent model."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("inherit", desc.lower())
+
+    def test_description_contracts_non_durability_warning(self):
+        """Non-durability warning: background delegations are NOT durable."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        self.assertIn("NOT durable", desc)
+        self.assertIn("cronjob", desc.lower())
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):

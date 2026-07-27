@@ -285,3 +285,108 @@ def test_json_serializable(isolated_home):
     data = compute_prompt_breakdown("cli")
     # Round-trips cleanly for ``--json`` output.
     assert json.loads(json.dumps(data)) == json.loads(json.dumps(data))
+
+
+# ── Regression tests for #72737: compact guidance without relaxing gates ──
+
+
+def _seed_preamble_skill(hermes_home):
+    """Seed at least one skill so build_skills_system_prompt returns content."""
+    skill_dir = hermes_home / "skills" / "demo" / "test-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: test-skill\ndescription: a test skill\n---\n# test\nbody\n",
+        encoding="utf-8",
+    )
+
+
+def test_preamble_instruction_text_size_ceiling(isolated_home):
+    """The skills preamble instruction text (before <available_skills>) must
+    remain under 800 chars to prevent prompt bloat regression."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt, "build_skills_system_prompt returned empty"
+    idx = prompt.find("<available_skills>")
+    assert idx >= 0, "Missing <available_skills> tag"
+    instr_start = prompt.find("## Skills (mandatory)")
+    assert instr_start >= 0, "Missing '## Skills (mandatory)' header"
+    instr_text = prompt[instr_start:idx]
+    # 800 chars is a generous ceiling; the initial compact version is ~766.
+    assert len(instr_text) <= 800, (
+        f"Preamble instruction text too large: {len(instr_text)} chars > 800"
+    )
+
+
+def test_preamble_contracts_strict_relevance(isolated_home):
+    """Strict relevance policy: skills must be loaded when partially relevant."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt
+    assert "partially relevant" in prompt, (
+        "Must retain 'partially relevant' for strict relevance policy"
+    )
+
+
+def test_preamble_contracts_skill_view_disclosure(isolated_home):
+    """Progressive disclosure: skills are discovered via skill_view(name)."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt
+    assert "skill_view(" in prompt, (
+        "Must retain skill_view() progressive-disclosure pattern"
+    )
+
+
+def test_preamble_contracts_hermes_skill_guidance(isolated_home):
+    """Hermes-first troubleshooting: 'hermes-agent' skill referenced."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt
+    assert "hermes-agent" in prompt, (
+        "Must retain 'hermes-agent' skill reference for Hermes-first troubleshooting"
+    )
+
+
+def test_preamble_contracts_skill_maintenance_hooks(isolated_home):
+    """Skill maintenance hooks: skill_manage(action='patch') and save-as-skill."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt
+    assert "skill_manage" in prompt, "Must retain skill_manage() hook"
+    assert "save as a skill" in prompt or "save as skill" in prompt, (
+        "Must retain post-task skill-save offer guidance"
+    )
+
+
+def test_preamble_contracts_index_block_structure(isolated_home):
+    """The <available_skills> block structure is preserved."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt
+    assert "<available_skills>" in prompt
+    assert "</available_skills>" in prompt
+    assert prompt.index("<available_skills>") < prompt.index("</available_skills>")
+
+
+def test_preamble_contracts_relevance_gate(isolated_home):
+    """Only-proceed gate: the 'only proceed if none are relevant' tail."""
+    _seed_preamble_skill(isolated_home)
+    from agent.prompt_builder import build_skills_system_prompt
+
+    prompt = build_skills_system_prompt()
+    assert prompt
+    assert "none are relevant" in prompt, (
+        "Must retain only-proceed gate for skills"
+    )
