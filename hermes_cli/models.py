@@ -3039,6 +3039,107 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         pass
 
 
+
+
+def _custom_endpoint_cache_key(base_url: str) -> str:
+    """Return a deterministic cache key for a custom endpoint base_url."""
+    norm = str(base_url or "").strip().rstrip("/").lower()
+    return f"custom:{norm}" if norm else ""
+
+
+def _custom_endpoint_fingerprint(
+    api_key: Optional[str],
+    api_mode: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> str:
+    """Return a short hash representing the credentials for a custom endpoint.
+
+    Rotating the api_key, api_mode, or extra_headers busts the cached entry.
+    Mirrors _credential_fingerprint but for custom endpoints that have no
+    PROVIDER_REGISTRY slug — fingerprints are derived from the actual params
+    passed to fetch_api_models instead of env-var lookups.
+    """
+    import hashlib
+
+    parts: list[str] = []
+    parts.append(f"key={str(api_key or '').strip()}")
+    parts.append(f"mode={str(api_mode or '').strip()}")
+    if headers:
+        for k in sorted(headers.keys()):
+            parts.append(f"hdr:{k}={headers[k]}")
+    blob = "|".join(parts).encode("utf-8", errors="replace")
+    # blake2b for cache-key fingerprinting (see _credential_fingerprint).
+    return hashlib.blake2b(blob, digest_size=8).hexdigest()
+
+
+def cached_fetch_api_models(
+    api_key: Optional[str],
+    base_url: Optional[str],
+    *,
+    timeout: float = 5.0,
+    api_mode: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+    force_refresh: bool = False,
+    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+) -> Optional[list[str]]:
+    """TTL-disk-cached wrapper around :func:`fetch_api_models` for custom endpoints.
+
+    Keys the cache off a ``custom:<normalized_url>`` prefix so custom endpoint
+    probes get the same 1h TTL benefit as first-class providers without a live
+    HTTP round-trip on every ``/model`` open.
+
+    The credential fingerprint incorporates ``api_key``, ``api_mode``, and
+    ``extra_headers`` so a rotated key or header change busts the cache
+    automatically.
+
+    Same stale-beats-nothing fallback policy as :func:`cached_provider_model_ids`.
+    Only non-empty results are cached.
+    """
+    cache_key = _custom_endpoint_cache_key(base_url)
+    if not cache_key:
+        return fetch_api_models(
+            api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+        )
+
+    fp = _custom_endpoint_fingerprint(api_key, api_mode=api_mode, headers=headers)
+    cache = _load_provider_models_cache()
+    entry = cache.get(cache_key)
+    now = time.time()
+
+    if (
+        not force_refresh
+        and isinstance(entry, dict)
+        and entry.get("fp") == fp
+        and isinstance(entry.get("models"), list)
+        and entry["models"]
+        and (now - float(entry.get("at", 0))) < ttl_seconds
+    ):
+        return list(entry["models"])
+
+    # Cache miss / stale / forced refresh — call the live path.
+    live = fetch_api_models(
+        api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+    )
+    if live:
+        cache[cache_key] = {
+            "fp": fp,
+            "at": now,
+            "models": list(live),
+        }
+        _save_provider_models_cache(cache)
+        return list(live)
+
+    # Live fetch returned nothing. Prefer stale data with the same fingerprint.
+    if (
+        isinstance(entry, dict)
+        and entry.get("fp") == fp
+        and isinstance(entry.get("models"), list)
+        and entry["models"]
+    ):
+        return list(entry["models"])
+    return None
+
+
 def _fetch_anthropic_models(
     timeout: float = 5.0,
     *,

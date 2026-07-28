@@ -2487,8 +2487,9 @@ def list_authenticated_providers(
             )
             if should_probe:
                 try:
-                    from hermes_cli.models import fetch_api_models
-                    live_models = fetch_api_models(
+                    from hermes_cli.models import cached_fetch_api_models
+
+                    live_models = cached_fetch_api_models(
                         api_key,
                         api_url,
                         headers=_extra_headers_from_config(ep_cfg) or None,
@@ -2556,9 +2557,9 @@ def list_authenticated_providers(
         _models = [current_model] if current_model else []
         if refresh or probe_current_custom_provider:
             try:
-                from hermes_cli.models import fetch_api_models
+                from hermes_cli.models import cached_fetch_api_models
 
-                _live_models = fetch_api_models("", str(current_base_url).strip().rstrip("/"))
+                _live_models = cached_fetch_api_models("", str(current_base_url).strip().rstrip("/"))
                 if _live_models:
                     _models = _live_models
             except Exception:
@@ -2782,9 +2783,9 @@ def list_authenticated_providers(
             )
             if should_probe:
                 try:
-                    from hermes_cli.models import fetch_api_models
+                    from hermes_cli.models import cached_fetch_api_models
 
-                    live_models = fetch_api_models(
+                    live_models = cached_fetch_api_models(
                         api_key,
                         api_url,
                         headers=grp.get("extra_headers") or None,
