@@ -165,6 +165,41 @@ def _reverse_alias_for_display(model_name: str) -> str:
     return _REVERSE_ALIAS_CACHE.get(model_name, model_name)
 
 
+def _resolve_alias_forward(model_name: str) -> str:
+    """Resolve *model_name* if it is an alias key in ``model.aliases`` or
+    ``model_aliases:`` config, returning the full resolved model name.
+
+    When *model_name* is not an alias key, returns it unchanged so the caller
+    can proceed with vendor-prefix stripping and Palantir RID normalization.
+    """
+    if not model_name:
+        return model_name
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+
+        # Check model_aliases (dict-based, full DirectAlias entries).
+        ma = cfg.get("model_aliases")
+        if isinstance(ma, dict):
+            entry = ma.get(model_name)
+            if isinstance(entry, dict):
+                resolved = str(entry.get("model", "") or "").strip()
+                if resolved:
+                    return resolved
+
+        # Check model.aliases (string-based, set via ``hermes config set``).
+        mdl = cfg.get("model", {}) or {}
+        simple = mdl.get("aliases")
+        if isinstance(simple, dict):
+            resolved = simple.get(model_name)
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved.strip()
+    except Exception:
+        pass
+    return model_name
+
+
 def format_token_count_compact(*args, **kwargs):
     value = int(args[0] if args else kwargs.get("value", 0))
     abs_value = abs(value)
@@ -5063,17 +5098,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # _try_activate_fallback() switches provider/model.
         agent = getattr(self, "agent", None)
         model_name = (getattr(agent, "model", None) or self.model or "unknown")
-        # Friendly display: prefer reverse-alias from config.yaml ``model_aliases:``
-        # before slash/length truncation. This turns long Palantir RIDs like
-        # ``ri.language-model-service..language-model.anthropic-claude-4-7-opus``
-        # into the user's chosen short name (e.g. ``opus-4.7``) in the status bar.
-        model_short = _reverse_alias_for_display(model_name)
-        if model_short == model_name:
-            model_short = model_name.split("/")[-1] if "/" in model_name else model_name
-            # Strip Palantir RID prefixes via the shared display formatter so
-            # this site and ``ModelSwitchResult`` confirmation can't drift.
-            from hermes_cli.model_switch import format_model_for_display
-            model_short = format_model_for_display(model_short)
+        # Friendly display: resolve alias keys forward (alias -> full model name),
+        # then strip the vendor prefix.  This ensures a configured alias like
+        # ``minimax-m2: minimax-oauth/MiniMax-M2.5`` displays as ``MiniMax-M2.5``
+        # in the status bar rather than the opaque alias key.  Palantir RID
+        # prefixes (``ri.language-model-service..language-model.*``) are stripped
+        # by ``format_model_for_display`` below.
+        model_short = _resolve_alias_forward(model_name)
+        model_short = model_short.split("/")[-1] if "/" in model_short else model_short
+        # Strip Palantir RID prefixes via the shared display formatter so
+        # this site and ``ModelSwitchResult`` confirmation can't drift.
+        from hermes_cli.model_switch import format_model_for_display
+        model_short = format_model_for_display(model_short)
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
         if len(model_short) > 26:
