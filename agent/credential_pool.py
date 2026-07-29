@@ -30,6 +30,7 @@ from hermes_cli.auth import (
     _decode_jwt_claims,
     _load_auth_store,
     _load_provider_state,
+    _load_provider_state_with_source,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
     _save_auth_store,
@@ -1039,32 +1040,51 @@ class CredentialPool:
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
-                # Decide BEFORE writing whether this profile is reading the
-                # grant from the global root (no own providers.<id> block) vs.
-                # genuinely shadowing it. A pool refresh rotates single-use
-                # OAuth refresh tokens, so a profile that resolved the grant
-                # from root MUST write the rotated chain back to root too —
-                # otherwise root keeps a revoked refresh token and every other
-                # profile reading the stale root grant dies with
-                # refresh_token_reused / invalid_grant once its access token
-                # expires. This mirrors the xAI write-through in
-                # hermes_cli.auth._save_xai_oauth_tokens (#43589); the pool
-                # refresh path is the Codex/xAI analog reported in #48415.
-                _wt_provider_id = {
+                # Decide write-through based on where the provider state was
+                # actually *resolved from*, not on whether the profile store
+                # has a providers.<id> key.  The old approach checked key
+                # presence, but _store_provider_state below creates that key
+                # on every call, making the condition self-sealing: after the
+                # first refresh, write-through permanently disabled itself,
+                # leaving root with a revoked single-use refresh token on
+                # every subsequent refresh (#74339).
+                #
+                # Use _load_provider_state_with_source which returns the
+                # source path (profile vs. global root).  When the state was
+                # resolved from the global root (no own providers.<id> block),
+                # the rotated chain must be written back to root too — every
+                # other profile reading root's stale grant would otherwise
+                # die with refresh_token_reused / invalid_grant once its
+                # access token expires.  This mirrors the xAI write-through
+                # in hermes_cli.auth._save_xai_oauth_tokens (#43589); the
+                # pool refresh path is the Codex/xAI analog reported in
+                # #48415.
+                #
+                # Additionally, when write-through fires we MUST NOT call
+                # _store_provider_state on the profile store — doing so
+                # creates a providers.<id> key that shadows root on the
+                # *next* refresh and re-introduces the very bug we're fixing.
+                # The profile without a local block simply falls back to the
+                # now-updated root via _load_provider_state's fallback, so
+                # reads stay correct.
+                provider_id = {
                     "nous": "nous",
                     "openai-codex": "openai-codex",
                     "xai-oauth": "xai-oauth",
                 }.get(self.provider)
-                write_through_to_root = bool(_wt_provider_id) and not (
-                    isinstance(auth_store.get("providers"), dict)
-                    and isinstance(
-                        auth_store["providers"].get(_wt_provider_id), dict
-                    )
-                )
+                if provider_id is None:
+                    return
+
                 if self.provider == "nous":
-                    state = _load_provider_state(auth_store, "nous")
+                    state, source_path = _load_provider_state_with_source(
+                        auth_store, "nous"
+                    )
                     if state is None:
                         return
+                    write_through_to_root = (
+                        source_path is not None
+                        and source_path == auth_mod._global_auth_file_path()
+                    )
                     state["access_token"] = entry.access_token
                     if entry.refresh_token:
                         state["refresh_token"] = entry.refresh_token
@@ -1082,43 +1102,62 @@ class CredentialPool:
                             state[extra_key] = val
                     if entry.inference_base_url:
                         state["inference_base_url"] = entry.inference_base_url
-                    _store_provider_state(auth_store, "nous", state, set_active=False)
+                    if not write_through_to_root:
+                        _store_provider_state(auth_store, "nous", state, set_active=False)
 
                 elif self.provider == "openai-codex":
-                    state = _load_provider_state(auth_store, "openai-codex")
+                    state, source_path = _load_provider_state_with_source(
+                        auth_store, "openai-codex"
+                    )
                     if not isinstance(state, dict):
                         return
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
                         return
+                    write_through_to_root = (
+                        source_path is not None
+                        and source_path == auth_mod._global_auth_file_path()
+                    )
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "openai-codex", state, set_active=False)
+                    if not write_through_to_root:
+                        _store_provider_state(
+                            auth_store, "openai-codex", state, set_active=False
+                        )
 
                 elif self.provider == "xai-oauth":
-                    state = _load_provider_state(auth_store, "xai-oauth")
+                    state, source_path = _load_provider_state_with_source(
+                        auth_store, "xai-oauth"
+                    )
                     if not isinstance(state, dict):
                         return
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
                         return
+                    write_through_to_root = (
+                        source_path is not None
+                        and source_path == auth_mod._global_auth_file_path()
+                    )
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
+                    if not write_through_to_root:
+                        _store_provider_state(
+                            auth_store, "xai-oauth", state, set_active=False
+                        )
 
                 else:
                     return
 
                 _save_auth_store(auth_store)
-                if write_through_to_root and _wt_provider_id:
+                if write_through_to_root:
                     _write_through_provider_state_to_global_root(
-                        _wt_provider_id, state
+                        provider_id, state
                     )
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)

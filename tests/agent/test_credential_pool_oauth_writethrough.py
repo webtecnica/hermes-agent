@@ -101,13 +101,19 @@ def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
         _entry(provider, id="e1", access_token="new-access", refresh_token="new-refresh")
     )
 
-    # Profile got the rotated chain (existing behavior).
+    # Profile does NOT get a local providers.<id> block when the state
+    # was resolved from root (the fix for #74339).  Creating a local block
+    # on the first refresh shadows root on subsequent refreshes and
+    # permanently disables the write-through.  The profile falls back to
+    # root via _load_provider_state's fallback, so reads stay correct.
     profile = _read_store(profile_path)
-    assert (
-        profile["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
+    profile_providers = profile.get("providers", {})
+    assert provider not in profile_providers, (
+        f"Profile must not have a local providers.{provider} block "
+        f"when the grant was resolved from root"
     )
 
-    # AND the global root no longer holds the revoked refresh token (#48415).
+    # AND the global root has the rotated chain (write-through fired).
     root = _read_store(root_path)
     assert root["providers"][provider]["tokens"]["access_token"] == "new-access"
     assert root["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
@@ -189,6 +195,74 @@ def test_write_through_helper_is_noop_in_classic_mode(monkeypatch, tmp_path):
     CP._write_through_provider_state_to_global_root(
         "openai-codex", {"tokens": {"access_token": "a", "refresh_token": "r"}}
     )
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["openai-codex", "xai-oauth"],
+)
+def test_pool_refresh_writes_through_to_root_on_every_refresh(
+    profile_and_root, provider
+):
+    """Regression test for #74339: write-through must fire on every refresh,
+    not just the first one that resolves the grant from root.
+
+    The old implementation checked whether ``providers.<id>`` existed in the
+    profile store.  The first refresh created that key (via
+    ``_store_provider_state``), so the second refresh saw the key and skipped
+    the write-through — leaving root with a revoked refresh token
+    permanently.
+    """
+    profile_path, root_path = profile_and_root
+    # Profile has NO own provider block (reads root via fallback).
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "root-access-v0",
+                        "refresh_token": "root-refresh-v0",
+                    }
+                }
+            },
+        },
+    )
+
+    pool = CredentialPool(provider, [])
+
+    # --- First refresh: grant resolved from root, write-through fires ---
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(
+            provider, id="e1",
+            access_token="root-access-v1", refresh_token="root-refresh-v1",
+        )
+    )
+
+    # Profile still has no local providers.<id> block.
+    profile = _read_store(profile_path)
+    assert provider not in profile.get("providers", {})
+    # Root has v1 tokens.
+    root = _read_store(root_path)
+    assert root["providers"][provider]["tokens"]["access_token"] == "root-access-v1"
+    assert root["providers"][provider]["tokens"]["refresh_token"] == "root-refresh-v1"
+
+    # --- Second refresh: profile still has no local block (fix for #74339),
+    # so write-through fires again.  Root must not keep v1 tokens. ---
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(
+            provider, id="e1",
+            access_token="root-access-v2", refresh_token="root-refresh-v2",
+        )
+    )
+
+    profile = _read_store(profile_path)
+    assert provider not in profile.get("providers", {})
+    root = _read_store(root_path)
+    assert root["providers"][provider]["tokens"]["access_token"] == "root-access-v2"
+    assert root["providers"][provider]["tokens"]["refresh_token"] == "root-refresh-v2"
 
 
 def test_global_write_through_preserves_concurrent_root_update(
