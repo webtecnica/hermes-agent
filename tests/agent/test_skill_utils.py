@@ -211,6 +211,29 @@ class TestNormalizeSkillLookupName:
         monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
         assert normalize_skill_lookup_name(str(link)) == "my-skill"
 
+    def test_absolute_path_resolves_against_live_home_after_profile_switch(self, tmp_path, monkeypatch):
+        """Long-lived runtimes (gateway) can activate a profile AFTER
+        tools.skills_tool was imported; an absolute job skill path must
+        normalize against the CURRENT home — the same root skill_view()
+        enforces — or skill_view() rejects it as untrusted (#84667)."""
+        from agent.skill_utils import normalize_skill_lookup_name
+        import tools.skills_tool as skills_tool
+
+        first_home = tmp_path / "first" / ".hermes"
+        second_home = tmp_path / "second" / ".hermes"
+        (second_home / "skills" / "my-skill").mkdir(parents=True)
+
+        # Simulate the module-import snapshot taken under the first home.
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", first_home / "skills")
+        monkeypatch.setattr(skills_tool, "_SKILLS_DIR_AT_IMPORT", first_home / "skills")
+        # The process (gateway) then activates the second profile.
+        monkeypatch.setenv("HERMES_HOME", str(second_home))
+
+        assert (
+            normalize_skill_lookup_name(str(second_home / "skills" / "my-skill"))
+            == "my-skill"
+        )
+
 
 
 # ── parse_frontmatter: UTF-8 BOM tolerance ─────────────────────────────────

@@ -615,7 +615,12 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     # module cycle (tools.skills_tool imports agent.skill_utils).
     try:
         from tools import skills_tool as _skills_tool
-        primary_root = Path(_skills_tool.SKILLS_DIR)
+        # Use the same live root skill_view() enforces (_skills_dir()),
+        # not the module-import snapshot: long-lived runtimes (gateway)
+        # can activate a profile after tools.skills_tool was imported, and
+        # an absolute job skill path must normalize against the CURRENT
+        # home or skill_view() will reject it as untrusted (#84667).
+        primary_root = _skills_tool._skills_dir()
     except Exception:
         primary_root = get_skills_dir()
 

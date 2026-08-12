@@ -2808,13 +2808,20 @@ def _build_job_prompt(
             user_prompt=user_prompt,
         )
 
-    from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
-    from agent.skill_utils import normalize_skill_lookup_name
+    # Resolve job skills through the SAME loader `hermes --skills` uses
+    # (``build_preloaded_skills_prompt`` -> ``_load_skill_payload``), so a
+    # skill that loads via the CLI flag is never reported as missing here
+    # (#84667). The cron loop used to duplicate skill resolution inline
+    # with a different call signature than the preload path, letting the
+    # two drift apart.
+    from agent.skill_commands import _load_skill_payload
+    from agent.skill_preprocessing import preprocess_skill_content
 
     parts = []
     skipped: list[str] = []
+    job_id = str(job.get("id") or "") or None
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -2825,7 +2832,7 @@ def _build_job_prompt(
             bundle_payload = build_bundle_invocation_message(
                 bundle_key,
                 user_instruction="",
-                task_id=str(job.get("id") or "") or None,
+                task_id=job_id,
             )
             if bundle_payload:
                 bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
@@ -2841,30 +2848,43 @@ def _build_job_prompt(
             skipped.append(skill_name)
             continue
 
-        try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
+        loaded = _load_skill_payload(skill_name, task_id=job_id)
+        if loaded is None:
+            logger.warning(
+                "Cron job '%s': skill not found, skipping — '%s' failed to load "
+                "via the standard skill resolver (same one `hermes --skills` uses)",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
             skipped.append(skill_name)
             continue
-        if not loaded.get("success"):
-            error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
-            skipped.append(skill_name)
-            continue
+
+        loaded_skill, skill_dir, resolved_name = loaded
 
         # Bump usage so the curator sees this skill as actively used.
         try:
+<<<<<<< Updated upstream
             bump_use(skill_name, task_id=str(job.get("id") or "") or None)
+=======
+            bump_use(resolved_name, task_id=job_id)
+>>>>>>> Stashed changes
         except Exception:
-            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
+            logger.debug("Cron job: failed to bump skill usage for '%s'", resolved_name, exc_info=True)
 
-        content = str(loaded.get("content") or "").strip()
+        # `_load_skill_payload` views raw content (preprocess=False); re-apply
+        # the same template/inline-shell preprocessing skill_view applies on
+        # the preload path so cron prompts render identically.
+        content = str(loaded_skill.get("content") or "").strip()
+        try:
+            content = preprocess_skill_content(content, skill_dir, session_id=job_id)
+        except Exception:
+            logger.debug("Cron job: failed to preprocess skill '%s'", resolved_name, exc_info=True)
+
         if parts:
             parts.append("")
         parts.extend(
             [
-                f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+                f'[IMPORTANT: The user has invoked the "{resolved_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
                 "",
                 content,
             ]
