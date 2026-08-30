@@ -305,6 +305,49 @@ class TestSearchHandler:
         assert "error" in result
 
 
+class TestSearchFilesDefaultOutputMode:
+    """The schema default is obeyed on every call while the description is
+    read once — the cheap mode has to be the default, not merely offered.
+    Full content costs multiples of files_only per call."""
+
+    def test_schema_default_is_files_only(self):
+        from tools.file_tools import SEARCH_FILES_SCHEMA
+        assert (
+            SEARCH_FILES_SCHEMA["parameters"]["properties"]["output_mode"]["default"]
+            == "files_only"
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_handler_omits_output_mode_defaults_to_files_only(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"matches": ["file1.py"]}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import _handle_search_files
+        _handle_search_files({"pattern": "TODO"}, task_id="t-default-mode")
+
+        _, kwargs = mock_ops.search.call_args
+        assert kwargs.get("output_mode") == "files_only"
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_handler_respects_explicit_content_request(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"matches": ["file1.py:3:match"]}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import _handle_search_files
+        _handle_search_files(
+            {"pattern": "TODO", "output_mode": "content"}, task_id="t-explicit-mode"
+        )
+
+        _, kwargs = mock_ops.search.call_args
+        assert kwargs.get("output_mode") == "content"
+
+
 # ---------------------------------------------------------------------------
 # Windows MSYS path resolution (salvage of #50488 / #46995)
 # ---------------------------------------------------------------------------

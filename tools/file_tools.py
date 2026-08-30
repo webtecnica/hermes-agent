@@ -2813,7 +2813,7 @@ SEARCH_FILES_SCHEMA = {
             "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
-            "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
+            "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'files_only' lists file paths (cheapest, default), 'content' shows matching lines with line numbers, 'count' shows match counts per file", "default": "files_only"},
             "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
         },
         "required": ["pattern"]
@@ -2872,7 +2872,7 @@ def _handle_search_files(args, **kw):
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode") or "files_only", context=args.get("context", 0), task_id=tid)
 
 
 def _read_file_schema_overrides():
