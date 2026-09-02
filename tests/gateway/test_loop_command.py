@@ -10,7 +10,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
-from hermes_cli import loops
+from hermes_cli import goals, loops
 
 
 class _FakeSessionEntry:
@@ -33,9 +33,16 @@ def loop_env(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
+    # Pre-warm the SessionDB cache from this sync (non-loop) context. Inside
+    # the async tests, a cold cache makes GoalManager.set() kick the bounded
+    # background bootstrap (loop-thread path) and wait only
+    # _DB_BOOTSTRAP_INIT_WAIT_S — on a loaded CI runner the init overruns the
+    # window, the goal is never persisted, and the active-goal assertion
+    # flakes (main run 33455779041). Warming here removes the race entirely.
+    goals._get_session_db()
     yield home
-    loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
 
 
 def _make_runner():

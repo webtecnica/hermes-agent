@@ -246,7 +246,8 @@ What happens:
 
 **Failure modes:**
 - No home channel configured → CLI refuses with a `/sethome` hint.
-- Platform not enabled / gateway not running → CLI times out at 60s with a clear message and your CLI session stays intact.
+- Gateway not running (nothing ever claims the request) → CLI times out at 60s with a clear message and your CLI session stays intact.
+- Slow transfer: once the gateway claims the handoff it replays your full session through a real agent turn, which can take a few minutes on long sessions. The CLI shows "Still transferring..." heartbeats and waits up to 15 minutes — it never misreports a slow transfer as "gateway not running".
 - Thread creation fails (permissions, topics-mode off) → falls back to the home channel directly and still completes; no thread isolation but the handoff itself works.
 - `adapter.send` fails (rate limit, transient API error) → handoff marked failed with the reason; the row clears so you can retry.
 
@@ -461,6 +462,28 @@ hermes sessions rename 20250305_091523_a1b2c3d4 debugging auth flow
 ```
 
 If the title is already in use by another session, an error is shown.
+
+### Pin a Session
+
+Pinning sets a durable "keep" flag: pinned sessions are exempt from the
+`sessions.auto_archive` stale sweep and always appear in listings. It is the
+same flag the Desktop sidebar's Pinned section uses — pin from either surface
+and both see it.
+
+```bash
+# Pin one or more sessions (unique ID prefixes work)
+hermes sessions pin 20250305_091523_a1b2c3d4
+hermes sessions pin 20250305 20250306
+
+# Remove the pin
+hermes sessions unpin 20250305_091523_a1b2c3d4
+
+# List pinned sessions
+hermes sessions pinned
+
+# Machine-readable output, e.g. for a nightly backup of your pin set
+hermes sessions pinned --json > pinned-sessions.json
+```
 
 ### Prune Old Sessions
 

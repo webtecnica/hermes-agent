@@ -9,6 +9,8 @@ export interface ActiveTool {
 export interface TodoItem {
   content: string
   id: string
+  /** Optional id of another item — renders this as a nested subtask. */
+  parent?: string
   status: 'cancelled' | 'completed' | 'in_progress' | 'pending'
 }
 
@@ -107,10 +109,22 @@ export interface ConfirmReq {
   title: string
 }
 
+export interface ClarifyBatchQuestion {
+  choices: string[] | null
+  multiSelect?: boolean
+  qid: string
+  question: string
+}
+
 export interface ClarifyReq {
   choices: string[] | null
   question: string
   requestId: string
+  /** Batch (multi-question) clarify: present instead of question/choices. */
+  questions?: ClarifyBatchQuestion[]
+  /** Answers already locked server-side (qid → answer): seeded from the
+   *  reconnect replay, updated as the user locks each question. */
+  answers?: Record<string, string>
 }
 
 export interface Msg {
@@ -193,6 +207,12 @@ export interface SessionInfo {
 
 export interface Usage {
   active_subagents?: number
+  /** Rolling mean API latency over the last 10 calls (seconds). */
+  avg_latency_s?: number
+  /** Rolling output tokens/sec over the last 10 calls. */
+  avg_tps?: number
+  /** Session prompt-cache hit ratio (cache_read / prompt tokens, %). */
+  cache_hit_pct?: number
   calls: number
   compressions?: number
   context_max?: number

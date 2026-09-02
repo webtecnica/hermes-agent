@@ -79,6 +79,7 @@ _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
 _spawn_hermes_action = late("_spawn_hermes_action")
+run_in_threadpool = late("run_in_threadpool")
 _strip_session_list_rows = late("_strip_session_list_rows")
 _write_profile_mcp_servers = late("_write_profile_mcp_servers")
 _write_profile_model = late("_write_profile_model")
@@ -196,6 +197,11 @@ def _sidebar_singleflight_cache(func):
             if cached is not miss:
                 return cached
             result = func(*args, **kwargs)
+            # A 200 carrying errors[] is a FAILED profile scan, not a
+            # successful empty page. Caching it holds the empty recents in
+            # front of a store that has already recovered, for the whole TTL.
+            if isinstance(result, dict) and result.get("errors"):
+                return result
             try:
                 snapshot = copy.deepcopy(result)
             except Exception:
@@ -777,8 +783,7 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
 async def list_profiles_endpoint():
     from hermes_cli import profiles as profiles_mod
     try:
-        loop = asyncio.get_running_loop()
-        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        profiles = await run_in_threadpool(profiles_mod.list_profiles)
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
@@ -1010,7 +1015,25 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
     except Exception as e:
         _log.exception("PATCH /api/profiles/%s failed", name)
         raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "name": body.new_name, "path": str(path)}
+    # For the default profile the rename lands as a presentation-only
+    # display_name; the canonical id ("default") is unchanged. Always
+    # return the canonical id so callers keying on `name` stay correct.
+    try:
+        is_default = profiles_mod.normalize_profile_name(name) == "default"
+    except ValueError:
+        is_default = False
+    if is_default:
+        return {
+            "ok": True,
+            "name": "default",
+            "display_name": body.new_name.strip(),
+            "path": str(path),
+        }
+    return {
+        "ok": True,
+        "name": profiles_mod.normalize_profile_name(body.new_name),
+        "path": str(path),
+    }
 
 
 @router.delete("/api/profiles/{name}")
@@ -1155,14 +1178,12 @@ async def export_profile_endpoint(name: str, body: ProfileExport):
 
     output = (body.output or "").strip()
     if not output:
-        from hermes_constants import get_hermes_home
-        staging = get_hermes_home() / "profile-exports"
         try:
-            staging.mkdir(parents=True, exist_ok=True)
+            output = str(profiles_mod.get_profile_export_path(name))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not create export directory: {exc}")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        output = str(staging / f"{profiles_mod.normalize_profile_name(name)}-{stamp}.tar.gz")
 
     loop = asyncio.get_running_loop()
     try:

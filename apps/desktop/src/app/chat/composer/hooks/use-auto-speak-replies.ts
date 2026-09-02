@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
 import { playSpeechText } from '@/lib/voice-playback'
+import { useVoiceRouteScope } from '@/lib/voice-route-scope'
 import { ownsAmbientCue } from '@/store/ambient'
 import { notifyError } from '@/store/notifications'
 import { $voicePlayback } from '@/store/voice-playback'
@@ -44,8 +45,11 @@ export function useAutoSpeakReplies({
   // Wake on THIS composer's transcript: a tile subscribed to the primary's
   // would never fire on its own replies (and would fire on someone else's).
   const { $messages } = useComposerScope()
-  const latest = useRef({ conversationActive, failureLabel, markSpoken, pendingReply })
-  latest.current = { conversationActive, failureLabel, markSpoken, pendingReply }
+  // Speak with the chat's OWNER scope (a Bot's profile) when this surface has
+  // one — auto-speak must voice a Bot chat with the Bot's TTS (#100864).
+  const scope = useVoiceRouteScope()
+  const latest = useRef({ conversationActive, failureLabel, markSpoken, pendingReply, scope })
+  latest.current = { conversationActive, failureLabel, markSpoken, pendingReply, scope }
 
   useEffect(() => {
     if (!enabled) {
@@ -57,7 +61,7 @@ export function useAutoSpeakReplies({
     latest.current.markSpoken()
 
     const speakLatest = () => {
-      const { conversationActive, failureLabel, markSpoken, pendingReply } = latest.current
+      const { conversationActive, failureLabel, markSpoken, pendingReply, scope } = latest.current
 
       if (conversationActive || $voicePlayback.get().status !== 'idle') {
         return
@@ -75,7 +79,7 @@ export function useAutoSpeakReplies({
       // ran in every window, so peers just stay quiet.
       void ownsAmbientCue(`speak:${reply.id}`).then(owns => {
         if (owns) {
-          void playSpeechText(reply.text, { messageId: reply.id, source: 'read-aloud' }).catch(error =>
+          void playSpeechText(reply.text, { messageId: reply.id, scope, source: 'read-aloud' }).catch(error =>
             notifyError(error, failureLabel)
           )
         }
