@@ -7,6 +7,7 @@ import {
   type DirectTtsConfig,
   synthesizeSpeechClientDirect
 } from '@/lib/voice-client-direct'
+import type { VoiceRouteScope } from '@/lib/voice-route-scope'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 import {
   $voicePlayback,
@@ -74,6 +75,13 @@ function currentState(
 export interface VoicePlaybackOptions {
   messageId?: string | null
   source: VoicePlaybackSource
+  /**
+   * The (connection, profile) whose TTS config must synthesize this playback.
+   * A Bot chat passes its owner route so replies speak with the BOT's voice,
+   * not the window's active profile's (#100864). Null/absent → the active
+   * (connection, profile) — the pre-#100864 behavior.
+   */
+  scope?: null | VoiceRouteScope
 }
 
 export function stopVoicePlayback() {
@@ -105,7 +113,7 @@ export function stopVoicePlayback() {
 
 /** Exported for tests: the (connection, profile) routing contract below is
  *  exactly what broke in the desktop-remote voice report — keep it pinned. */
-export async function resolveSpeakStreamUrl(): Promise<null | string> {
+export async function resolveSpeakStreamUrl(scope?: null | VoiceRouteScope): Promise<null | string> {
   const desktop = window.hermesDesktop
 
   if (!desktop?.getConnection) {
@@ -114,8 +122,10 @@ export async function resolveSpeakStreamUrl(): Promise<null | string> {
 
   try {
     // Mint a fresh credential (single-use ticket in OAuth mode) for the
-    // ACTIVE (connection, profile) backend, then swap the gateway endpoint
-    // for the PCM one — auth is shared across WS routes. A registry-scoped
+    // ACTIVE (connection, profile) backend — or, when the caller passes a
+    // route scope (a Bot chat's owner route, #100864), for THAT backend —
+    // then swap the gateway endpoint for the PCM one; auth is shared across
+    // WS routes. A registry-scoped
     // remote MUST resolve through the *For bridges (same seam as
     // store/gateway's openSecondary): the bare getConnection/getGatewayWsUrl
     // pair answers for the v1 primary backend, which — when a registry
@@ -123,8 +133,8 @@ export async function resolveSpeakStreamUrl(): Promise<null | string> {
     // replies would synthesize with the local (often unconfigured) TTS
     // instead of the profile the user is actually talking to (#90051-adjacent
     // desktop-remote voice report, Aug 2026).
-    const profile = getApiRequestProfile()
-    const connectionId = getApiRequestConnection()
+    const profile = scope?.profile ?? getApiRequestProfile()
+    const connectionId = scope?.connectionId ?? getApiRequestConnection()
 
     // Both awaits below are IPC round-trips into the main process with no
     // timeout of their own (#93454) — a wedged main-process round-trip
@@ -522,7 +532,7 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
  * `playSpeechText`).
  */
 export async function startSpeechStream(options: VoicePlaybackOptions): Promise<null | SpeechStreamSession> {
-  const direct = await directTtsConfig().catch(() => null)
+  const direct = await directTtsConfig(options.scope).catch(() => null)
 
   if (direct) {
     stopVoicePlayback()
@@ -539,7 +549,7 @@ export async function startSpeechStream(options: VoicePlaybackOptions): Promise<
     return session
   }
 
-  const wsUrl = await resolveSpeakStreamUrl()
+  const wsUrl = await resolveSpeakStreamUrl(options.scope)
 
   if (!wsUrl) {
     return null
@@ -573,7 +583,7 @@ async function playSpeechDataUrl(
   options: VoicePlaybackOptions,
   isCurrent: () => boolean
 ): Promise<boolean> {
-  const response = await speakText(speakableText)
+  const response = await speakText(speakableText, options.scope)
 
   if (!isCurrent()) {
     return false
@@ -668,8 +678,10 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
   try {
     // Ladder: client-direct synthesis (profile's own TTS, no gateway audio
-    // hop) → streaming WS relay → POST data-URL fallback.
-    const direct = await directTtsConfig().catch(() => null)
+    // hop) → streaming WS relay → POST data-URL fallback. Each rung resolves
+    // the playback's OWNER scope when one was passed (a Bot chat's route,
+    // #100864), else the active profile.
+    const direct = await directTtsConfig(options.scope).catch(() => null)
 
     if (direct && isCurrent()) {
       const session = openClientDirectSpeechSession(direct, options)
@@ -693,7 +705,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
       return false
     }
 
-    const streamUrl = await resolveSpeakStreamUrl()
+    const streamUrl = await resolveSpeakStreamUrl(options.scope)
 
     if (streamUrl && isCurrent()) {
       const outcome = await playSpeechStream(streamUrl, speakableText, options)

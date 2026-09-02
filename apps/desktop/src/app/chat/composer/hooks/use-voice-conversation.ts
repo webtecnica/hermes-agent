@@ -10,6 +10,7 @@ import {
   startSpeechStream,
   stopVoicePlayback
 } from '@/lib/voice-playback'
+import { useVoiceRouteScope } from '@/lib/voice-route-scope'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
 import { $voicePlayback } from '@/store/voice-playback'
@@ -117,6 +118,10 @@ export function useVoiceConversation({
   useEffect(() => {
     statusRef.current = status
   }, [status])
+
+  // The chat's OWNER scope (a Bot's profile) whose TTS config this voice
+  // conversation must synthesize with (#100864). Null → active scope.
+  const scope = useVoiceRouteScope()
 
   const clearTurnTimeout = () => {
     if (turnTimeoutRef.current) {
@@ -459,7 +464,7 @@ export function useVoiceConversation({
         // this is a safety net for read-aloud-style entries into the loop.
         ensureBargeMonitor()
 
-        const playback = playSpeechText(response.text, { source: 'voice-conversation' })
+        const playback = playSpeechText(response.text, { scope, source: 'voice-conversation' })
         // playSpeechText performs its normal cleanup synchronously before
         // returning. Capture the sequence after that internal increment so
         // only a later, external stop suppresses the next listen cycle.
@@ -477,7 +482,7 @@ export function useVoiceConversation({
 
       poll()
     },
-    [ensureBargeMonitor, pendingResponse, settleAfterSpeech, voiceCopy.playbackFailed]
+    [ensureBargeMonitor, pendingResponse, scope, settleAfterSpeech, voiceCopy.playbackFailed]
   )
 
   /**
@@ -500,7 +505,7 @@ export function useVoiceConversation({
       ensureBargeMonitor()
 
       void (async () => {
-        const session = await startSpeechStream({ source: 'voice-conversation' })
+        const session = await startSpeechStream({ scope, source: 'voice-conversation' })
 
         // The session may resolve after the loop moved on (barge, disable).
         if (responseIdRef.current !== responseId) {
@@ -569,7 +574,7 @@ export function useVoiceConversation({
         settleAfterSpeech(bargedRef.current)
       })()
     },
-    [awaitFallbackSpeech, ensureBargeMonitor, feedSpeechSession, settleAfterSpeech]
+    [awaitFallbackSpeech, ensureBargeMonitor, feedSpeechSession, scope, settleAfterSpeech]
   )
 
   const start = useCallback(async () => {

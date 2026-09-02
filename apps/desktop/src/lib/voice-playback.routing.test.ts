@@ -119,4 +119,33 @@ describe('resolveSpeakStreamUrl', () => {
 
     await expect(pending).resolves.toBeNull()
   })
+
+  it('routes through the OWNER route when a Bot scope is passed, ignoring the active profile (#100864)', async () => {
+    // A Bot chat speaks with the BOT's voice. Before #100864 the playback
+    // seam resolved through getApiRequestProfile() — the WINDOW's active
+    // profile — so a Bot chat riding a different connection/profile spoke
+    // with the wrong TTS voice.
+    setApiRequestConnection('gw-human')
+    setApiRequestProfile('human-active')
+    getGatewayWsUrlFor.mockResolvedValue({ ok: true, wsUrl: remoteWsUrl })
+
+    const url = await resolveSpeakStreamUrl({ connectionId: 'gw-bot', profile: 'bot-voice' })
+
+    expect(url).toContain('wss://gateway.example')
+    expect(getConnectionFor).toHaveBeenCalledWith({ connectionId: 'gw-bot', profile: 'bot-voice' })
+    expect(getGatewayWsUrlFor).toHaveBeenCalledWith({ connectionId: 'gw-bot', profile: 'bot-voice' })
+    // The active human profile must NOT leak into the Bot playback.
+    expect(getConnectionFor).not.toHaveBeenCalledWith({ connectionId: 'gw-human', profile: 'human-active' })
+    expect(getConnection).not.toHaveBeenCalledWith('human-active')
+  })
+
+  it('keeps resolving through the active profile when no scope is passed (non-Bot chats unchanged)', async () => {
+    setApiRequestConnection('gw-tailscale')
+    setApiRequestProfile('research')
+
+    const url = await resolveSpeakStreamUrl()
+
+    expect(url).toContain('wss://gateway.example')
+    expect(getConnectionFor).toHaveBeenCalledWith({ connectionId: 'gw-tailscale', profile: 'research' })
+  })
 })

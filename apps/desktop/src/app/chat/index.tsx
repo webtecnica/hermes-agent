@@ -26,6 +26,7 @@ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-s
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { type VoiceRouteScope, VoiceRouteScopeContext } from '@/lib/voice-route-scope'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
@@ -193,6 +194,9 @@ interface ChatRuntimeBoundaryProps {
   /** Route points at an unloaded session — render empty until resume swaps in
    *  the new transcript, so the previous session's messages don't linger. */
   suppressMessages: boolean
+  /** Owner route whose TTS/STT config this chat's voice playback must use (a
+   *  Bot chat's profile, #100864). Null → active scope. */
+  voiceRouteScope?: null | VoiceRouteScope
 }
 
 const NO_MESSAGES: ChatMessage[] = []
@@ -238,7 +242,8 @@ function ChatRuntimeBoundary({
   onEdit,
   onReload,
   onThreadMessagesChange,
-  suppressMessages
+  suppressMessages,
+  voiceRouteScope
 }: ChatRuntimeBoundaryProps) {
   const view = useSessionView()
   const runtimeId = useStore(view.$runtimeId)
@@ -340,7 +345,9 @@ function ChatRuntimeBoundary({
 
   return (
     <TranscriptWindowProvider value={transcriptWindow}>
-      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+      <AssistantRuntimeProvider runtime={runtime}>
+        <VoiceRouteScopeContext.Provider value={voiceRouteScope ?? null}>{children}</VoiceRouteScopeContext.Provider>
+      </AssistantRuntimeProvider>
     </TranscriptWindowProvider>
   )
 }
@@ -413,6 +420,21 @@ const ChatViewContent = memo(function ChatViewContent({
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  // Voice playback follows the chat's OWNER route — the profile the hosts
+  // already resolve for model options/config reads (`session-tile.tsx`:
+  // ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile)
+  // — so a Bot chat's replies speak with the BOT's TTS config, not the
+  // window's active profile (#100864). No owner route → null → playback uses
+  // the active scope, unchanged.
+  const voiceRouteScope = useMemo<null | VoiceRouteScope>(() => {
+    const profile = modelOptionsProfile || activeGatewayProfile || null
+
+    if (!profile) {
+      return null
+    }
+
+    return { connectionId: modelOptionsOwnerConnectionId ?? null, profile }
+  }, [activeGatewayProfile, modelOptionsOwnerConnectionId, modelOptionsProfile])
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -664,6 +686,7 @@ const ChatViewContent = memo(function ChatViewContent({
         onReload={onReload}
         onThreadMessagesChange={onThreadMessagesChange}
         suppressMessages={routeSessionMismatch}
+        voiceRouteScope={voiceRouteScope}
       >
         <div
           className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"

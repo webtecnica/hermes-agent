@@ -168,11 +168,17 @@ export function getActionStatus(name: string, lines = 200, profile?: ProfileScop
   })
 }
 
-export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
+export function transcribeAudio(
+  dataUrl: string,
+  mimeType?: string,
+  scope?: ProfileScope
+): Promise<AudioTranscriptionResponse> {
   return hermesApi<AudioTranscriptionResponse>({
     path: '/api/audio/transcribe',
     method: 'POST',
-    ...profileScoped(),
+    // An explicit scope (a Bot chat's owner route) pins the backend whose STT
+    // config resolves the clip; no scope → the active profile (#100864).
+    ...capabilityScoped(scope),
     body: {
       data_url: dataUrl,
       mime_type: mimeType
@@ -184,9 +190,9 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
   })
 }
 
-export function speakText(text: string): Promise<AudioSpeakResponse> {
+export function speakText(text: string, scope?: ProfileScope): Promise<AudioSpeakResponse> {
   return hermesApi<AudioSpeakResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(scope),
     path: '/api/audio/speak',
     method: 'POST',
     body: { text },

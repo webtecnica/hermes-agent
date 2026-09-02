@@ -1,5 +1,7 @@
-import { profileScoped } from '@/api/client'
+import { capabilityScoped } from '@/api/client'
 import { getApiRequestConnection, getApiRequestProfile, hermesApi } from '@/hermes'
+
+import type { VoiceRouteScope } from './voice-route-scope'
 
 /**
  * Client-direct voice: call the active profile's STT/TTS providers straight
@@ -61,8 +63,11 @@ const CONFIG_TTL_MS = 60_000
 let cached: { key: string; at: number; config: VoiceClientConfig } | null = null
 let inflight: { key: string; promise: Promise<null | VoiceClientConfig> } | null = null
 
-function scopeKey(): string {
-  return `${getApiRequestConnection() ?? 'local'}::${getApiRequestProfile() ?? 'default'}`
+function scopeKey(scope?: null | VoiceRouteScope): string {
+  const connectionId = scope?.connectionId ?? getApiRequestConnection() ?? 'local'
+  const profile = scope?.profile ?? getApiRequestProfile() ?? 'default'
+
+  return `${connectionId}::${profile}`
 }
 
 /** Drop cached credentials (used by tests; scope changes rotate the key). */
@@ -71,8 +76,8 @@ export function clearVoiceClientConfigCache(): void {
   inflight = null
 }
 
-export async function fetchVoiceClientConfig(): Promise<null | VoiceClientConfig> {
-  const key = scopeKey()
+export async function fetchVoiceClientConfig(scope?: null | VoiceRouteScope): Promise<null | VoiceClientConfig> {
+  const key = scopeKey(scope)
 
   if (cached && cached.key === key && Date.now() - cached.at < CONFIG_TTL_MS) {
     return cached.config
@@ -84,11 +89,13 @@ export async function fetchVoiceClientConfig(): Promise<null | VoiceClientConfig
 
   const promise = (async () => {
     try {
-      // hermesApi carries connectionScoped(); profileScoped() adds the
-      // profile — the same routing every relay audio call uses, so the
-      // config comes from the backend the user is actually talking to.
+      // hermesApi carries connectionScoped(); capabilityScoped(scope) adds
+      // the request's own profile + connection pin when the caller names one
+      // (a Bot chat's owner route) — the same routing every relay audio call
+      // uses, so the config comes from the backend the chat actually talks
+      // to (#100864). No scope → the active profile, unchanged.
       const response = await hermesApi<{ ok: boolean } & VoiceClientConfig>({
-        ...profileScoped(),
+        ...capabilityScoped(scope),
         path: '/api/audio/voice-config'
       })
 
@@ -177,8 +184,11 @@ export function transcriptFromOpenAiMultipartBody(body: string): string {
  * re-running the same request through the gateway would just fail again
  * slower and hide the real error.
  */
-export async function transcribeAudioClientDirect(audio: Blob): Promise<null | string> {
-  const config = await fetchVoiceClientConfig()
+export async function transcribeAudioClientDirect(
+  audio: Blob,
+  scope?: null | VoiceRouteScope
+): Promise<null | string> {
+  const config = await fetchVoiceClientConfig(scope)
   const stt = config?.stt
 
   if (!stt || stt.mode !== 'direct') {
@@ -272,8 +282,8 @@ export async function transcribeAudioClientDirect(audio: Blob): Promise<null | s
 // ---------------------------------------------------------------------------
 
 /** Resolve the profile's TTS config when it is client-callable, else null. */
-export async function directTtsConfig(): Promise<DirectTtsConfig | null> {
-  const config = await fetchVoiceClientConfig()
+export async function directTtsConfig(scope?: null | VoiceRouteScope): Promise<DirectTtsConfig | null> {
+  const config = await fetchVoiceClientConfig(scope)
 
   return config?.tts && config.tts.mode === 'direct' ? config.tts : null
 }

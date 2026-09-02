@@ -47,6 +47,7 @@ import { markAssistantIdSpoken } from '@/lib/spoken-reply'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { useVoiceRouteScope } from '@/lib/voice-route-scope'
 import { notifyError } from '@/store/notifications'
 import { requestSendDiagnostics } from '@/store/send-diagnostics'
 import { $connection, $currentModel } from '@/store/session'
@@ -687,6 +688,9 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
   const voicePlayback = useStore($voicePlayback)
   const view = useSessionView()
   const sessionId = useStore(view.$runtimeId)
+  // Read-aloud in a Bot chat must synthesize with the BOT's profile TTS
+  // config, not the window's active profile (#100864). Null → active scope.
+  const scope = useVoiceRouteScope()
 
   const readAloudStatus =
     voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
@@ -705,12 +709,12 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
     }
 
     try {
-      await playSpeechText(text, { messageId, source: 'read-aloud' })
+      await playSpeechText(text, { messageId, scope, source: 'read-aloud' })
       markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
     } catch (error) {
       notifyError(error, copy.readAloudFailed)
     }
-  }, [copy.readAloudFailed, getText, messageId, sessionId, view.$messages])
+  }, [copy.readAloudFailed, getText, messageId, scope, sessionId, view.$messages])
 
   return (
     <TooltipIconButton
