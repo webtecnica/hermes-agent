@@ -347,10 +347,49 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
 
 
+_EPHEMERAL_USER_NOTE_PATTERN = re.compile(
+    r"^(?:\[Note:\s*(?:model\s+was\s+just\s+switched\b[^\]]*|switched\s+to\b[^\]]*|the\s+user\s+interrupted\b[^\]]*|this\s+message\s+came\s+from\s+HUD\s+mode\b[^\]]*|this\s+message\s+is\s+a\s+delegation\b[^\]]*)\]|"
+    r"\[MODEL\s+SWITCH\s+NOTE\]|"
+    r"\[USER INITIATED SKILLS RELOAD:.*?Use skills_list to see the updated catalog\.\])"
+    r"(?:\n\n|\s*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def strip_one_turn_user_notes(content: Any) -> Any:
+    """Strip ephemeral one-turn session notes (model switches, skill reloads, interruptions)
+    from user messages so compaction summaries and restated inflight tasks carry only real user text."""
+    if isinstance(content, str):
+        prev = None
+        s = content.strip()
+        while s != prev:
+            prev = s
+            s = _EPHEMERAL_USER_NOTE_PATTERN.sub("", s).strip()
+        return s
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                prev = None
+                s = text.strip()
+                while s != prev:
+                    prev = s
+                    s = _EPHEMERAL_USER_NOTE_PATTERN.sub("", s).strip()
+                if s or len(content) == 1:
+                    parts.append({**part, "text": s})
+            else:
+                parts.append(part)
+        return parts
+    return content
+
+
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Copy a message for compaction assembly without persistence markers (``_strip_persistence_markers`` is authoritative)."""
     fresh = msg.copy()
     fresh.pop(_DB_PERSISTED_MARKER, None)
+    if fresh.get("role") == "user" and "content" in fresh:
+        fresh["content"] = strip_one_turn_user_notes(fresh["content"])
     return fresh
 
 
@@ -3473,6 +3512,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content")
+            if role == "user":
+                content = strip_one_turn_user_notes(content)
             if isinstance(content, list):
                 content = "\n".join(_summary_part_text(part) for part in content if isinstance(part, (dict, str)))
             content = _redact_compaction_text(content or "")
@@ -3520,7 +3561,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     _collect_paths_from_jsonish(parsed, relevant_files)
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            text = _compact_fallback_turn(msg.get("content"))
+            turn_content = msg.get("content")
+            if role == "user":
+                turn_content = strip_one_turn_user_notes(turn_content)
+            text = _compact_fallback_turn(turn_content)
             _collect_path_mentions(text, relevant_files)
             synthetic_user = role == "user" and self._is_synthetic_compression_user_turn(msg)
             tool_names = [_extract_tool_call_name_and_args(tc)[0] for tc in (msg.get("tool_calls") or [])] if role == "assistant" else []
@@ -4407,6 +4451,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             if msg.get("role") != "user" or cls._is_synthetic_compression_user_turn(msg) or msg.get("display_kind"):
                 continue
             text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
+            text = strip_one_turn_user_notes(text)
             if not text:
                 continue
             text = " ".join(text.split())
@@ -4434,6 +4479,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             if msg.get("role") != "user" or not _is_real_user_message(msg):
                 continue
             text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
+            text = strip_one_turn_user_notes(text)
             if not text:
                 continue
             text = re.sub(r"\s+", " ", text)
@@ -4884,6 +4930,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             # task that survives >1 cycle never stacks headers or drags the
             # old summary along.
             task_text = task_text.rsplit(_INFLIGHT_TASK_REPLAY_HEADER, 1)[1].strip()
+        task_text = strip_one_turn_user_notes(task_text)
         if not task_text:
             return compressed
 
