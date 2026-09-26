@@ -600,13 +600,20 @@ def _fetch_anthropic_account_usage(
     payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
-                  ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at", fraction=True,
+                  ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at",
     )
     details: list[str] = []
     extra = payload.get("extra_usage") or {}
     used_credits, monthly_limit = extra.get("used_credits"), extra.get("monthly_limit")
     if extra.get("is_enabled") and _is_num(used_credits) and _is_num(monthly_limit):
-        details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {extra.get('currency') or 'USD'}")
+        spend = payload.get("spend") or {}
+        used_spend = spend.get("used") or {}
+        limit_spend = spend.get("limit") or {}
+        exponent = used_spend.get("exponent") if _is_num(used_spend.get("exponent")) else (limit_spend.get("exponent") if _is_num(limit_spend.get("exponent")) else None)
+        scale = 10 ** int(exponent) if (exponent is not None and (used_spend.get("amount_minor") == used_credits or limit_spend.get("amount_minor") == monthly_limit or int(exponent) > 0)) else 1
+        used_val = float(used_credits) / scale
+        limit_val = float(monthly_limit) / scale
+        details.append(f"Extra usage: {used_val:.2f} / {limit_val:.2f} {extra.get('currency') or 'USD'}")
     return _snapshot("anthropic", "oauth_usage_api", windows, details)
 
 

@@ -118,6 +118,44 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert "Credits balance: $12.50" in snapshot.details
 
 
+def test_fetch_account_usage_anthropic_utilization_and_extra_usage(monkeypatch):
+    payload = {
+        "five_hour": {
+            "utilization": 1.0,
+            "resets_at": "2026-09-26T20:00:00Z",
+        },
+        "seven_day": {
+            "utilization": 15.5,
+            "resets_at": "2026-09-30T00:00:00Z",
+        },
+        "extra_usage": {
+            "is_enabled": True,
+            "used_credits": 14375,
+            "monthly_limit": 20000,
+            "currency": "USD",
+        },
+        "spend": {
+            "used": {"amount_minor": 14375, "exponent": 2},
+            "limit": {"amount_minor": 20000, "exponent": 2},
+        },
+    }
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda: "mock-oauth-token")
+    monkeypatch.setattr("agent.account_usage._is_oauth_token", lambda token: True)
+    monkeypatch.setattr("agent.account_usage._get_json", lambda url, headers, timeout: payload)
+
+    snapshot = fetch_account_usage("anthropic")
+    assert snapshot is not None
+    assert snapshot.provider == "anthropic"
+    assert len(snapshot.windows) == 2
+    # 1.0% utilization should NOT be 100.0%
+    assert snapshot.windows[0].label == "Current session"
+    assert snapshot.windows[0].used_percent == 1.0
+    assert snapshot.windows[1].label == "Current week"
+    assert snapshot.windows[1].used_percent == 15.5
+    # Extra usage should be scaled by exponent (divided by 100), not 14375.00 / 20000.00
+    assert snapshot.details == ("Extra usage: 143.75 / 200.00 USD",)
+
+
 def _register_profile(monkeypatch, profile):
     import providers
 
