@@ -380,6 +380,14 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     def _record_scale(w: int, h: int) -> None:
         if scale_out is not None and (w, h) != orig_dims:
             scale_out.update(orig_width=orig_dims[0], orig_height=orig_dims[1], new_width=w, new_height=h)
+
+    if max_dimension is not None and max(img.width, img.height) > max_dimension:
+        scale = max_dimension / max(img.width, img.height)
+        new_w, new_h = max(int(img.width * scale), 64), max(int(img.height * scale), 64)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        prev_dims = (new_w, new_h)
+        logger.info("Directly scaled to max_dimension %d: %dx%d", max_dimension, new_w, new_h)
+
     for attempt in range(5):
         if attempt > 0:
             # Halve, then re-derive from whichever axis hit the 64px floor so both shrink equally.

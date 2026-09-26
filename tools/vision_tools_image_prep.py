@@ -264,21 +264,31 @@ def _validate_raster_image_decodable(
             image.verify()
         with _PILImage.open(image_path) as image:
             validated_pixels = 0
-            for frame_number, frame in enumerate(_PILImageSequence.Iterator(image), start=1):
-                if frame_number > max_frames:
-                    return (
-                        "Image validation rejected animation: "
-                        f"frame {frame_number} exceeds the maximum "
-                        f"{max_frames} validated frames.")
-                next_validated_pixels = validated_pixels + frame.width * frame.height
-                if next_validated_pixels > max_pixels:
-                    return (
-                        "Image validation rejected animation: aggregate decoded "
-                        f"pixel count would reach {next_validated_pixels} at frame "
-                        f"{frame_number}, exceeding the maximum "
-                        f"{max_pixels}.")
-                frame.load()
-                validated_pixels = next_validated_pixels
+            fmt = str(getattr(image, "format", "") or "").upper()
+            try:
+                for frame_number, frame in enumerate(_PILImageSequence.Iterator(image), start=1):
+                    if frame_number > max_frames:
+                        return (
+                            "Image validation rejected animation: "
+                            f"frame {frame_number} exceeds the maximum "
+                            f"{max_frames} validated frames.")
+                    next_validated_pixels = validated_pixels + frame.width * frame.height
+                    if next_validated_pixels > max_pixels:
+                        return (
+                            "Image validation rejected animation: aggregate decoded "
+                            f"pixel count would reach {next_validated_pixels} at frame "
+                            f"{frame_number}, exceeding the maximum "
+                            f"{max_pixels}.")
+                    frame.load()
+                    validated_pixels = next_validated_pixels
+            except (ValueError, SyntaxError, EOFError, OSError) as exc:
+                # MPO / multi-picture files often have secondary frame offsets corrupted or stripped
+                # by editors (like Picasa). If the primary frame (frame 1) has already been fully decoded
+                # and validated, treat the primary image as valid instead of rejecting the whole file.
+                if fmt in ("MPO", "JPEG") and validated_pixels > 0:
+                    pass
+                else:
+                    raise
     except Exception as exc:
         return f"Image could not be fully decoded: {exc}"
     return None
