@@ -182,6 +182,19 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
             return await send(chunk, parse_mode)
         err_text = str(md_error).lower()
         if "parse" in err_text or "markdown" in err_text or "html" in err_text:
+            if "HTML" in str(parse_mode).upper():
+                logger.warning("Parse mode HTML failed in _send_telegram, retrying with MarkdownV2: %s",
+                               _sanitize_error_text(md_error))
+                try:
+                    from plugins.platforms.telegram.adapter import TelegramAdapter
+                    parse_mode_v2 = "MarkdownV2"
+                    with contextlib.suppress(Exception):
+                        from telegram.constants import ParseMode
+                        parse_mode_v2 = ParseMode.MARKDOWN_V2
+                    md_text = TelegramAdapter.__new__(TelegramAdapter).format_message(_normalize_telegram_details_tags(chunk))
+                    return await send(md_text, parse_mode_v2)
+                except Exception as mdv2_err:
+                    logger.warning("MarkdownV2 retry also failed: %s", _sanitize_error_text(mdv2_err))
             logger.warning("Parse mode %s failed in _send_telegram, falling back to plain text: %s",
                            parse_mode, _sanitize_error_text(md_error))
             return await send(chunk if has_html else _strip_mdv2_safe(chunk), None)
@@ -243,17 +256,46 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
                 os.remove(thumb_path)
 
 
+_TELEGRAM_SUPPORTED_HTML_TAGS = frozenset({
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span",
+    "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote"
+})
+
+
+def _normalize_telegram_details_tags(message: str) -> str:
+    """Normalize <details> and <summary> into Markdown-safe bold headers and text."""
+    if not message or ("<details" not in message.lower() and "<summary" not in message.lower()):
+        return message
+    text = re.sub(r'(?is)<summary\b[^>]*>(.*?)</summary>', r'\n**\1**\n', message)
+    text = re.sub(r'(?is)</?details\b[^>]*>', '\n', text)
+    return text
+
+
+def _is_telegram_html(message: str) -> bool:
+    """True only if the message contains HTML tags and all tags are Telegram-supported."""
+    tags = re.findall(r'</?([a-zA-Z0-9_-]+)', message)
+    if not tags:
+        return False
+    return all(t.lower() in _TELEGRAM_SUPPORTED_HTML_TAGS for t in tags)
+
+
 def _telegram_format(message):
-    """``(formatted, parse_mode, has_html)``: text already containing HTML tags is sent as
-    HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``."""
-    from telegram.constants import ParseMode
-    if re.search(r'<[a-zA-Z/][^>]*>', message):
-        return message, ParseMode.HTML, True
+    """``(formatted, parse_mode, has_html)``: text containing ONLY supported HTML tags is sent as
+    HTML; otherwise normalized Markdown -> MarkdownV2 via the adapter's ``format_message``."""
+    mode_html = "HTML"
+    mode_v2 = "MarkdownV2"
+    with contextlib.suppress(Exception):
+        from telegram.constants import ParseMode
+        mode_html = ParseMode.HTML
+        mode_v2 = ParseMode.MARKDOWN_V2
+    normalized = _normalize_telegram_details_tags(message)
+    if _is_telegram_html(normalized):
+        return normalized, mode_html, True
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter
-        return TelegramAdapter.__new__(TelegramAdapter).format_message(message), ParseMode.MARKDOWN_V2, False
+        return TelegramAdapter.__new__(TelegramAdapter).format_message(normalized), mode_v2, False
     except Exception:
-        return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
+        return normalized, mode_v2, False  # formatting unavailable: send as-is
 
 
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
@@ -276,9 +318,45 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         _cap, _ = _media_caption_split(message, media_files, max_caption_len=_TELEGRAM_CAPTION_LIMIT)
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
+        # Check if rich messages should be attempted for standalone Telegram send
+        if not media_files and message and message.strip():
+            try:
+                from hermes_cli.config import load_config_readonly
+                cfg = load_config_readonly() or {}
+                tg_cfg = cfg.get("telegram") or {}
+                tg_extra = tg_cfg.get("extra") or {}
+                if tg_extra.get("rich_messages", False):
+                    from plugins.platforms.telegram.adapter import TelegramAdapter
+                    adapter = TelegramAdapter.__new__(TelegramAdapter)
+                    adapter._bot = bot
+                    adapter._rich_messages_enabled = True
+                    if adapter._should_attempt_rich(message):
+                        payload = adapter._rich_payload_base(str(int_chat_id), message)
+                        if thread_kwargs.get("message_thread_id") is not None:
+                            payload["message_thread_id"] = thread_kwargs["message_thread_id"]
+                        if disable_link_previews:
+                            payload["link_preview_options"] = {"is_disabled": True}
+                        try:
+                            res = await bot.do_api_request("sendRichMessage", api_kwargs=payload)
+                            msg_id = None
+                            if isinstance(res, dict):
+                                msg_id = res.get("message_id") or (res.get("result") or {}).get("message_id")
+                            elif hasattr(res, "message_id"):
+                                msg_id = res.message_id
+                            if msg_id:
+                                class _RichMsg:
+                                    message_id = msg_id
+                                last_msg = _RichMsg()
+                        except Exception as rich_err:
+                            logger.warning("Standalone sendRichMessage failed, falling back to formatted text chunks: %s",
+                                           _sanitize_error_text(rich_err))
+            except Exception as e:
+                logger.debug("Standalone Telegram rich message attempt skipped: %s", e)
+
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
-            last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
+        if last_msg is None:
+            for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
+                last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
