@@ -745,7 +745,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):
             logger.info(
-                "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
+                "Bot Chat capability epoch changed for session %s; rebuilding system prompt and tool definitions to "
                 "adopt the new capability surface (one-time prefix-cache break).",
                 agent.session_id,
             )
@@ -757,6 +757,31 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 clear_skills_system_prompt_cache(clear_snapshot=True)
             except Exception:
                 pass
+            # Toolset / MCP / capability changes: refresh live agent tools and re-pin them
+            try:
+                from tools.mcp_tool_agent import (
+                    persist_agent_tool_names,
+                    refresh_agent_mcp_tools,
+                    reprobe_tool_availability,
+                )
+                reprobe_tool_availability()
+                from hermes_cli.config import load_config_readonly
+                from hermes_cli.tools_config import _get_platform_tools
+                cfg = load_config_readonly() or {}
+                platform = getattr(agent, "platform", None) or "cli"
+                new_enabled = sorted(_get_platform_tools(cfg, platform, include_default_mcp_servers=True))
+                dis = (cfg.get("agent") or {}).get("disabled_toolsets")
+                new_disabled = [str(d) for d in dis] if isinstance(dis, list) else None
+                refresh_agent_mcp_tools(
+                    agent,
+                    enabled_override=new_enabled,
+                    disabled_override=new_disabled,
+                    quiet_mode=True,
+                    content_aware=True,
+                )
+                persist_agent_tool_names(agent)
+            except Exception:
+                logger.debug("Failed refreshing tools during Bot Chat capability sync", exc_info=True)
             agent._cached_system_prompt = agent._build_system_prompt(system_message)
             stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
             # Persist so the NEXT turn restores the new bytes verbatim (cache break is
@@ -765,6 +790,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent,
                 "Session DB update_system_prompt failed after Bot Chat capability refresh "
                 "(session=%s): %s. The refresh will re-fire next turn.",
+                persist_tools=True,
             )
             return
         # Continuing session — reuse the exact system prompt from the

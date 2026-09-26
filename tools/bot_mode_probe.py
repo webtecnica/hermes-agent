@@ -385,6 +385,14 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         surface["model_capabilities"] = _model_prompt_capability_surface(model_cfg)
         surface["disabled_skills"] = sorted(str(s).lower() for s in (skills_cfg.get("disabled") or []))
         surface["enabled_toolsets"] = sorted(str(t) for t in (tools_cfg.get("enabled_toolsets") or []))
+        platform_ts = cfg.get("platform_toolsets")
+        surface["platform_toolsets"] = {
+            str(p): sorted(str(x) for x in (ts or []))
+            for p, ts in (platform_ts.items() if isinstance(platform_ts, dict) else ())
+            if isinstance(ts, (list, set))
+        }
+        agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+        surface["disabled_toolsets"] = sorted(str(t) for t in (agent_cfg.get("disabled_toolsets") or []))
         mcp = cfg.get("mcp_servers")
         surface["mcp"] = json.dumps(mcp, sort_keys=True, default=str) if isinstance(mcp, dict) else ""
     except Exception:
