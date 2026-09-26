@@ -221,7 +221,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
 
 def build_model_options_payload(
     ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
-    refresh: bool = False,
+    refresh: bool = False, for_picker: bool = True,
 ) -> dict:
     """Shared API-server/dashboard/TUI payload. Normal open probes only the current custom provider so
     offline saved endpoints don't block the picker; explicit refresh probes all and busts the cache.
@@ -236,6 +236,7 @@ def build_model_options_payload(
         capabilities=True, featured=True,
         refresh=refresh, probe_custom_providers=refresh, probe_current_custom_provider=not refresh,
         non_blocking_catalogs=not refresh,
+        for_picker=bool(for_picker),
     )
     if not refresh:
         _prewarm_pricing_async(payload["providers"], current_provider=ctx.current_provider,

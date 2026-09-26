@@ -274,6 +274,7 @@ def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
             ctx, probe_custom_providers=force_refresh,
             probe_current_custom_provider=not force_refresh,
             capabilities=True,  # the effort step hides itself on reasoning-free routes
+            for_picker=True,
         )["providers"]
     except Exception:
         providers = []
