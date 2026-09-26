@@ -62,9 +62,10 @@ import {
   ensureGatewayProfile,
   newSessionInProfile,
   normalizeProfileKey,
+  pinNewChatProfile,
   refreshActiveProfile
 } from '@/store/profile'
-import { $newProjectSessionRequest, $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
+import { $newProjectSessionRequest, $startWorkSessionRequest, followActiveSessionCwd, projectProfile } from '@/store/projects'
 import { $backendRestartRequest, $routeRequest } from '@/store/recovery-requests'
 import {
   $activeSessionId,
@@ -638,8 +639,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     (path: null | string, options?: { openTab?: boolean }) => {
       setWorkspaceScope('sessions')
 
+      const profile = projectProfile()
+
+      if (profile) {
+        pinNewChatProfile(profile)
+      }
+
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
-        void openNewSessionTile('center', { cwd: path, listed: false })
+        void openNewSessionTile('center', { cwd: path, listed: false, profile: profile ?? undefined })
 
         return
       }
