@@ -766,6 +766,43 @@ class TestEnvironmentHints:
         assert "Linux 6.8.0" in line
         assert "root" in line
 
+    def test_probe_remote_backend_honors_docker_network(self, monkeypatch):
+        """Regression for #76906: container_config in _probe_remote_backend must
+        propagate docker_network setting so container network isolation is honored."""
+        import agent.prompt_builder as _pb
+        import tools.terminal_tool as _tt
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": "os=Linux\nkernel=6.8.0\nhome=/root\ncwd=/workspace\nuser=root\n",
+                }
+
+        created = {}
+
+        def _fake_create_environment(*, env_type, **kwargs):
+            created["env_type"] = env_type
+            created["container_config"] = kwargs.get("container_config")
+            return _FakeEnv()
+
+        monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
+
+        # 1. Default config -> docker_network defaults to True
+        monkeypatch.setattr(_tt, "_get_env_config", lambda: {})
+        _pb._probe_remote_backend("docker")
+        assert created.get("container_config") is not None
+        assert created["container_config"]["docker_network"] is True
+
+        # 2. Configured docker_network=False -> propagated to container_config
+        _pb._clear_backend_probe_cache()
+        monkeypatch.setattr(_tt, "_get_env_config", lambda: {"docker_network": False})
+        _pb._probe_remote_backend("docker")
+        assert created["container_config"]["docker_network"] is False
+
 
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
