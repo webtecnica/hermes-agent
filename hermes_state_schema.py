@@ -1141,17 +1141,52 @@ class SessionSchemaMixin:
             cursor.execute(_TITLE_UNIQUE_INDEX_SQL)
         except sqlite3.IntegrityError:
             try:
-                cursor.execute("""UPDATE sessions AS older
-                       SET title = NULL
-                       WHERE title IS NOT NULL
-                         AND EXISTS (
-                             SELECT 1 FROM sessions AS newer
-                             WHERE newer.title = older.title
-                               AND newer.rowid > older.rowid
-                         )""")
-                logger.warning(
-                    "Cleared %d duplicate session title(s) while restoring the unique index", cursor.rowcount,
-                )
+                cursor.execute("""
+                    SELECT title
+                    FROM sessions
+                    WHERE title IS NOT NULL
+                    GROUP BY title
+                    HAVING COUNT(*) > 1
+                """)
+                duplicate_titles = [row[0] for row in cursor.fetchall()]
+                cleared_count = 0
+                for title in duplicate_titles:
+                    cursor.execute("""
+                        SELECT id, title_source, started_at, rowid
+                        FROM sessions
+                        WHERE title = ?
+                        ORDER BY started_at DESC, rowid DESC
+                    """, (title,))
+                    rows = cursor.fetchall()
+                    if not rows:
+                        continue
+                    for older in rows[1:]:
+                        older_id, older_source = older[0], older[1]
+                        if older_source == "user":
+                            suffix_idx = 2
+                            candidate = f"{title} ({suffix_idx})"
+                            while True:
+                                cursor.execute("SELECT 1 FROM sessions WHERE title = ?", (candidate,))
+                                if not cursor.fetchone():
+                                    break
+                                suffix_idx += 1
+                                candidate = f"{title} ({suffix_idx})"
+                            logger.warning(
+                                "Disambiguating duplicate user-typed session title %r on older session %s to %r",
+                                title, older_id, candidate,
+                            )
+                            cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (candidate, older_id))
+                        else:
+                            logger.warning(
+                                "Clearing duplicate auto-derived session title %r on older session %s",
+                                title, older_id,
+                            )
+                            cursor.execute("UPDATE sessions SET title = NULL WHERE id = ?", (older_id,))
+                            cleared_count += 1
+                if cleared_count:
+                    logger.warning(
+                        "Cleared %d duplicate session title(s) while restoring the unique index", cleared_count,
+                    )
                 cursor.execute(_TITLE_UNIQUE_INDEX_SQL)
             except sqlite3.Error:
                 logger.exception("Could not repair duplicate session titles; unique title index not created")
