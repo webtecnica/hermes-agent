@@ -156,6 +156,11 @@ class _PathReadBudget:
         # Weak: a SessionDB dropped without close() must not pin peers' budget.
         self._members: "weakref.WeakSet[SessionDB]" = weakref.WeakSet()
         self._duplicate_handles_warned = False
+        self._checked_out = 0
+
+    def permits_available(self) -> int:
+        with self._lock:
+            return _READ_POOL_MAX - self._checked_out
 
     def register(self, db: "SessionDB") -> None:
         with self._lock:
@@ -194,6 +199,8 @@ class _PathReadBudget:
         """Remove a closed writer from duplicate-handle diagnostics immediately."""
         with self._lock:
             self._members.discard(db)
+        with _read_budgets_lock:
+            _reap_idle_budgets_locked()
 
     def acquire(self, requester: "SessionDB") -> bool:
         """Take a permit for a new read connection, or refuse (caller degrades to the
@@ -213,6 +220,9 @@ class _PathReadBudget:
 
     def release(self) -> None:
         """Return one connection's permits. Pairs with a successful acquire()."""
+        with self._lock:
+            if self._checked_out > 0:
+                self._checked_out -= 1
         self.permits.release()
         _process_read_permits.release()
 
@@ -223,9 +233,13 @@ class _PathReadBudget:
         )
 
     def _acquire_path_permit(self, requester: "SessionDB") -> bool:
-        return self.permits.acquire(blocking=False) or (
+        acquired = self.permits.acquire(blocking=False) or (
             self.reclaim_idle(exclude=requester) and self.permits.acquire(blocking=False)
         )
+        if acquired:
+            with self._lock:
+                self._checked_out += 1
+        return acquired
 
     def reclaim_idle(self, exclude: "Optional[SessionDB]" = None) -> bool:
         """Close one idle pooled connection held by a member; True if one went.
@@ -235,9 +249,8 @@ class _PathReadBudget:
         return any(member._evict_one_idle_read_conn() for member in members)
 
 
-# canonical db path -> permits for that file. Weak values: the budget lives only
-# while some SessionDB on the path holds it, so tmp_path churn can't grow this.
-_read_budgets: "weakref.WeakValueDictionary[str, _PathReadBudget]" = (weakref.WeakValueDictionary())
+# canonical db path -> permits for that file. Strong dict, pruned when idle with no checked-out permits.
+_read_budgets: dict[str, _PathReadBudget] = {}
 _read_budgets_lock = threading.Lock()
 
 
@@ -249,9 +262,18 @@ def _read_budget_key(db_path) -> str:
         return str(db_path)
 
 
+def _reap_idle_budgets_locked() -> None:
+    for key, budget in list(_read_budgets.items()):
+        with budget._lock:
+            idle = len(budget._members) == 0 and budget._checked_out == 0
+        if idle:
+            _read_budgets.pop(key, None)
+
+
 def _read_budget_for(db_path) -> _PathReadBudget:
     key = _read_budget_key(db_path)
     with _read_budgets_lock:
+        _reap_idle_budgets_locked()
         budget = _read_budgets.get(key)
         if budget is None:
             budget = _PathReadBudget()
