@@ -804,7 +804,14 @@ class SessionSchemaMixin:
         any failure rolls the RENAME back."""
         conn = cursor.connection
         if conn.in_transaction:  # caller already owns the transaction
-            SessionSchemaMixin._rebuild_table_statements(cursor, table, legacy_name, ddl, copy_sql, indexes)
+            cursor.execute("SAVEPOINT rebuild_table")
+            try:
+                SessionSchemaMixin._rebuild_table_statements(cursor, table, legacy_name, ddl, copy_sql, indexes)
+            except BaseException:
+                cursor.execute("ROLLBACK TO rebuild_table")
+                cursor.execute("RELEASE rebuild_table")
+                raise
+            cursor.execute("RELEASE rebuild_table")
             return
         cursor.execute("BEGIN IMMEDIATE")
         try:
@@ -906,7 +913,7 @@ class SessionSchemaMixin:
                 _SESSION_MODEL_USAGE_INDEX_SQL,
             )
         except sqlite3.OperationalError as exc:
-            logger.debug("session_model_usage PK heal skipped: %s", exc)
+            logger.exception("session_model_usage PK heal skipped: %s", exc)
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
@@ -1132,7 +1139,7 @@ class SessionSchemaMixin:
                 _SESSION_MODEL_USAGE_INDEX_SQL,
             )
         except sqlite3.OperationalError as exc:
-            logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
+            logger.exception("v22 session_model_usage rebuild skipped: %s", exc)
 
     def _ensure_unique_title_index(self, cursor: sqlite3.Cursor) -> None:
         """Unique title index. Older DBs may hold duplicate aliases from before the constraint;
