@@ -3,12 +3,15 @@ Every SessionDB construction resolves its path through _ensure_test_isolation
 so a pytest-context process (env OR ancestry) can never open a production
 state.db; env-based so subprocess children are protected too."""
 
+import logging
 import os
 import sys
 import threading
 import weakref
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger("hermes_state")
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -104,8 +107,10 @@ def _has_pytest_ancestor() -> bool:
         try:
             found = any(_process_looks_like_pytest(p) for p in psutil.Process().parents())
         except Exception:
-            found = False
-    _PYTEST_ANCESTOR = found
+            logger.debug("pytest ancestry probe indeterminate; not memoizing", exc_info=True)
+            return False
+    if found:
+        _PYTEST_ANCESTOR = True
     return found
 
 
