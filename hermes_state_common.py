@@ -1076,6 +1076,9 @@ def _read_lock_holder_record(handle):
     return record if isinstance(record, dict) else None
 
 
+_MAX_BREAK_ATTEMPTS = 3
+
+
 def _rewrite_lock_file(handle, payload: bytes) -> None:
     """Best-effort truncate-and-write of *payload* at offset 0."""
     with contextlib.suppress(OSError, ValueError):
@@ -1084,6 +1087,10 @@ def _rewrite_lock_file(handle, payload: bytes) -> None:
         if payload:
             handle.write(payload)
         handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
 
 
 def _write_lock_holder_record(handle) -> None:
@@ -1140,6 +1147,7 @@ def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, descript
     import fcntl
     deadline = time.monotonic() + timeout_seconds
     broke_lock = False
+    break_attempts = 0
     while True:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1152,7 +1160,7 @@ def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, descript
             if time.monotonic() < deadline:
                 time.sleep(poll_seconds)
                 continue
-            if broke_lock:
+            if break_attempts >= _MAX_BREAK_ATTEMPTS:
                 return False, handle
             record = _read_lock_holder_record(handle)
             if not _lock_holder_provably_dead(record):
@@ -1168,6 +1176,7 @@ def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, descript
                 logger.warning("Could not break stale %s %s (%s) — deferring.", description, lock_path, exc)
                 return False, handle
             broke_lock = True
+            break_attempts += 1
             deadline = time.monotonic() + _LOCK_BREAK_REACQUIRE_SECONDS
             continue
         # A breaker may have replaced the file while we waited; a lock on a dead inode excludes nobody.
