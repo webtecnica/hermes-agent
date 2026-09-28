@@ -104,15 +104,21 @@ def _field(job: dict, key: str) -> str:
     return (job.get(key) or "").strip()
 
 
-def _run_monitor_source(job: dict) -> tuple[bool, str]:
+def _run_monitor_source(job: dict, cancel_event=None) -> tuple[bool, str]:
     """Run the job's monitor source (script or URL). Returns (ok, output)."""
+    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+        return False, "monitor execution cancelled"
     monitor_script = _field(job, "monitor_script")
     if monitor_script:
         # Same containment + interpreter rules as the existing `script` field.
         from cron.scheduler_script import _run_job_script
 
-        return _run_job_script(monitor_script, workdir=_field(job, "workdir") or None,
-                               interpreter=job.get("interpreter"))
+        return _run_job_script(
+            monitor_script,
+            workdir=_field(job, "workdir") or None,
+            cancel_event=cancel_event,
+            interpreter=job.get("interpreter"),
+        )
     monitor_url = _field(job, "monitor_url")
     if monitor_url:
         return _fetch_monitor_url(monitor_url)
@@ -123,7 +129,7 @@ def job_has_monitor(job: dict) -> bool:
     return bool(_field(job, "monitor_script") or _field(job, "monitor_url"))
 
 
-def check_monitor(job: dict) -> MonitorOutcome:
+def check_monitor(job: dict, cancel_event=None) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 
     On change (or first run) the new hash + snapshot are persisted BEFORE the agent runs — detection
@@ -131,7 +137,7 @@ def check_monitor(job: dict) -> MonitorOutcome:
     On failure nothing is persisted.
     """
     job_id = str(job.get("id") or "")
-    ok, output = _run_monitor_source(job)
+    ok, output = _run_monitor_source(job, cancel_event=cancel_event)
     if not ok:
         return MonitorOutcome(ok=False, error=output)
 

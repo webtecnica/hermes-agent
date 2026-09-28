@@ -475,3 +475,52 @@ def test_cronjob_tool_update_clears_monitor_script(hermes_env):
     )
     assert result.get("success") is True
     assert get_job(created["job_id"]).get("monitor_script") is None
+
+
+def test_monitor_script_cancel_event_threaded(hermes_env, monkeypatch):
+    import threading
+    from cron.monitor import check_monitor
+
+    passed_cancel_event = []
+
+    def fake_run_job_script(script_path, workdir=None, cancel_event=None, interpreter=None):
+        passed_cancel_event.append(cancel_event)
+        if cancel_event and cancel_event.is_set():
+            return False, "cancelled"
+        return True, "hello world"
+
+    monkeypatch.setattr("cron.scheduler_script._run_job_script", fake_run_job_script)
+
+    event = threading.Event()
+    job = {"id": "job123", "monitor_script": "mon.py"}
+
+    # Not cancelled yet
+    outcome = check_monitor(job, cancel_event=event)
+    assert len(passed_cancel_event) == 1
+    assert passed_cancel_event[0] is event
+    assert outcome.ok is True
+
+    # Now set event
+    event.set()
+    outcome_cancelled = check_monitor(job, cancel_event=event)
+    assert outcome_cancelled.ok is False
+    assert "cancel" in outcome_cancelled.error.lower()
+
+
+def test_apply_monitor_gate_threads_cancel_event(hermes_env, monkeypatch):
+    import threading
+    from cron.scheduler import _apply_monitor_gate
+
+    passed_cancel_event = []
+
+    def fake_check_monitor(job, cancel_event=None):
+        passed_cancel_event.append(cancel_event)
+        from cron.monitor import MonitorOutcome
+        return MonitorOutcome(ok=True, changed=False)
+
+    monkeypatch.setattr("cron.monitor.check_monitor", fake_check_monitor)
+
+    event = threading.Event()
+    job = {"id": "job123", "monitor_script": "mon.py"}
+    _early, _extra, _context = _apply_monitor_gate(job, "job123", "test", None, cancel_event=event)
+    assert passed_cancel_event == [event]
