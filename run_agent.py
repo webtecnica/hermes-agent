@@ -23,6 +23,14 @@ if "hermes_cli.main" not in sys.modules:
     if _early_recovery.restore_interrupted_pull():
         _early_recovery.relaunch_after_restore()
 
+# Install platform truststore early before any provider SDKs or HTTPS clients import ssl.SSLContext (#126808).
+try:
+    from agent.ssl_verify import install_truststore
+
+    install_truststore()
+except Exception:
+    pass
+
 import json
 import logging
 logger = logging.getLogger(__name__)

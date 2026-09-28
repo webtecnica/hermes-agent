@@ -170,3 +170,38 @@ assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
 assert ctx.cert_store_stats()['x509_ca'] > 0
 """], capture_output=True, text=True, timeout=30)
     assert child.returncode == 0, child.stderr
+
+
+def test_install_truststore_detects_already_injected_ssl_context(monkeypatch):
+    """When ssl.SSLContext was already patched (e.g. by pm or direct injection),
+
+    install_truststore() returns True immediately without duplicate injection (#126808).
+    """
+    import agent.ssl_verify as sv
+
+    monkeypatch.setattr(sv, "_installed", None)
+
+    class FakePatchedSSLContext:
+        pass
+
+    FakePatchedSSLContext.__module__ = "truststore._api"
+    monkeypatch.setattr(sv.ssl, "SSLContext", FakePatchedSSLContext)
+
+    assert sv.install_truststore() is True
+    assert sv._installed is True
+
+
+def test_run_agent_early_truststore_install():
+    """Importing run_agent installs truststore at module level before provider SDKs (#126808)."""
+    import subprocess
+    import sys
+
+    child = subprocess.run([sys.executable, "-c", """
+import sys, ssl
+import run_agent
+from agent.ssl_verify import install_truststore
+assert install_truststore() is True
+assert ssl.SSLContext.__module__ != 'ssl'
+"""], capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0, child.stderr
+

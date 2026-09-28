@@ -44,6 +44,9 @@ def install_truststore() -> bool:
     global _installed
     if _installed is not None:
         return _installed
+    if ssl.SSLContext.__module__ != "ssl":
+        _installed = True
+        return True
     try:
         import truststore
 

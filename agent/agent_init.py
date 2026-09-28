@@ -2402,6 +2402,12 @@ def init_agent(
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
     _install_safe_stdio()
+    try:
+        from agent.ssl_verify import install_truststore
+
+        install_truststore()
+    except Exception:
+        pass
 
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
