@@ -63,3 +63,46 @@ def test_guard_warns_on_rearmed_consumed_record(temp_home, caplog):
     ]
     assert warnings, "expected WARNING on removal of a re-armed consumed one-shot"
     assert "cron resume" in warnings[0].getMessage()
+
+
+def test_completed_occurrence_oneshot_retires_spent_record(temp_home, monkeypatch):
+    """A once job whose occurrence is already completed in the ledger must be retired
+
+    instead of remaining as a zombie scheduled record (#126787).
+    """
+    job = create_job(
+        prompt="zombie test",
+        schedule=(_hermes_now() - timedelta(seconds=10)).isoformat(),
+        name="zombie-record",
+        deliver="local",
+    )
+    jid = job["id"]
+
+    # Mock completed_occurrence to simulate an already completed execution for this slot
+    monkeypatch.setattr("cron.occurrences.completed_occurrence", lambda j, inst: True)
+
+    due = get_due_jobs()
+    assert jid not in [d["id"] for d in due]
+    # The zombie record should have been retired from jobs store
+    remaining_jobs = [j["id"] for j in load_jobs()]
+    assert jid not in remaining_jobs, "expected completed one-shot to be retired from jobs store"
+
+
+def test_oneshot_dispatch_limit_reached_before_completed_occurrence(temp_home, monkeypatch):
+    """The dispatch limit check must run before completed_occurrence and retire the spent record."""
+    job = create_job(
+        prompt="limit test",
+        schedule=(_hermes_now() - timedelta(seconds=10)).isoformat(),
+        name="limit-record",
+        deliver="local",
+    )
+    jid = job["id"]
+    jobs = load_jobs()
+    for j in jobs:
+        if j["id"] == jid:
+            j["repeat"] = {"times": 1, "completed": 1}
+    save_jobs(jobs)
+
+    due = get_due_jobs()
+    assert jid not in [d["id"] for d in due]
+    assert jid not in [j["id"] for j in load_jobs()]

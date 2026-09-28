@@ -3229,8 +3229,16 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     manual_run = job.get("manual_run_at") == next_run
     from cron.occurrences import completed_occurrence, scheduled_instant
 
+    if kind == "once":
+        if _retire_expired_oneshot(d) or _oneshot_dispatch_limit_reached(job, scan):
+            return False
+
     if not manual_run and completed_occurrence(job, next_run):
-        new_next = d.recompute_next() if recurring else None
+        if not recurring:
+            if not _job_running_in_this_process(job.get("id", "")):
+                scan.retire(job["id"])
+            return False
+        new_next = d.recompute_next()
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
         return False
