@@ -6275,8 +6275,10 @@ def _get_task_no_progress_timeout(task: str) -> Optional[float]:
     return value
 
 
-def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
-    """``auxiliary.<task>.timeout`` from config, else *default*."""
+def _get_task_timeout(task: str, default: Optional[float] = None) -> float:
+    """``auxiliary.<task>.timeout`` from config, else default (or task-specific fallback)."""
+    if default is None:
+        default = _COMPRESSION_TIMEOUT_FLOOR_SECONDS if task == "compression" else _DEFAULT_AUX_TIMEOUT
     if not task:
         return default
     raw = _get_auxiliary_task_config(task).get("timeout")
@@ -6287,12 +6289,11 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
-    """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
-    summarising a large context isn't cut off."""
+    """Explicit per-call ``timeout`` wins, else configured task timeout; compression defaults
+    to 300s when unset so reasoning models aren't cut off (#54915, #126769)."""
     if timeout is not None:
         return timeout
-    effective = _get_task_timeout(task)
-    return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS) if task == "compression" else effective
+    return _get_task_timeout(task)
 
 
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
