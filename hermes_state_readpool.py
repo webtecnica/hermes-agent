@@ -10,7 +10,7 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
     from hermes_state import SessionDB
@@ -81,16 +81,21 @@ def _proc_fd_targets(pid: int) -> "Iterator[tuple[str, str]]":
             continue
 
 
-def _open_fd_count() -> Optional[int]:
-    """Open descriptors in THIS process; None when unmeasurable (Windows: no fd
-    dir, correctly inert); -1 when the probe itself hit EMFILE/ENFILE (no headroom)."""
+_FD_COUNT_STARVED = object()
+_FD_COUNT_UNMEASURABLE = None
+
+
+def _open_fd_count() -> Any:
+    """Open descriptors in THIS process; _FD_COUNT_UNMEASURABLE (None) when unmeasurable
+    (Windows: no fd dir, correctly inert); _FD_COUNT_STARVED when the probe itself hit
+    EMFILE/ENFILE (no headroom)."""
     for fd_dir in ("/proc/self/fd", "/dev/fd"):
         try:
             return len(os.listdir(fd_dir))
         except OSError as exc:
             if exc.errno in (errno.EMFILE, errno.ENFILE):
-                return -1
-    return None
+                return _FD_COUNT_STARVED
+    return _FD_COUNT_UNMEASURABLE
 
 
 def _fd_soft_limit() -> Optional[int]:
@@ -123,10 +128,13 @@ def _fd_headroom_ok() -> bool:
     if not fresh:
         cached = _open_fd_count()
         with _fd_usage_lock:
-            _fd_usage_cache = (now, cached)
-    if cached is None:
+            _fd_usage_cache = (time.monotonic(), cached)
+    if cached is _FD_COUNT_UNMEASURABLE:
         return True
-    return cached >= 0 and (soft - cached) > _FD_HEADROOM_RESERVE
+    if cached is _FD_COUNT_STARVED:
+        logger.warning("fd probe starved (EMFILE/ENFILE); read pool degraded to writer connection")
+        return False
+    return (soft - cached) > _FD_HEADROOM_RESERVE
 
 
 def _reclaim_idle_read_conn_anywhere() -> bool:
