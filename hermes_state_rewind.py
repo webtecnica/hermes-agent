@@ -86,9 +86,20 @@ class SessionRewindMixin:
             warm_user = _user_indices(warm)
             if len(warm_user) != len(durable_user):
                 raise RuntimeError(_HISTORY_CHANGED)
+            for k in range(user_ordinal + 1):
+                if _comparison_content(warm[warm_user[k]]) != _comparison_content(durable[durable_user[k]]):
+                    raise RuntimeError(_HISTORY_CHANGED)
             prefix, warm_live_view = history_before_user_originated_turn(warm, warm_user[user_ordinal])
             if _comparison_content(live_view) != _comparison_content(warm_live_view):
                 raise RuntimeError(_HISTORY_CHANGED)
+            if adopt_row_ids and prefix is not durable_prefix:
+                if len(prefix) != len(durable_prefix) or not all(
+                    warm_msg.get("role") == durable_message.get("role")
+                    and bool(warm_msg.get("display_kind")) == bool(durable_message.get("display_kind"))
+                    and _comparison_content(warm_msg) == _comparison_content(durable_message)
+                    for warm_msg, durable_message in zip(prefix, durable_prefix)
+                ):
+                    raise RuntimeError(_HISTORY_CHANGED)
         # Retry re-sends the stored bytes: ``"".join`` of the text parts, never the "\n"-joined display
         # flattening (wire bytes == stored bytes; ``"ab"`` must not come back as ``"a\nb"``).
         live_text = retryable_user_text(live_view.get("content")) if require_retryable else None
@@ -113,16 +124,11 @@ class SessionRewindMixin:
                 raise RuntimeError("rewind did not retain its compaction handoff")
             durable_prefix[-1].update({"_row_id": replacement_id, _DB_PERSISTED_MARKER: True})
             prefix[-1] = durable_prefix[-1]
-        if adopt_row_ids and prefix is not durable_prefix and len(prefix) == len(durable_prefix) and all(
-            warm.get("role") == durable_message.get("role")
-            and bool(warm.get("display_kind")) == bool(durable_message.get("display_kind"))
-            and _comparison_content(warm) == _comparison_content(durable_message)
-            for warm, durable_message in zip(prefix, durable_prefix)
-        ):
+        if adopt_row_ids and prefix is not durable_prefix:
             # Clients address follow-ups by durable row id: keep the richer warm content, adopt the identities.
-            for warm, durable_message in zip(prefix, durable_prefix):
+            for warm_msg, durable_message in zip(prefix, durable_prefix):
                 if isinstance(row_id := durable_message.get("_row_id"), int):
-                    warm["_row_id"] = row_id
+                    warm_msg["_row_id"] = row_id
         return RewindOutcome(
             prefix=prefix, live_view=live_view,
             live_text=live_text if live_text is not None else flatten_message_text(live_view.get("content")),
