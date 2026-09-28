@@ -298,7 +298,7 @@ def _iter_darwin_fd_targets():
                                   _DARWIN_FD_RECORD_SIZE) <= 0:
                 continue
             raw = record.raw
-            identity = (struct.unpack_from("<I", raw, _DARWIN_FD_DEV_OFFSET)[0],
+            identity = (struct.unpack_from("<Q", raw, _DARWIN_FD_DEV_OFFSET)[0],
                         struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
             target = raw[_DARWIN_FD_PATH_OFFSET:].split(b"\x00", 1)[0].decode("utf-8", "replace")
             yield pid, fd, target, identity
