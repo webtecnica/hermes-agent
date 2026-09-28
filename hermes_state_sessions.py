@@ -43,14 +43,18 @@ def _delegate_from_json(col: str = "model_config") -> str:
 _MODEL_CONFIG_ROW_MISSING = object()
 
 
-def _parse_model_config(raw: Any) -> Dict[str, Any]:
-    """Tolerant ``model_config`` decode: JSON text or dict -> dict copy; anything else -> {}."""
-    if isinstance(raw, str) and raw.strip():
+def _parse_model_config(raw: Any) -> Optional[Dict[str, Any]]:
+    """Decode model_config: JSON text or dict -> dict copy; None/empty -> {}; unparseable/invalid -> None."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}
+    if isinstance(raw, str):
         try:
             raw = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            return {}
-    return dict(raw) if isinstance(raw, dict) else {}
+            return None
+    if not isinstance(raw, dict):
+        return None
+    return dict(raw)
 
 
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
@@ -731,6 +735,9 @@ class SessionSessionsMixin:
                 raise ValueError(f"Session not found: {session_id}")
             return _MODEL_CONFIG_ROW_MISSING
         config = _parse_model_config(row[0])
+        if config is None:
+            logger.error("session %s has unparseable model_config; refusing to merge", session_id)
+            return row[0]
         for key, value in patch.items():
             if value is None:
                 config.pop(key, None)
@@ -748,7 +755,8 @@ class SessionSessionsMixin:
     def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
         """Read one key out of a session's model_config JSON (tolerant parse)."""
         session = self.get_session(session_id) or {}
-        return _parse_model_config(session.get("model_config")).get(key, default)
+        config = _parse_model_config(session.get("model_config"))
+        return (config or {}).get(key, default)
 
     def update_session_runtime_lock(
         self, session_id: str, *, model: Optional[str] = None, provider: Optional[str] = None,
@@ -779,7 +787,8 @@ class SessionSessionsMixin:
     @staticmethod
     def session_yolo_enabled(session_meta: Optional[Dict[str, Any]]) -> bool:
         """Persisted YOLO flag; False on any parse failure (resume must never enable the bypass)."""
-        return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
+        config = _parse_model_config((session_meta or {}).get("model_config"))
+        return bool((config or {}).get("yolo_mode"))
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID (drains queued token deltas first so cost readers see exact totals)."""
@@ -1433,7 +1442,10 @@ class SessionSessionsMixin:
         if not session_id:
             return False
         row = self._read_one("SELECT model_config FROM sessions WHERE id = ?", (session_id,))
-        return row is not None and bool(_parse_model_config(row[0]).get("_branched_from"))
+        if row is None or row[0] is None:
+            return False
+        config = _parse_model_config(row[0])
+        return bool((config or {}).get("_branched_from"))
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
