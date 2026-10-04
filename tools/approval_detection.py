@@ -364,7 +364,28 @@ DANGEROUS_PATTERNS = [
     # consent. Global flags between docker/compose and the verb and the legacy `docker-compose`
     # binary are allowed so a flag can't slip past.
     (r'\bdocker(?:-compose|\s+compose)\s+' + _CONTAINER_GLOBAL_FLAGS + r'(restart|stop|kill|down)\b', "docker compose restart/stop/kill/down (container lifecycle)"),
-    (r'\bdocker\s+' + _CONTAINER_GLOBAL_FLAGS + r'(restart|stop|kill)\b', "docker restart/stop/kill (container lifecycle)"),
+    (r'\bdocker\s+' + _CONTAINER_GLOBAL_FLAGS + r'(?:container\s+)?(restart|stop|kill)\b', "docker restart/stop/kill (container lifecycle)"),
+    # Container/volume/system DESTRUCTION (#132483). The lifecycle rule above stops and restarts a
+    # container; removing it is strictly more destructive (a stopped container restarts, a removed one
+    # is gone), yet the canonical spellings matched no rule at all: `docker container rm` /
+    # `podman container rm` (the management-command form of the verb), `docker container prune` (every
+    # stopped container, no name given) and `docker system prune` (stopped containers plus unused
+    # images/networks, `-a` widens it to every unused image) all ran with no approval card, next to
+    # `docker stop web` which did get one.
+    # The bare spellings (`docker rm`, `docker volume rm|prune`) are gated here too even though
+    # #125843 proposes them as well: main stays covered whichever of the two PRs lands first, and the
+    # duplicate lines are trivial to drop when they merge together.
+    # Deliberate boundary, not a silent gap (#132483): `docker image rm` / `docker rmi` and
+    # `docker network rm` stay UNgated — an image returns with a pull and a network with a recreate,
+    # and a card on those would tax routine work.
+    # _GLOBAL_FLAGS rather than _CONTAINER_GLOBAL_FLAGS: a brand-new rule has no prior approval
+    # decision to preserve, so it takes the grammar that also accepts a flag value after a whitespace
+    # run — `docker --log-level  warn container rm web` is one command to the shell and must not hide
+    # the verb behind the single-whitespace limit #130511 reports.
+    (r'\b(?:docker|podman)(?:-compose|\s+compose)?\s+' + _GLOBAL_FLAGS + r'(?:container\s+)?rm\b', "docker/podman rm (container destruction)"),
+    (r'\b(?:docker|podman)\s+' + _GLOBAL_FLAGS + r'volume\s+(rm|prune)\b', "docker/podman volume rm/prune (volume data destruction)"),
+    (r'\b(?:docker|podman)\s+' + _GLOBAL_FLAGS + r'container\s+prune\b', "docker/podman container prune (removes every stopped container)"),
+    (r'\b(?:docker|podman)\s+' + _GLOBAL_FLAGS + r'system\s+prune\b', "docker/podman system prune (removes stopped containers, unused images and networks)"),
     # Gateway protection: never start gateway outside systemd management
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),

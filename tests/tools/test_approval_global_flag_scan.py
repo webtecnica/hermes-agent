@@ -28,6 +28,8 @@ cases = {
     f"podman {run}--remote ps": "podman remote mode (-r/--remote: remote daemon)",
     f"docker compose {run}down": "docker compose restart/stop/kill/down (container lifecycle)",
     f"docker {run}kill app": "docker restart/stop/kill (container lifecycle)",
+    f"docker {run}container rm web": "docker/podman rm (container destruction)",
+    f"docker {run}system prune": "docker/podman system prune (removes stopped containers, unused images and networks)",
 }
 for command, description in cases.items():
     assert detect_dangerous_command(command) == (True, description, description), command[:40]

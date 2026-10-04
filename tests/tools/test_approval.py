@@ -2233,3 +2233,64 @@ class TestLifecycleGuardLaunchctlParity:
             "launchctl print system/com.apple.WindowServer",
         ):
             assert contains_gateway_lifecycle_command(cmd) is False, cmd
+
+
+class TestContainerDestructionCoverage:
+    """Docker/podman destruction verbs missed by the container rules (#132483).
+
+    `docker stop web` needed an approval card while `docker container rm web` — the canonical
+    spelling of the same verb on the same object — and `docker container prune` / `docker system
+    prune`, which remove every stopped container without naming one, matched nothing at all.
+
+    The image/network spellings are asserted UNgated on purpose: #132483 sets that boundary as a
+    decision (an image returns with a pull, a network with a recreate) instead of leaving it a
+    silent gap.
+    """
+
+    @pytest.mark.parametrize("command", [
+        # every row the issue measured as "not detected" on clean main
+        "docker rm web",
+        "docker container rm web",
+        "podman container rm web",
+        "docker volume prune",
+        "docker container prune",
+        "docker system prune",
+        "docker system prune -af",
+        # spellings that already had a rule must keep it
+        "docker stop web",
+        "docker container stop web",
+        "docker volume rm appdata",
+        "docker compose rm web",
+        "podman container prune",
+        # a flag value after a whitespace run is one command to the shell and must not hide the
+        # verb (#130511) behind the single-whitespace limit the old grammar imposed
+        "docker --log-level  warn container rm web",
+        "docker --log-level  warn system prune",
+        # indirect form: the verb inside a quoted remote payload still has to be flagged
+        "ssh deploy@host 'docker container rm web'",
+    ])
+    def test_destruction_requires_approval(self, command):
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is True, command
+        assert key and desc, command
+
+    @pytest.mark.parametrize("command", [
+        "docker ps",
+        "docker ps -a",
+        "docker run -d nginx",
+        "docker container ls",
+        "docker container start web",
+        "docker volume ls",
+        # the settled boundary: recoverable by pull/recreate, so no card
+        "docker image rm img",
+        "docker rmi img",
+        "docker network rm net",
+    ])
+    def test_read_verbs_and_recoverable_objects_stay_ungated(self, command):
+        assert detect_dangerous_command(command) == (False, None, None), command
+
+    def test_destructive_command_outside_the_docker_table_is_still_blocked(self):
+        """Adding docker rules must not relax any other gate."""
+        assert detect_dangerous_command("rm -rf /")[0] is True
+        assert detect_dangerous_command("mkfs.ext4 /dev/sda1")[0] is True
+        assert detect_dangerous_command("sudo rm -rf /var")[0] is True
