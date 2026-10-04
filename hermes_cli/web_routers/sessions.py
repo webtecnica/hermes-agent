@@ -873,6 +873,28 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             if value is not None:
                 setter(db, sid, value)
                 result[flag] = bool(value)
+        # Archiving is end-of-life in the core's design (#105588): automatic Desktop cleanup reclaims
+        # the runtime but deliberately leaves the durable row open and resumable "until the user
+        # explicitly closes or archives it". This route only flipped the column, so the runtime, its
+        # active-session lease and the transcript stayed resident after the row left the sidebar —
+        # an orphaned delivery lease and a leaked max_concurrent_sessions slot. End the runtime on the
+        # EXPLICIT archive through the same idempotent teardown funnel the reapers use
+        # (``_close_session_by_id`` -> ``_finalize_session``, which ends the row with
+        # ``end_reason="archived"`` and releases the lease). Only ``archived``: ``hidden`` is the
+        # canonical Bot Chat's normal state (tui_gateway/methods_session.py) and the live owner of
+        # agent-to-agent delivery, so closing on it would kill a session that is alive on purpose.
+        # Late import matches the dashboard pattern in ``chat_workspaces.py`` (the gateway hosts
+        # in-process); a gateway that never loaded the session is a no-op close.
+        if body.archived:
+            try:
+                import tui_gateway.server as gateway
+
+                # ``bind_module`` publishes the split-module funnel onto ``tui_gateway.server`` at
+                # import, so static checkers can't see the attribute (same seam as the gateway
+                # helpers already consumed in ``chat_workspaces.py``).
+                gateway._close_session_by_id(sid, end_reason="archived")  # ty: ignore[unresolved-attribute]
+            except Exception:
+                _log.debug("archive close skipped for %s", sid, exc_info=True)
         result["title"] = db.get_session_title(sid) or ""
         return result
 
