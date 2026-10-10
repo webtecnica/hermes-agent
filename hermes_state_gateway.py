@@ -59,6 +59,11 @@ _PEER_SELECT_HEAD = """
 _HANDOFF_OWNED_ROW_SQL = "(s.handoff_state = 'completed')"
 _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = ?
                   AND s.source = ?
+                  -- A subagent transcript is never a chat route. A delegate child whose routing
+                  -- columns were rewritten onto a chat still carries ``_delegate_from``, so
+                  -- presence alone disqualifies it here: adopting one is what made a restarted
+                  -- gateway keep answering from the subagent instead of the parent session.
+                  AND {_sql_json_extract('s.model_config', '$._delegate_from')} IS NULL
                   AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL})
                        OR {_HANDOFF_OWNED_ROW_SQL})
                   AND NOT EXISTS (
@@ -75,6 +80,9 @@ _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = 
                 LIMIT 1
                 """
 _PEER_BY_TUPLE_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.source = ?
+                  -- Same disqualification as _PEER_BY_KEY_SQL: a delegate child never adopts a
+                  -- chat's identity, however its routing columns were rewritten.
+                  AND {_sql_json_extract('s.model_config', '$._delegate_from')} IS NULL
                   AND COALESCE(s.user_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_type, '') = COALESCE(?, '')

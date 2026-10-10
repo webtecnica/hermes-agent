@@ -135,6 +135,58 @@ class TestGatewayPinningFailsClosed:
         assert resolved is None
         self._assert_no_route_change(runner)
 
+    @pytest.mark.asyncio
+    async def test_live_subagent_pin_keeps_the_route(self):
+        """A completion pinned to the subagent that spawned it must not hand the chat's key to
+        that subagent row: the chat keeps answering from its own session."""
+        current = self._entry("sess_current")
+        runner = self._make_runner(
+            {
+                "sess_child": {
+                    "id": "sess_child",
+                    "ended_at": None,
+                    "source": "subagent",
+                    "parent_session_id": "sess_current",
+                    "model_config": '{"_delegate_from": "sess_current"}',
+                }
+            },
+            switched_entry=self._entry("sess_child"),
+        )
+
+        resolved = await runner._resolve_async_delegation_session(
+            current, "sess_child"
+        )
+
+        assert resolved is current
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
+    async def test_rewritten_subagent_pin_still_keeps_the_route(self):
+        """After one hijack the row already carries the chat's source/session_key, so only the
+        ``_delegate_from`` marker still proves it is a subagent transcript — recovery must not
+        re-adopt it either."""
+        current = self._entry("sess_current")
+        runner = self._make_runner(
+            {
+                "sess_child": {
+                    "id": "sess_child",
+                    "ended_at": None,
+                    "source": "telegram",
+                    "session_key": current.session_key,
+                    "parent_session_id": "sess_current",
+                    "model_config": '{"_delegate_from": "sess_current"}',
+                }
+            },
+            switched_entry=self._entry("sess_child"),
+        )
+
+        resolved = await runner._resolve_async_delegation_session(
+            current, "sess_child"
+        )
+
+        assert resolved is current
+        self._assert_no_route_change(runner)
+
 
     @pytest.mark.asyncio
     async def test_intermediate_compression_route_advances_to_same_live_tip(self):
@@ -251,3 +303,45 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
         assert result is not None and result.session_id == expected
     else:
         assert result is None
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        # Spawn-time source: sufficient on its own.
+        ({"source": "subagent", "parent_session_id": "p"}, True),
+        ({"source": "tool", "parent_session_id": "p"}, True),
+        # Delegate marker bound to the row's own parent: sufficient after the rewrite.
+        (
+            {"source": "telegram", "parent_session_id": "p",
+             "model_config": '{"_delegate_from": "p"}'},
+            True,
+        ),
+        (
+            {"source": "telegram", "parent_session_id": "p",
+             "model_config": {"_delegate_from": "p"}},
+            True,
+        ),
+        # Marker without a parent still proves delegate provenance.
+        ({"source": "telegram", "parent_session_id": None,
+          "model_config": {"_delegate_from": "somebody"}}, True),
+        # A marker inherited from an earlier parent (compression re-parents the continuation)
+        # is not this row's provenance: presence alone must not match.
+        (
+            {"source": "telegram", "parent_session_id": "p",
+             "model_config": {"_delegate_from": "older"}},
+            False,
+        ),
+        # Ordinary conversation rows (reset markers / no markers) stay routable.
+        ({"source": "telegram", "parent_session_id": "p",
+          "model_config": {"_reset_from": "p"}}, False),
+        ({"source": "telegram", "parent_session_id": "p", "model_config": None}, False),
+        ({"source": "telegram", "parent_session_id": None, "model_config": None}, False),
+        # Corrupt config never claims provenance it cannot read.
+        ({"source": "telegram", "parent_session_id": "p", "model_config": "not-json{"}, False),
+    ],
+)
+def test_is_subagent_row(row, expected):
+    from gateway.run_notifications import _is_subagent_row
+
+    assert _is_subagent_row(row) is expected

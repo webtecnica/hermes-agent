@@ -51,6 +51,44 @@ def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_
         platform_value if profile is None else f"{profile}:{platform_value}", chat_id, thread_id)
 
 
+def _is_subagent_row(row: Dict[str, Any]) -> bool:
+    """True when *row* is a subagent/tool transcript — never a chat route target.
+
+    A background-process completion pins the session that SPAWNED the process, and a subagent
+    spawns those too; resolving that pin as a routing target would point a Telegram key at the
+    subagent's row and the next inbound message would land inside the subagent transcript (its
+    ``source``/``session_key`` then get rewritten onto the chat, so the damage outlives the event
+    and route recovery re-adopts it after a restart).
+
+    Two independent signals, either one sufficient:
+
+    * ``source`` in ``{'subagent', 'tool'}`` — set at spawn (``delegate_tool`` passes
+      ``platform="subagent"``). Not relied on alone: after a hijack the row's source has already
+      been rewritten to the chat's surface.
+    * ``model_config._delegate_from`` bound to ``parent_session_id`` — the sidebar marker
+      ``delegate_tool`` stamps on every delegate child (mirrors ``/branch``'s ``_branched_from``),
+      and it survives that rewrite. The binding test mirrors
+      ``hermes_state_messages._is_explicit_fork_child_row``: compression copies ``model_config``
+      verbatim onto its continuation, so presence alone would misclassify a compression child of a
+      *normal* conversation as a subagent.
+    """
+    if str(row.get("source") or "") in {"subagent", "tool"}:
+        return True
+    config = row.get("model_config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(config, dict):
+        return False
+    marker = config.get("_delegate_from")
+    if marker is None:
+        return False
+    parent_id = row.get("parent_session_id")
+    return not parent_id or marker == parent_id
+
+
 def _safe_delivery_transport(platform, config, adapters, *, profile: Optional[str] = None):
     """``resolve_delivery_transport`` isolated to one target: ``None`` (logged) on failure.
 
@@ -287,6 +325,18 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
             return None
+        if _is_subagent_row(pinned_row):
+            # The pin is the subagent that spawned the process, not a chat route: switching here
+            # would hand the chat's key to a subagent row (source/session_key rewritten onto it),
+            # so the next inbound message lands inside the subagent transcript and route recovery
+            # re-adopts that row after a restart. The chat's current session owns this event
+            # already — deliver there without moving the route.
+            logger.info(
+                "Async-delegation completion pinned to subagent session %s; keeping route on %s "
+                "instead of binding a chat key to a subagent row.",
+                pinned_session_id, session_entry.session_id,
+            )
+            return session_entry
         target_session_id = pinned_session_id
         follows_compression = False
         if pinned_row.get("ended_at"):

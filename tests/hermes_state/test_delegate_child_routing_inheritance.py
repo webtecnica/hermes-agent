@@ -73,3 +73,52 @@ def test_compression_continuation_of_a_branch_child_keeps_inheriting(db: Session
     continuation = db.get_session("continuation")
     assert continuation["session_key"] == "agent:main:telegram:dm:42"
     assert continuation["chat_id"] == "42" and continuation["user_id"] == "u1"
+
+
+_KEY = "agent:main:telegram:dm:42"
+
+
+def _hijacked_chat(db: SessionDB) -> None:
+    """A conversation plus the delegate child that took its routing identity over — the row a
+    restarted gateway used to adopt, which is why the chat kept answering as the subagent."""
+    db.create_session(
+        "parent", source="telegram", session_key=_KEY, chat_id="42", chat_type="dm", user_id="u1",
+    )
+    db.end_session("parent", "agent_close")  # recoverable: not a deliberate boundary
+    db.create_session(
+        "worker", source="telegram", session_key=_KEY, chat_id="42", chat_type="dm", user_id="u1",
+        parent_session_id="parent", model_config={"_delegate_from": "parent"},
+    )
+
+
+def test_route_recovery_skips_the_delegate_child_row(db: SessionDB) -> None:
+    """Restart symptom: the child is the NEWEST keyed row, so ranking alone would pick it and the
+    chat would resume inside the subagent transcript instead of the parent conversation."""
+    _hijacked_chat(db)
+
+    recovered = db.find_latest_gateway_session_for_peer(source="telegram", session_key=_KEY)
+
+    assert recovered is not None
+    assert recovered["id"] == "parent"
+
+
+def test_route_recovery_tuple_fallback_skips_the_delegate_child_row(db: SessionDB) -> None:
+    """The keyed lookup misses (the only keyed row IS the delegate child), so recovery falls back
+    to the peer tuple: there the child must be disqualified too, letting the clean conversation
+    row — keyless legacy data — win instead of resuming inside the subagent."""
+    db.create_session(
+        "parent", source="telegram", chat_id="42", chat_type="dm", user_id="u1",
+    )
+    db.append_message("parent", role="user", content="oi")
+    db.end_session("parent", "agent_close")  # recoverable: not a deliberate boundary
+    db.create_session(
+        "worker", source="telegram", session_key=_KEY, chat_id="42", chat_type="dm", user_id="u1",
+        parent_session_id="parent", model_config={"_delegate_from": "parent"},
+    )
+
+    recovered = db.find_latest_gateway_session_for_peer(
+        source="telegram", session_key=_KEY, chat_id="42", chat_type="dm", user_id="u1",
+    )
+
+    assert recovered is not None
+    assert recovered["id"] == "parent"
