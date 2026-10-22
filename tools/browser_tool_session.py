@@ -188,6 +188,8 @@ def _agent_browser_command_env(socket_dir: str) -> dict[str, str]:
     executable = chromium_executable()
     if executable:
         env["AGENT_BROWSER_EXECUTABLE_PATH"] = executable
+    else:
+        env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)
     env["AGENT_BROWSER_SOCKET_DIR"] = socket_dir
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in env:
         env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(_daemon_idle_timeout_seconds() * 1000)

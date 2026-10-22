@@ -43,7 +43,9 @@ def executable() -> Optional[str]:
     a distro chromium ships the helper. The bundle stays the answer when it is the only browser — a dock
     icon that fails loudly beats a non-root ``--no-sandbox``.
     """
-    explicit = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
+    from hermes_cli.browser_runtime import chromium_executable
+
+    explicit = (chromium_executable() or "").strip()
     if explicit and os.access(explicit, os.X_OK) and not _is_headless_shell(explicit):
         return explicit
     finders = [_managed_executable, _system_executable]

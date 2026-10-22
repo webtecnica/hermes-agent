@@ -33,6 +33,7 @@ from hermes_cli.observability.shared_metrics_loop import record_browser_call
 _BROWSER_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "BROWSER_USE_API_KEY",
     "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "FIRECRAWL_BROWSER_TTL",
+    "AGENT_BROWSER_EXECUTABLE_PATH",
 )
 
 
@@ -60,6 +61,8 @@ def _build_browser_env() -> dict:
     # ``os.environ`` value that ``get_secret`` falls through to while multiplexing is inactive.
     routed = serves_routed_profile()
     scope = (current_secret_scope() or {}) if routed else None
+    if routed:
+        env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)
     for key in _BROWSER_PASSTHROUGH_KEYS:
         value = scope.get(key) if routed else get_secret(key)
         if value is not None:

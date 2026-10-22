@@ -114,7 +114,9 @@ def _maybe_autoinstall_chromium() -> bool:
     if _bt._chromium_autoinstall_attempted:
         return _chromium_installed()
     _bt._chromium_autoinstall_attempted = True
-    if _running_in_docker() or _is_termux_environment() or os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH"):
+    from hermes_cli.browser_runtime import chromium_executable
+
+    if _running_in_docker() or _is_termux_environment() or chromium_executable():
         return False
     from pm import InstallError, ensure, lazy_installs_allowed
     if not lazy_installs_allowed():
