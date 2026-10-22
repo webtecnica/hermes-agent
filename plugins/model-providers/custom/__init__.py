@@ -4,7 +4,12 @@ provider="custom" (Ollama, vLLM, llama.cpp, GLM-5.2 on ARK, …)."""
 from typing import Any
 from urllib.parse import urlparse
 
-from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort
+from agent.reasoning_effort import (
+    DEEPSEEK_V41_EFFORTS,
+    OPENAI_COMPAT_WIRE_EFFORTS,
+    clamp_effort,
+    is_deepseek_v41_model,
+)
 from providers import register_provider
 from providers.base import ProviderProfile
 from utils import base_url_host_matches
@@ -39,8 +44,11 @@ class CustomProfile(ProviderProfile):
         ``xhigh`` while the same provider over chat-completions forwarded ``max``
         unchanged (#114249). A custom endpoint's vocabulary is undiscoverable, so
         the widest OpenAI-compat set is the honest ceiling; ``ultra`` still clamps
-        to ``max`` via the shared ``clamp_effort`` policy.
+        to ``max`` via the shared ``clamp_effort`` policy. DeepSeek V4.1 local
+        endpoints (vLLM / chat template) reject minimal and medium (#143247).
         """
+        if is_deepseek_v41_model(model):
+            return DEEPSEEK_V41_EFFORTS
         return OPENAI_COMPAT_WIRE_EFFORTS
 
     def default_reasoning_config(self, model: str | None = None) -> dict | None:
@@ -80,7 +88,12 @@ class CustomProfile(ProviderProfile):
                 # "none" / "default"; any graded level ("medium", "high") 400s (#75089).
                 top_level["reasoning_effort"] = "default"
             elif effort:
-                top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
+                supported = (
+                    DEEPSEEK_V41_EFFORTS
+                    if is_deepseek_v41_model(ctx.get("model"))
+                    else OPENAI_COMPAT_WIRE_EFFORTS
+                )
+                top_level["reasoning_effort"] = clamp_effort(effort, supported)
         return extra_body, top_level
 
     def fetch_models(

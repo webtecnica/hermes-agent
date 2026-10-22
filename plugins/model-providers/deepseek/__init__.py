@@ -10,7 +10,13 @@ Retired ``deepseek-chat``/``deepseek-reasoner`` IDs are remapped in
 
 from typing import Any
 
-from agent.reasoning_effort import DEEPSEEK_V4_EFFORTS, DEEPSEEK_V4_OVERRIDES, thinking_toggle_extras
+from agent.reasoning_effort import (
+    DEEPSEEK_V4_EFFORTS,
+    DEEPSEEK_V4_OVERRIDES,
+    DEEPSEEK_V41_EFFORTS,
+    is_deepseek_v41_model,
+    thinking_toggle_extras,
+)
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -38,8 +44,9 @@ class DeepSeekProfile(ProviderProfile):
             return {}, {}
         # Always set thinking explicitly (default enabled, matching the API default)
         # to avoid the reasoning_content echo trap on subsequent turns.
+        supported = DEEPSEEK_V41_EFFORTS if is_deepseek_v41_model(m) else DEEPSEEK_V4_EFFORTS
         extras, top_level = thinking_toggle_extras(
-            reasoning_config, DEEPSEEK_V4_EFFORTS, DEEPSEEK_V4_OVERRIDES, always_emit_toggle=True
+            reasoning_config, supported, DEEPSEEK_V4_OVERRIDES, always_emit_toggle=True
         )
         # ``{effort: "none"|"false"|"disabled"}`` is also an explicit disable:
         # UI/session surfaces report Off from the effort field even when

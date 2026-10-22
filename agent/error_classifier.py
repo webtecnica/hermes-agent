@@ -535,27 +535,35 @@ _REASONING_REQUIRED_MARKERS = (
 # Same rejection, wording by *value*: an endpoint that publishes a closed level set refuses the
 # thinking-OFF encoding because ``none`` is not in it — "'reasoning_effort' must be one of:
 # 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'" (Alibaba token-plan / DashScope
-# routes, code ``invalid_parameter_error``). The field is understood and has to stay on the wire;
-# only the disabled level is invalid, so the floor step-up (the weakest accepted level) is the
+# routes, code ``invalid_parameter_error``), or a chat template enumerating allowed levels like
+# DeepSeek V4.1 ("reasoning_effort must be low, high, xhigh, max"). The field is understood and
+# has to stay on the wire; only the disabled or unaccepted level is invalid, so the floor step-up
+# (the weakest accepted level) in the auxiliary ladder and the effort drop in the main loop is the
 # right recovery. Neither the strip rung nor its "unsupported" wording matches this message, so
-# without these markers the title lane fails outright instead of retrying at the floor.
-_REASONING_LEVEL_REJECTION_MARKERS = ("must be one of", "invalid value for")
+# without these markers the turn fails outright to fallback instead of recovering.
+_REASONING_LEVEL_REJECTION_MARKERS = ("must be one of", "invalid value for", "expected one of")
+
+_REASONING_LEVEL_ENUM_RE = re.compile(
+    r"(?:must be\s+['\"]?(?:off|none|minimal|low|medium|high|xhigh|max|ultra)\b[^;.\n]*?(?:,\s*|(?:\s+or\s+))['\"]?(?:off|none|minimal|low|medium|high|xhigh|max|ultra)\b"
+    r"|input should be\s+['\"]?(?:off|none|minimal|low|medium|high|xhigh|max|ultra)\b)"
+)
 
 
 def is_reasoning_level_rejection(error_msg: str) -> bool:
     """Provider 400 rejecting the *value* of a reasoning wire control against the endpoint's closed
     level set ("'reasoning_effort' must be one of: 'minimal', 'low', …", Alibaba token-plan /
-    DashScope routes, code ``invalid_parameter_error``). The reasoning-field token must be present
+    DashScope routes, code ``invalid_parameter_error``, or DeepSeek V4.1 vLLM chat template
+    "reasoning_effort must be low, high, xhigh, max"). The reasoning-field token must be present
     next to the wording — a 400 enum complaint about some other field is not this class. The field is
-    understood and has to stay on the wire; only the disabled level ("none") is invalid, so the
-    recovery is the floor step-up in the auxiliary ladder and the disable-drop in the main loop, not
+    understood and has to stay on the wire; only the disabled or unaccepted level is invalid, so the
+    recovery is the floor step-up in the auxiliary ladder and the effort drop in the main loop, not
     the strip rung and not an abort to the fallback chain."""
     msg = (error_msg or "").lower()
     token = _REASONING_FIELD_TOKEN.search(msg)
     if token is None:
         return False
-    near = msg[max(0, token.start() - 48):token.end() + 96]
-    return any(m in near for m in _REASONING_LEVEL_REJECTION_MARKERS)
+    near = msg[max(0, token.start() - 48):token.end() + 160]
+    return any(m in near for m in _REASONING_LEVEL_REJECTION_MARKERS) or bool(_REASONING_LEVEL_ENUM_RE.search(near))
 
 
 def is_reasoning_required_rejection(error_msg: str) -> bool:

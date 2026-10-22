@@ -82,6 +82,11 @@ GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: DeepSeek V4.1 (vLLM / chat template): rejects minimal and medium with HTTP 400.
+DEEPSEEK_V41_EFFORTS: tuple[str, ...] = ("low", "high", "xhigh", "max")
+DEEPSEEK_V41_OVERRIDES: dict[str, str] = {}
+
+
 #: Ollama Cloud /v1/chat/completions: rejects ``minimal`` with HTTP 400.
 OLLAMA_CLOUD_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
 OLLAMA_CLOUD_OVERRIDES: dict[str, str] = {"xhigh": "max"}
@@ -122,6 +127,14 @@ def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """
     m = (model or "").strip().lower().split("/")[-1]
     return KIMI_K3_EFFORTS if _KIMI_K3_SLUG_RE.search(m) else KIMI_K2_EFFORTS
+
+
+def is_deepseek_v41_model(model: Optional[str]) -> bool:
+    """True if model slug indicates DeepSeek V4.1 (e.g. ``dsk-41-flash-1017``,
+    ``deepseek-v4.1``, ``deepseek-v4-1``, etc.). DeepSeek V4.1 chat template / vLLM
+    accepts low, high, xhigh, max (medium and minimal are rejected with 400)."""
+    m = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return bool(re.search(r"(?:deepseek[-_]?v?4[-._]?1|dsk[-_]?4[-._]?1)", m))
 
 
 def clamp_effort(
@@ -168,6 +181,8 @@ def route_supported_efforts(
     if (provider or "").strip().lower() == "openai-codex":
         supported = codex_supported_efforts(model)
         return (*supported, "ultra") if api_mode == "codex_app_server" and "max" in supported else supported
+    if is_deepseek_v41_model(model):
+        return DEEPSEEK_V41_EFFORTS
     return OPENAI_COMPAT_WIRE_EFFORTS
 
 

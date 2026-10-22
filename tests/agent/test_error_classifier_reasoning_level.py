@@ -23,6 +23,18 @@ _GROQ_400 = (
     "Error code: 400 - {'error': {'message': \"'reasoning_effort' must be one of 'low', "
     "'medium', or 'high'\", 'type': 'invalid_request_error'}}"
 )
+# DeepSeek V4.1 vLLM chat template: accepts low, high, xhigh, max (#143247).
+_DEEPSEEK_V41_400 = (
+    "Error code: 400 - {'error': {'message': 'DeepSeek V4.1 reasoning_effort must be low, "
+    "high, xhigh, max, or an integer within [1, 100] in chat_template_kwargs', "
+    "'type': 'BadRequestError', 'param': None, 'code': 400}}"
+)
+# FastAPI / Pydantic schema rejection for top-level reasoning_effort.
+_PYDANTIC_LITERAL_400 = (
+    "Error code: 400 - {'error': {'message': \"1 validation error:\\n  {'type': 'literal_error', "
+    "'loc': 'body.reasoning_effort', 'msg': \\\"Input should be 'none', 'minimal', 'low', 'medium', "
+    "'high', 'xhigh' or 'max'\\\"}\", 'type': 'Bad Request', 'param': 'body.reasoning_effort', 'code': 400}}"
+)
 
 
 class _APIError(Exception):
@@ -31,7 +43,9 @@ class _APIError(Exception):
         self.status_code = status_code
 
 
-@pytest.mark.parametrize("body", [_TOKENPLAN_400, _OFF_LOW_HIGH_MAX_400, _GROQ_400])
+@pytest.mark.parametrize("body", [
+    _TOKENPLAN_400, _OFF_LOW_HIGH_MAX_400, _GROQ_400, _DEEPSEEK_V41_400, _PYDANTIC_LITERAL_400,
+])
 def test_closed_level_set_rejection_is_reasoning_mandatory(body):
     result = classify_api_error(_APIError(body, 400), provider="custom", model="m")
     assert result.reason == FailoverReason.reasoning_mandatory
@@ -49,10 +63,42 @@ def test_other_enum_wording_keeps_its_classification(body):
     assert result.reason != FailoverReason.reasoning_mandatory
 
 
-@pytest.mark.parametrize("body", [_OFF_LOW_HIGH_MAX_400, _GROQ_400])
+@pytest.mark.parametrize("body", [_OFF_LOW_HIGH_MAX_400, _GROQ_400, _DEEPSEEK_V41_400])
 def test_rejected_enabled_level_retries_with_the_route_default(body):
     agent = _WireAgent({"enabled": True, "effort": "medium"})
     assert _wire_reasoning_config(agent) == {"enabled": True, "effort": "medium"}  # the request that 400ed
     _recover(agent, body)
     assert _wire_reasoning_config(agent) is None, "retry must not resend reasoning_effort=medium"
     assert any("rejects reasoning effort medium" in n for n in agent.notices)
+
+
+def test_deepseek_v41_custom_provider_clamping():
+    from agent.reasoning_effort import (
+        DEEPSEEK_V41_EFFORTS,
+        clamp_effort,
+        is_deepseek_v41_model,
+        route_supported_efforts,
+    )
+    from providers import get_provider_profile
+
+    assert is_deepseek_v41_model("dsk-41-flash-1017") is True
+    assert is_deepseek_v41_model("deepseek-v4.1") is True
+    assert is_deepseek_v41_model("deepseek-v4-1") is True
+    assert is_deepseek_v41_model("deepseek-v4") is False
+
+    assert route_supported_efforts("custom", "dsk-41-flash-1017") == DEEPSEEK_V41_EFFORTS
+    # medium clamps to low so medium never reaches the template
+    assert clamp_effort("medium", DEEPSEEK_V41_EFFORTS) == "low"
+    assert clamp_effort("minimal", DEEPSEEK_V41_EFFORTS) == "low"
+    assert clamp_effort("high", DEEPSEEK_V41_EFFORTS) == "high"
+    assert clamp_effort("max", DEEPSEEK_V41_EFFORTS) == "max"
+
+    profile = get_provider_profile("custom")
+    assert profile.supported_reasoning_efforts("dsk-41-flash-1017") == DEEPSEEK_V41_EFFORTS
+
+    # When medium is requested for a DeepSeek V4.1 custom model, it sends low
+    _, top_level = profile.build_api_kwargs_extras(
+        reasoning_config={"enabled": True, "effort": "medium"},
+        model="dsk-41-flash-1017",
+    )
+    assert top_level.get("reasoning_effort") == "low"
