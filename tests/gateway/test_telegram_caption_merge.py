@@ -33,3 +33,71 @@ class TestMergeCaptionMultipleItems:
         assert text == "A\n\nB\n\nC"
 
 
+class TestMergeIntoPendingMediaTextInlined:
+    def _event(self, urls, types, inlined=None, text=""):
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        ev = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            user_id="u1",
+        )
+        ev.media_urls = list(urls)
+        ev.media_types = list(types)
+        if inlined is not None:
+            ev.media_text_inlined = list(inlined)
+        return ev
+
+    def test_merge_two_documents(self):
+        adapter = object.__new__(TelegramAdapter)
+        pending = {}
+        ev1 = self._event(["doc1.pdf"], ["application/pdf"], inlined=[False])
+        ev2 = self._event(["doc2.txt"], ["text/plain"], inlined=[True], text="content")
+        adapter._merge_into_pending(pending, "group1", ev1)
+        adapter._merge_into_pending(pending, "group1", ev2)
+
+        merged = pending["group1"]
+        assert len(merged.media_urls) == 2
+        assert len(merged.media_text_inlined) == 2
+        assert merged.media_text_inlined == [False, True]
+
+    def test_merge_document_and_photo(self):
+        adapter = object.__new__(TelegramAdapter)
+        pending = {}
+        ev1 = self._event(["doc1.pdf"], ["application/pdf"], inlined=[True])
+        ev2 = self._event(["photo1.jpg"], ["image/jpeg"], inlined=None)
+        adapter._merge_into_pending(pending, "group1", ev1)
+        adapter._merge_into_pending(pending, "group1", ev2)
+
+        merged = pending["group1"]
+        assert len(merged.media_urls) == 2
+        assert len(merged.media_text_inlined) == 2
+        assert merged.media_text_inlined == [True, False]
+
+    def test_merge_photo_and_document(self):
+        adapter = object.__new__(TelegramAdapter)
+        pending = {}
+        ev1 = self._event(["photo1.jpg"], ["image/jpeg"], inlined=[])
+        ev2 = self._event(["doc1.txt"], ["text/plain"], inlined=[True])
+        adapter._merge_into_pending(pending, "group1", ev1)
+        adapter._merge_into_pending(pending, "group1", ev2)
+
+        merged = pending["group1"]
+        assert len(merged.media_urls) == 2
+        assert len(merged.media_text_inlined) == 2
+        assert merged.media_text_inlined == [False, True]
+
+    def test_merge_two_photos_keeps_empty_inlined(self):
+        adapter = object.__new__(TelegramAdapter)
+        pending = {}
+        ev1 = self._event(["photo1.jpg"], ["image/jpeg"], inlined=[])
+        ev2 = self._event(["photo2.jpg"], ["image/jpeg"], inlined=[])
+        adapter._merge_into_pending(pending, "group1", ev1)
+        adapter._merge_into_pending(pending, "group1", ev2)
+
+        merged = pending["group1"]
+        assert len(merged.media_urls) == 2
+        assert len(merged.media_text_inlined) == 0
+
+
+

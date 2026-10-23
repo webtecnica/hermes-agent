@@ -6720,8 +6720,20 @@ class TelegramAdapter(BasePlatformAdapter):
         if existing is None:
             pending[key] = event
             return
+
+        # media_text_inlined must stay parallel to media_urls: the envelope refuses
+        # the whole message with invalid_params(media_text_inlined_length) when the
+        # lengths disagree. Pad each side to its URL count first.
+        def _flags(ev: MessageEvent) -> list[bool]:
+            n = len(getattr(ev, "media_urls", None) or [])
+            return (list(getattr(ev, "media_text_inlined", None) or []) + [False] * n)[:n]
+
+        has_flags = bool(getattr(existing, "media_text_inlined", None) or getattr(event, "media_text_inlined", None))
+        merged_flags = _flags(existing) + _flags(event) if has_flags else []
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
+        if has_flags:
+            existing.media_text_inlined = merged_flags
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
 
