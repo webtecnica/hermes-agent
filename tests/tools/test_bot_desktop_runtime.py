@@ -481,3 +481,13 @@ def test_a_comfortable_start_is_not_logged(tmp_path, monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="tools.bot_desktop.runtime"):
         runtime.start()
     assert not [m for m in (r.getMessage() for r in caplog.records) if "available" in m]
+
+
+def test_flocked_cross_platform(tmp_path):
+    """Ensure _flocked functions cleanly across platforms including Windows (via msvcrt)
+    without crashing on missing fcntl (#143567)."""
+    lock_file = tmp_path / "test.lock"
+    with runtime._flocked(lock_file) as fh:
+        assert fh is not None
+        assert lock_file.exists()
+

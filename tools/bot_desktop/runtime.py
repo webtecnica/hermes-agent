@@ -314,13 +314,36 @@ _ALLOC_LOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or Path.home() / ".cache") 
 
 @contextlib.contextmanager
 def _flocked(path: Path):
-    import fcntl  # windows-footgun: ok — Linux-only runtime (is_supported_host gates start)
-    with open(path, "a+", encoding="utf-8") as fh:  # windows-footgun: ok — Linux-only runtime
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            yield fh
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    if sys.platform == "win32":
+        import msvcrt
+        with open(path, "a+b") as fh:  # windows-footgun: ok — Windows fallback for _flocked
+            fh.seek(0)
+            if fh.tell() == 0 and os.fstat(fh.fileno()).st_size == 0:
+                fh.write(b"0")
+                fh.flush()
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            except OSError:
+                time.sleep(0.05)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield fh
+            finally:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+    else:
+        import fcntl  # windows-footgun: ok — Linux-only runtime (is_supported_host gates start)
+        with open(path, "a+", encoding="utf-8") as fh:  # windows-footgun: ok — Linux-only runtime
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield fh
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
 
 
 def _pick_display() -> int:
@@ -686,7 +709,8 @@ def start(*, wait_seconds: float = 15.0) -> DesktopStatus:
         raise RuntimeError(f"{need}. Install: {install_command()}")
     sd = state_dir()
     sd.mkdir(parents=True, exist_ok=True)
-    os.chmod(sd, 0o700)
+    if sys.platform != "win32":
+        os.chmod(sd, 0o700)
     with _flocked(sd / "start.lock"):
         if _launcher_pid() is not None and published_env().get("DISPLAY"):
             return status()
@@ -785,7 +809,8 @@ def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
         raise RuntimeError("the terminal backend's sandbox could not be started, so there is nowhere to put the screen")
     sd = state_dir()
     sd.mkdir(parents=True, exist_ok=True)
-    os.chmod(sd, 0o700)
+    if sys.platform != "win32":
+        os.chmod(sd, 0o700)
     with _flocked(sd / "start.lock"):
         # The dock's Browser icon runs the sandbox's own Playwright Chromium on the profile agent-browser
         # uses there: the human's browser is the bot's browser, as on the host.
