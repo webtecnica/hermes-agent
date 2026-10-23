@@ -36,6 +36,12 @@ def message_fingerprint(msg: Any) -> Optional[str]:
     if not isinstance(msg, dict):
         return None
     payload = {k: msg.get(k) for k in _FINGERPRINT_KEYS if msg.get(k) is not None}
+    if isinstance(payload.get("content"), str):
+        try:
+            from hermes_state_messages import SessionMessagesMixin
+            payload["content"] = SessionMessagesMixin._loaded_view_content(payload.get("role"), payload["content"])
+        except Exception:
+            pass
     try:
         raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=True, separators=(",", ":"))
     except (TypeError, ValueError):
