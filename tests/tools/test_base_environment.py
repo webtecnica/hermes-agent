@@ -238,6 +238,32 @@ class TestExtractCwdFromOutput:
         assert env.cwd == "/home/user"
         assert marker not in result["output"]
 
+    def test_strips_cwd_marker_from_spill_file(self, tmp_path):
+        import json
+        from pathlib import Path
+
+        env = _TestableEnv()
+        marker = env._cwd_marker
+        spill_file = tmp_path / "out.log"
+        json_data = [{"i": i, "pad": "x" * 100} for i in range(10)]
+        clean_text = json.dumps(json_data, indent=2) + "\n"
+        spill_file.write_text(f"{clean_text}\n{marker}/home/user{marker}\n", encoding="utf-8")
+
+        result = {
+            "output": f"head...[TRUNCATED]...tail\n{marker}/home/user{marker}\n",
+            "full_output_path": str(spill_file),
+            "output_total_chars": len(clean_text) + len(f"\n{marker}/home/user{marker}\n"),
+        }
+
+        env._extract_cwd_from_output(result)
+
+        assert env.cwd == "/home/user"
+        assert marker not in result["output"]
+        assert marker not in spill_file.read_text(encoding="utf-8")
+        assert spill_file.read_text(encoding="utf-8") == clean_text
+        assert json.loads(spill_file.read_text(encoding="utf-8")) == json_data
+        assert result["output_total_chars"] == len(clean_text)
+
 
 
 

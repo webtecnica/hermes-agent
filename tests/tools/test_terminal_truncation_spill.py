@@ -33,7 +33,8 @@ class TestTruncationSpill:
         assert p.exists()
         full = p.read_text()
         assert "marker_head" in full and "marker_tail" in full
-        # The spill contains rows that were cut from the visible window.
+        # The spill contains rows that were cut from the visible window, but no in-band CWD marker.
+        assert "__HERMES_CWD_" not in full
         assert "row_100 " in full
         assert "read_file" in r["truncation_note"]
 

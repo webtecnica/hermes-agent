@@ -576,14 +576,36 @@ class BaseEnvironment(ABC):
         ``self.cwd`` keeps the previous value. The environment is shared across sessions, so
         concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``."""
         split = _split_cwd_marker(result.get("output", ""), self._cwd_marker)
-        if split is None:
-            return
-        cwd_path, cleaned = split
-        if cwd_path:
-            self.cwd = cwd_path
-            result["cwd_observed"] = True
-            result["cwd"] = cwd_path
-        result["output"] = cleaned
+        if split is not None:
+            cwd_path, cleaned = split
+            if cwd_path:
+                self.cwd = cwd_path
+                result["cwd_observed"] = True
+                result["cwd"] = cwd_path
+            result["output"] = cleaned
+        spill_path = result.get("full_output_path")
+        if spill_path:
+            self._strip_spill_cwd_marker(spill_path, self._cwd_marker, result)
+
+    def _strip_spill_cwd_marker(self, spill_path: str, marker: str, result: dict) -> None:
+        """Strip the in-band CWD marker line from the spill file so the file contains
+        pure command output."""
+        try:
+            from tools.spill_safety import write_text_exclusive
+            path = Path(spill_path)
+            if not path.is_file():
+                return
+            content = path.read_text(encoding="utf-8", errors="replace")
+            split = _split_cwd_marker(content, marker)
+            if split is not None:
+                _, cleaned = split
+                removed = len(content) - len(cleaned)
+                if removed > 0:
+                    write_text_exclusive(path, cleaned, private=True, overwrite=True, errors="replace")
+                    if "output_total_chars" in result:
+                        result["output_total_chars"] = max(0, result["output_total_chars"] - removed)
+        except Exception:
+            logger.debug("Failed to strip CWD marker from spill file %s", spill_path, exc_info=True)
 
     # --- Hooks ---
     def _before_execute(self) -> None:
