@@ -4009,9 +4009,23 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         call_kwargs["latency_info"] = _latency_info
         # Per-attempt observable (#114594): with this line a stalled attempt is distinguishable from a slow
         # one — silence before it is prompt build, silence after it is the summary provider.
+        _dispatch_model = call_kwargs.get("model")
+        if not _dispatch_model:
+            try:
+                from agent.auxiliary_client import _get_auxiliary_task_config
+                _task_cfg = _get_auxiliary_task_config("compression")
+                _cfg_model = str(_task_cfg.get("model") or "").strip()
+                if _cfg_model:
+                    _dispatch_model = _cfg_model
+                elif _task_cfg.get("provider"):
+                    _dispatch_model = "auto"
+            except Exception:
+                pass
+        if not _dispatch_model:
+            _dispatch_model = self.summary_model or self.model
         logger.info(
             "Compression summary call dispatched: model=%s prompt_chars=%s prompt_build_ms=%s",
-            self.summary_model or self.model, f"{len(prompt):,}", _latency_info["prompt_build_ms"],
+            _dispatch_model, f"{len(prompt):,}", _latency_info["prompt_build_ms"],
         )
         try:
             # Compression is atomic: shield the summary call from gateway interrupts. Re-entrant.
@@ -4023,11 +4037,18 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Remember the resolved model for the failure path: an ``auto`` route picks one per call
             # without setting ``summary_model``, so only this names it in the user warning (#116472).
             self._last_aux_resolved_model = _aux_model or None
+            _duration_ms = int((time.monotonic() - _aux_call_start) * 1000)
+            logger.info(
+                "Compression summary call served: aux_provider=%s aux_model=%s duration_ms=%s",
+                _aux_route.get("provider") or self.provider or "",
+                _aux_model,
+                _duration_ms,
+            )
             self._record_aux_compression_call(
                 prompt_messages=call_kwargs["messages"],
                 # max_tokens is intentionally absent; .get() keeps the telemetry hook from breaking the call.
                 max_tokens=call_kwargs.get("max_tokens"),
-                duration_ms=int((time.monotonic() - _aux_call_start) * 1000),
+                duration_ms=_duration_ms,
                 aux_provider=_aux_route.get("provider") or self.provider or "",
                 aux_model=_aux_model,
                 effective_aux_context=self.context_length if route_known and _aux_model == self.model else None,
