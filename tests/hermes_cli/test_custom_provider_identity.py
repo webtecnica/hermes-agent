@@ -153,3 +153,105 @@ def test_named_lookup_does_not_read_an_unmatched_providers_secret(monkeypatch):
     assert entry["name"] == "beta"
     assert entry["base_url"] == "https://beta.invalid/v1"
     assert entry["api_key"] == "beta-inline-key"
+
+
+def test_shared_base_url_disambiguates_by_model(monkeypatch):
+    """When two providers share the same endpoint, model narrows the identity (#143568)."""
+    config = {
+        "providers": {
+            "77-api": {
+                "api": "https://relay.example.com/v1",
+                "name": "77-api",
+                "key_env": "RELAY_GLM_KEY",
+                "models": {
+                    "glm-5.3": {"context_length": 1048576},
+                },
+            },
+            "77-api-deepseek": {
+                "api": "https://relay.example.com/v1",
+                "name": "77-api-deepseek",
+                "key_env": "RELAY_DEEPSEEK_KEY",
+                "models": {
+                    "DeepSeek-V4.1-Flash-1017": {"context_length": 1000000},
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    # Disambiguate by model
+    assert (
+        rp.find_custom_provider_identity("https://relay.example.com/v1", model="DeepSeek-V4.1-Flash-1017")
+        == "custom:77-api-deepseek"
+    )
+    assert (
+        rp.find_custom_provider_identity("https://relay.example.com/v1", model="glm-5.3")
+        == "custom:77-api"
+    )
+    # Without model, first entry on that base_url wins
+    assert (
+        rp.find_custom_provider_identity("https://relay.example.com/v1")
+        == "custom:77-api"
+    )
+    # With unlisted model on that base_url, fallback to first entry
+    assert (
+        rp.find_custom_provider_identity("https://relay.example.com/v1", model="unlisted-model")
+        == "custom:77-api"
+    )
+
+
+def test_shared_base_url_canonical_custom_identity(monkeypatch):
+    """canonical_custom_identity forwards model to find_custom_provider_identity."""
+    config = {
+        "providers": {
+            "77-api": {
+                "api": "https://relay.example.com/v1",
+                "key_env": "RELAY_GLM_KEY",
+                "models": ["glm-5.3"],
+            },
+            "77-api-deepseek": {
+                "api": "https://relay.example.com/v1",
+                "key_env": "RELAY_DEEPSEEK_KEY",
+                "models": ["DeepSeek-V4.1-Flash-1017"],
+            },
+        }
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    assert (
+        rp.canonical_custom_identity(base_url="https://relay.example.com/v1", model="DeepSeek-V4.1-Flash-1017")
+        == "custom:77-api-deepseek"
+    )
+    assert (
+        rp.canonical_custom_identity(base_url="https://relay.example.com/v1", model="glm-5.3")
+        == "custom:77-api"
+    )
+
+
+def test_shared_base_url_legacy_custom_providers_list(monkeypatch):
+    """Legacy custom_providers list with shared base_url also disambiguates by model."""
+    config = {
+        "custom_providers": [
+            {
+                "name": "shared-a",
+                "base_url": "https://relay.example.com/v1",
+                "model": "model-a",
+            },
+            {
+                "name": "shared-b",
+                "base_url": "https://relay.example.com/v1",
+                "model": "model-b",
+            },
+        ]
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    assert (
+        rp.find_custom_provider_identity("https://relay.example.com/v1", model="model-b")
+        == "custom:shared-b"
+    )
+    assert (
+        rp.find_custom_provider_identity("https://relay.example.com/v1", model="model-a")
+        == "custom:shared-a"
+    )
+

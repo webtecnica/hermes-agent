@@ -259,40 +259,60 @@ def _find_custom_identity(matches: Callable[[Dict[str, Any]], bool]) -> Optional
     return None
 
 
-def find_custom_provider_identity(base_url: str) -> Optional[str]:
+def _model_id_matches(value: Any, target: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    v = value.strip().lower()
+    if v == target:
+        return True
+    if "/" in target and target.split("/", 1)[1] == v:
+        return True
+    if "/" in v and v.split("/", 1)[1] == target:
+        return True
+    return False
+
+
+def _entry_serves_model(entry: Dict[str, Any], model: str) -> bool:
+    target = str(model or "").strip().lower()
+    if not target:
+        return False
+    if any(_model_id_matches(entry.get(key), target) for key in ("model", "default_model")):
+        return True
+    models = entry.get("models")
+    if isinstance(models, dict):
+        return any(_model_id_matches(str(mid), target) for mid in models)
+    if isinstance(models, list):
+        return any(_model_id_matches(item.get("id") or item.get("name") if isinstance(item, dict) else item, target)
+                   for item in models)
+    return False
+
+
+def find_custom_provider_identity(base_url: str, model: Optional[str] = None) -> Optional[str]:
     """Map an endpoint URL back to its canonical ``custom:<name>`` menu key. Session persistence
     stores the agent's *resolved* provider, which for every named custom endpoint is the literal
-    string ``"custom"`` — the entry name is lost, and the api_key is deliberately never persisted."""
+    string ``"custom"`` — the entry name is lost, and the api_key is deliberately never persisted.
+
+    When multiple configured entries share the same ``base_url``, disambiguate using ``model`` if
+    provided before falling back to the first URL match.
+    """
     target = _normalize_base_url_for_match(base_url)
     if not target:
         return None
+    if model:
+        matched = _find_custom_identity(
+            lambda entry: _normalize_base_url_for_match(_entry_url(entry)) == target
+            and _entry_serves_model(entry, model)
+        )
+        if matched:
+            return matched
     return _find_custom_identity(lambda entry: _normalize_base_url_for_match(_entry_url(entry)) == target)
-
-
-def _model_id_matches(value: Any, target: str) -> bool:
-    return isinstance(value, str) and value.strip().lower() == target
 
 
 def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
     """Map a model id back to the ``custom:<name>`` entry that serves it — companion to
     :func:`find_custom_provider_identity` for persistence paths where no base_url survived the
     round-trip (the session row always stores the model name)."""
-    target = str(model or "").strip().lower()
-    if not target:
-        return None
-
-    def _entry_serves_model(entry: Dict[str, Any]) -> bool:
-        if any(_model_id_matches(entry.get(key), target) for key in ("model", "default_model")):
-            return True
-        models = entry.get("models")
-        if isinstance(models, dict):
-            return any(str(mid).strip().lower() == target for mid in models)
-        if isinstance(models, list):
-            return any(_model_id_matches(item.get("id") or item.get("name") if isinstance(item, dict) else item, target)
-                       for item in models)
-        return False
-
-    return _find_custom_identity(_entry_serves_model)
+    return _find_custom_identity(lambda entry: _entry_serves_model(entry, model))
 
 
 def canonical_custom_identity(*, base_url: Optional[str] = None, config_provider: Optional[str] = None,
@@ -302,7 +322,7 @@ def canonical_custom_identity(*, base_url: Optional[str] = None, config_provider
     provider. Every session persistence/restore path shares this lookup."""
     rp = _rp()
     if base_url:
-        identity = find_custom_provider_identity(base_url)
+        identity = find_custom_provider_identity(base_url, model=model)
         if identity:
             return identity
         # The managed server has no custom-provider config entry. Recover its menu key
@@ -337,7 +357,7 @@ def canonical_custom_identity(*, base_url: Optional[str] = None, config_provider
     if entry is None:
         return None
     try:
-        identity = find_custom_provider_identity(str(entry.get("base_url") or ""))
+        identity = find_custom_provider_identity(str(entry.get("base_url") or ""), model=model)
     except Exception:
         return None
     return identity or custom_provider_slug(candidate_norm)
