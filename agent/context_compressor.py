@@ -1059,6 +1059,10 @@ _ANCHOR_PATTERNS: "list[tuple[str, re.Pattern[str], int]]" = [
     ("commits", re.compile(r"\b[0-9a-f]{9,40}\b"), 40),
     ("branches", re.compile(r"\b(?:fix|feat|docs|refactor|chore|salvage|ent)/[A-Za-z0-9._/-]{3,60}"), 40),
     ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh)\b"), 80),
+    ("media-paths", re.compile(
+        r"(?:~|[A-Za-z]:[/\\]|/(?:home/[\w.-]+|var|etc|opt|srv|root|tmp)|[\w.-]+[/\\])[\w./\\-]{1,140}?\."
+        r"(?:png|jpe?g|webp|gif|bmp|mp4|mov|webm|mkv|mp3|wav|ogg|m4a|pdf|db|sqlite|csv|txt|log|bak|env|conf|ini|cfg|service|jsonl)\b"
+    ), 60),
     ("errors", re.compile(r"\b(?:[A-Z][a-zA-Z]*Error|Exception|ENOSPC|EACCES|SIGKILL|Traceback)\b[^\n]{0,90}"), 40),
     ("handles", re.compile(r"@[A-Za-z0-9-]{3,30}\b"), 40),
     ("urls", re.compile(r"https?://[^\s)\"']{10,110}"), 30),
