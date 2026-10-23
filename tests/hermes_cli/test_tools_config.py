@@ -1093,3 +1093,29 @@ class TestLightpandaPostSetup:
         # Not in the forced-setup gate: a missing binary must not nag every
         # user who toggles the browser toolset.
         assert "lightpanda" not in _POST_SETUP_INSTALLED
+
+
+def test_explicit_empty_platform_toolsets_does_not_merge_mcp_servers():
+    """Ensure an explicitly saved empty platform_toolsets list ([]) resolves to zero toolsets
+    and does not merge default MCP servers (#82010, #143574)."""
+    cfg_empty = {
+        "mcp_servers": {
+            "claudius": {"url": "http://x"},
+            "evil": {"url": "http://y"},
+        },
+        "platform_toolsets": {"cli": []},
+    }
+    assert _get_platform_tools(cfg_empty, "cli") == set()
+
+    cfg_populated = {
+        "mcp_servers": {
+            "claudius": {"url": "http://x"},
+            "evil": {"url": "http://y"},
+        },
+        "platform_toolsets": {"cli": ["web"]},
+    }
+    tools_populated = _get_platform_tools(cfg_populated, "cli")
+    assert "web" in tools_populated
+    assert "claudius" in tools_populated
+    assert "evil" in tools_populated
+

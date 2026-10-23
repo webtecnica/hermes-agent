@@ -645,7 +645,9 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
 
     # Explicit non-configurable entries (custom toolsets, MCP server names) pass through.
     explicit_passthrough = {ts for ts in toolset_names if ts not in explicit_known_keys and ts not in platform_default_keys}
-    enabled_toolsets |= _merge_mcp_servers(config, toolset_names, explicit_passthrough, include_default_mcp_servers)
+    enabled_toolsets |= _merge_mcp_servers(
+        config, toolset_names, explicit_passthrough, include_default_mcp_servers, explicitly_configured=explicitly_configured
+    )
 
     # Legacy profile opt-in is a fallback only. A saved platform list (even
     # empty) is authoritative, so a later disable cannot silently re-enable it.
@@ -709,10 +711,19 @@ def _recover_platform_native_toolsets(enabled_toolsets: Set[str], platform: str,
 
 
 def _merge_mcp_servers(
-    config: dict, toolset_names: List[str], explicit_passthrough: Set[str], include_default_mcp_servers: bool
+    config: dict,
+    toolset_names: List[str],
+    explicit_passthrough: Set[str],
+    include_default_mcp_servers: bool,
+    *,
+    explicitly_configured: bool = False,
 ) -> Set[str]:
     """Explicit passthrough entries plus this platform's MCP servers: listed names form an allowlist, else every
-    globally enabled server (when ``include_default_mcp_servers``); the ``no_mcp`` sentinel disables all."""
+    globally enabled server (when ``include_default_mcp_servers``); the ``no_mcp`` sentinel disables all.
+    An explicitly saved empty toolset list (``explicitly_configured and not toolset_names``) resolves to zero
+    toolsets with no MCP merge fail-closed (#82010, #143574)."""
+    if explicitly_configured and not toolset_names:
+        return set()
     enabled_mcp_servers = enabled_mcp_server_names(config)
     result = explicit_passthrough - enabled_mcp_servers
     if "no_mcp" in toolset_names:
