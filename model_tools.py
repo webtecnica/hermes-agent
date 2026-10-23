@@ -495,10 +495,12 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
         print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
               if filtered_tools else "🛠️  No tools selected (all filtered out or unavailable)")
     # Normalize schema shapes llama.cpp's grammar converter rejects (bare
-    # "type": "object", string-valued nodes from malformed MCP servers).
+    # "type": "object", string-valued nodes from malformed MCP servers) and
+    # flatten nested combinators for Anthropic-family models.
     try:
         from tools.schema_sanitizer import sanitize_tool_schemas
-        filtered_tools = sanitize_tool_schemas(filtered_tools)
+        filtered_tools = sanitize_tool_schemas(
+            filtered_tools, anthropic_safe=_is_anthropic_model_target())
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
 
@@ -533,6 +535,27 @@ def _active_model_config() -> tuple[str, dict[str, Any]]:
         from hermes_cli.config import split_model_config_default
         raw_model_id, _ = split_model_config_default(raw_model_id)
     return str(raw_model_id).strip(), model_cfg
+
+
+def _is_anthropic_model_target() -> bool:
+    """True if active model/provider targets Anthropic (direct or OpenAI-compat relay)."""
+    env_model = (os.environ.get("HERMES_MODEL", "") or os.environ.get("HERMES_INFERENCE_MODEL", "")).strip().lower()
+    if "claude" in env_model or "anthropic" in env_model:
+        return True
+    try:
+        model_id, model_cfg = _active_model_config()
+        m_lower = model_id.lower()
+        if "claude" in m_lower or "anthropic" in m_lower:
+            return True
+        provider = str(model_cfg.get("provider") or "").strip().lower()
+        if "anthropic" in provider:
+            return True
+        api_mode = str(model_cfg.get("api_mode") or "").strip().lower()
+        if "anthropic" in api_mode:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _resolve_active_context_length() -> int:

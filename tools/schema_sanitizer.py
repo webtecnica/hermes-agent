@@ -130,12 +130,123 @@ def unrename_tool_args(params_schema: Any, args: Any, root_schema: Any = None) -
     return out
 
 
-def sanitize_tool_schemas(tools: list[dict]) -> list[dict]:
+def inline_combinators_anthropic(schema: Any) -> Any:
+    """Recursively inline and flatten anyOf/oneOf/allOf in JSON schema for Anthropic models.
+
+    Anthropic's validator rejects combinators anywhere inside input_schema.
+    - Scalar branches become a type array (e.g. ['boolean', 'array'] with items)
+    - Object branches union their properties and intersect required (for anyOf/oneOf)
+      or union required (for allOf)
+    - Non-schema keywords (default, const, enum, examples) are preserved or merged
+    - Removes nullable keywords which Anthropic does not support.
+    """
+    if not isinstance(schema, dict):
+        if isinstance(schema, list):
+            return [inline_combinators_anthropic(x) for x in schema]
+        return schema
+
+    # Recurse children first
+    node = {k: inline_combinators_anthropic(v) for k, v in schema.items() if k != "nullable"}
+
+    combinator_keys = ("allOf", "anyOf", "oneOf")
+    if not any(k in node for k in combinator_keys):
+        return node
+
+    for comb in combinator_keys:
+        if comb not in node:
+            continue
+        branches = node.pop(comb, [])
+        if not isinstance(branches, list):
+            continue
+
+        types: list[str] = []
+        if "type" in node:
+            t = node["type"]
+            if isinstance(t, list):
+                types.extend(t)
+            elif isinstance(t, str):
+                types.append(t)
+
+        props = dict(node.get("properties") or {})
+        items = node.get("items")
+        enums = list(node.get("enum") or [])
+        object_branches = []
+
+        for b in branches:
+            if not isinstance(b, dict):
+                continue
+            b_type = b.get("type")
+            if isinstance(b_type, str):
+                types.append(b_type)
+            elif isinstance(b_type, list):
+                types.extend(b_type)
+            elif "properties" in b:
+                types.append("object")
+            elif "items" in b:
+                types.append("array")
+
+            if isinstance(b.get("properties"), dict):
+                object_branches.append(b)
+                for pk, pv in b["properties"].items():
+                    if pk not in props:
+                        props[pk] = pv
+
+            if items is None and "items" in b:
+                items = b["items"]
+
+            if isinstance(b.get("enum"), list):
+                for val in b["enum"]:
+                    if val not in enums:
+                        enums.append(val)
+
+            for meta in ("description", "title", "format", "pattern"):
+                if meta not in node and meta in b:
+                    node[meta] = b[meta]
+
+        if types:
+            non_null = [t for t in types if t != "null"]
+            final_types = non_null if non_null else types
+            dedup_types = list(dict.fromkeys(final_types))
+            node["type"] = dedup_types[0] if len(dedup_types) == 1 else dedup_types
+
+        if props or node.get("type") == "object" or (isinstance(node.get("type"), list) and "object" in node.get("type")):
+            node["properties"] = props
+
+        if items is not None:
+            node["items"] = items
+
+        if enums:
+            node["enum"] = enums
+
+        if comb in ("anyOf", "oneOf"):
+            if object_branches:
+                req_sets = [set(b.get("required", [])) for b in object_branches if "required" in b]
+                if req_sets:
+                    common_req = set.intersection(*req_sets)
+                    node["required"] = [r for r in common_req if r in props]
+                else:
+                    node["required"] = []
+            elif "required" in node and not isinstance(node["required"], list):
+                node["required"] = []
+        elif comb == "allOf":
+            all_req = set(node.get("required") or [])
+            for b in branches:
+                if isinstance(b, dict) and isinstance(b.get("required"), list):
+                    all_req.update(b["required"])
+            node["required"] = [r for r in all_req if r in props]
+
+    for k in combinator_keys:
+        node.pop(k, None)
+
+    return node
+
+
+def sanitize_tool_schemas(tools: list[dict], *, anthropic_safe: bool = False) -> list[dict]:
     """Deep-copied ``tools`` (OpenAI format) with sanitized parameter schemas; safe to mutate."""
-    return [_sanitize_single_tool(tool) for tool in tools] if tools else tools
+    return [_sanitize_single_tool(tool, anthropic_safe=anthropic_safe) for tool in tools] if tools else tools
 
 
-def _sanitize_single_tool(tool: dict) -> dict:
+def _sanitize_single_tool(tool: dict, *, anthropic_safe: bool = False) -> dict:
     out = copy.deepcopy(tool)
     fn = out.get("function") if isinstance(out, dict) else None
     if not isinstance(fn, dict):
@@ -154,10 +265,13 @@ def _sanitize_single_tool(tool: dict) -> dict:
         top["required"] = []
     # The recursive pass only handles array-form ``type: [X, "null"]``; collapse anyOf unions
     # here, keeping ``nullable: true`` so ``tools.arg_coercion._schema_allows_null`` still coerces.
-    top = strip_nullable_unions(top, keep_nullable_hint=True)
+    top = strip_nullable_unions(top, keep_nullable_hint=not anthropic_safe)
     top = _strip_top_level_combinators(top, path=name)
+    if anthropic_safe:
+        top = inline_combinators_anthropic(top)
     fn["parameters"] = _strip_ref_siblings(top)
     return out
+
 
 
 _REF_FORBIDDEN_SIBLINGS = frozenset({"default"})  # strict validators reject these beside ``$ref``

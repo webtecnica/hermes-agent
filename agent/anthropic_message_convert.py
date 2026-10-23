@@ -125,13 +125,13 @@ def _normalize_tool_input_schema(schema: Any) -> dict[str, Any]:
     """Normalize a tool schema for Anthropic's validator: collapse nullable unions (``anyOf:
     [{type: string}, {type: null}]`` from Pydantic/MCP optional fields) to the non-null branch —
     optionality is already expressed by ``required``; ``keep_nullable_hint=False`` because the
-    OpenAPI ``nullable`` keyword is not recognized. Top-level oneOf/allOf/anyOf are rejected with a
-    generic 400, so they are dropped in favour of a plain object."""
-    from tools.schema_sanitizer import strip_nullable_unions
+    OpenAPI ``nullable`` keyword is not recognized. Recursively inline and flatten anyOf/oneOf/allOf."""
+    from tools.schema_sanitizer import inline_combinators_anthropic, strip_nullable_unions
 
     normalized = strip_nullable_unions(schema, keep_nullable_hint=False) if schema else None
     if not isinstance(normalized, dict):
         return dict(_EMPTY_SCHEMA)
+    normalized = inline_combinators_anthropic(normalized)
     banned = {"oneOf", "allOf", "anyOf"}
     if banned & normalized.keys():
         normalized = {k: v for k, v in normalized.items() if k not in banned}

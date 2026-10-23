@@ -630,3 +630,121 @@ def test_registered_tool_schemas_stay_inside_llama_cpp_repetition_limit():
                 if isinstance(val, int) and val >= 2000:
                     offenders.append((name, key, val))
     assert not offenders, offenders
+
+
+# ---------------------------------------------------------------------------
+# #143530: Anthropic 400 on nested anyOf/oneOf/allOf via OpenAI-compat relay
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_safe_inlines_scalar_and_array_anyof():
+    tools = [_tool("terminal", {
+        "type": "object",
+        "properties": {
+            "notify": {
+                "description": "notify on exit or pattern",
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"type": "array", "items": {"type": "string"}},
+                ],
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools, anthropic_safe=True)
+    prop = out[0]["function"]["parameters"]["properties"]["notify"]
+    assert "anyOf" not in prop
+    assert prop["type"] == ["boolean", "array"]
+    assert prop["items"] == {"type": "string"}
+    assert prop["description"] == "notify on exit or pattern"
+
+
+def test_anthropic_safe_inlines_object_unions_and_intersects_required():
+    tools = [_tool("op", {
+        "type": "object",
+        "properties": {
+            "config": {
+                "anyOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}, "common": {"type": "int"}}, "required": ["a", "common"]},
+                    {"type": "object", "properties": {"b": {"type": "string"}, "common": {"type": "int"}}, "required": ["b", "common"]},
+                ],
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools, anthropic_safe=True)
+    cfg = out[0]["function"]["parameters"]["properties"]["config"]
+    assert "anyOf" not in cfg
+    assert cfg["type"] == "object"
+    assert set(cfg["properties"].keys()) == {"a", "b", "common"}
+    assert cfg["required"] == ["common"]
+
+
+def test_anthropic_safe_inlines_allof_and_unions_required():
+    tools = [_tool("comb", {
+        "type": "object",
+        "properties": {
+            "info": {
+                "allOf": [
+                    {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+                    {"type": "object", "properties": {"tag": {"type": "string"}}, "required": ["tag"]},
+                ],
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools, anthropic_safe=True)
+    info = out[0]["function"]["parameters"]["properties"]["info"]
+    assert "allOf" not in info
+    assert info["type"] == "object"
+    assert set(info["properties"].keys()) == {"id", "tag"}
+    assert set(info["required"]) == {"id", "tag"}
+
+
+def test_anthropic_safe_strips_nullable():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "val": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "null"},
+                ],
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools, anthropic_safe=True)
+    val = out[0]["function"]["parameters"]["properties"]["val"]
+    assert "anyOf" not in val
+    assert val["type"] == "string"
+    assert "nullable" not in val
+
+
+def test_anthropic_safe_walks_every_registered_tool_without_combinators():
+    from model_tools import get_tool_definitions
+    tools = get_tool_definitions()
+    sanitized = sanitize_tool_schemas(tools, anthropic_safe=True)
+    combinator_keys = {"anyOf", "oneOf", "allOf"}
+    offenders = []
+    for t in sanitized:
+        for node in _walk_schema(t["function"]["parameters"]):
+            found = combinator_keys & node.keys()
+            if found:
+                offenders.append((t["function"]["name"], found))
+    assert not offenders, f"Found combinators in tools: {offenders}"
+
+
+def test_anthropic_message_convert_normalizes_nested_combinators():
+    from agent.anthropic_message_convert import _normalize_tool_input_schema
+    schema = {
+        "type": "object",
+        "properties": {
+            "notify": {
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"type": "array", "items": {"type": "string"}},
+                ],
+            },
+        },
+    }
+    normalized = _normalize_tool_input_schema(schema)
+    assert "anyOf" not in normalized["properties"]["notify"]
+    assert normalized["properties"]["notify"]["type"] == ["boolean", "array"]
+
