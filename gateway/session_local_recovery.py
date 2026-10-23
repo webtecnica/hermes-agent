@@ -134,6 +134,19 @@ def _stray_route_target(authority, receipt, session_id):
     return True
 
 
+def _live_local_source_matches(live_source, receipt_source, adapter) -> bool:
+    """True when live_source matches receipt_source in identity and durable attributes.
+    A live source records the triggering message_id of the active or previous turn,
+    which is per-message metadata rather than conversation identity (#143537)."""
+    if not adapter.authorize_source(live_source):
+        return False
+    if adapter._identity(live_source) != adapter._identity(receipt_source):
+        return False
+    live_d = {k: v for k, v in live_source.to_dict().items() if k != 'message_id'}
+    receipt_d = {k: v for k, v in receipt_source.to_dict().items() if k != 'message_id'}
+    return live_d == receipt_d
+
+
 def restore_local_session(authority, sid):
     from gateway.session_authority import LiveSession
     from gateway.session_local import LocalSessionAdapter
@@ -184,9 +197,13 @@ def restore_local_session(authority, sid):
         adapter.policies[chat_id] = policy
         authority.sessions[sid] = LiveSession(source, route)
         adapter.register_source(source)
-    elif (not adapter.authorize_source(live.source)
-          or live.source.to_dict() != source.to_dict()
-          or adapter.policies.get(chat_id) != policy):
+    elif not _live_local_source_matches(live.source, source, adapter):
+        logging.getLogger(__name__).warning(
+            'Local session %s live source differs from its receipt: live=%s receipt=%s',
+            sid, live.source.to_dict(), source.to_dict(),
+        )
+        raise RuntimeStoreError('storage_unavailable')
+    elif adapter.policies.get(chat_id) != policy:
         raise RuntimeStoreError('storage_unavailable')
     else:
         with store._lock:
