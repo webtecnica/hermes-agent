@@ -171,14 +171,14 @@ method("shell.exec", params=ShellExecParams, result=ShellExecResult,
 
 
 class CanonicalShellExecParams(Params):
-    session_id: str
     command: str
+    session_id: str | None = None
     profile: str | None = None
 
 
 canonical_method("shell.exec", params=CanonicalShellExecParams, result=ShellExecResult,
-                 doc="Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one safe command for a local session, in "
-                     "its frozen launch cwd (``gateway/session_shell.py``).")
+                 doc="Ink ``!cmd`` / ``{!cmd}`` and desktop plugin shell execution on the shared owner "
+                     "(``gateway/session_shell.py``).")
 
 
 class CliExecParams(Params):

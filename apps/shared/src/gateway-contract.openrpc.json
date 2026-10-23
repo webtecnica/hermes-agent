@@ -10255,13 +10255,21 @@
       "CanonicalShellExecParams": {
         "additionalProperties": false,
         "properties": {
-          "session_id": {
-            "title": "Session Id",
-            "type": "string"
-          },
           "command": {
             "title": "Command",
             "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
           },
           "profile": {
             "anyOf": [
@@ -10277,7 +10285,6 @@
           }
         },
         "required": [
-          "session_id",
           "command"
         ],
         "title": "CanonicalShellExecParams",
@@ -48106,7 +48113,7 @@
     },
     {
       "name": "shell.exec",
-      "summary": "Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one safe command for a local session, in its frozen launch cwd (``gateway/session_shell.py``).",
+      "summary": "Ink ``!cmd`` / ``{!cmd}`` and desktop plugin shell execution on the shared owner (``gateway/session_shell.py``).",
       "params": [
         {
           "name": "params",

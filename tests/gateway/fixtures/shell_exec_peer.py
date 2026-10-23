@@ -39,7 +39,8 @@ async def probe():
             receipt['ran'] = ran.get('result', ran.get('error'))
             dangerous = await rpc(ws, 'shell.exec', session_id=sid, command='rm -rf /')
             receipt['dangerous'] = dangerous.get('error', dangerous.get('result'))
-            receipt['sessionless'] = (await rpc(ws, 'shell.exec', command='pwd')).get('error', {}).get('code')
+            sessionless = await rpc(ws, 'shell.exec', command='pwd')
+            receipt['sessionless'] = sessionless.get('result', sessionless.get('error'))
     finally:
         await stop_gateway_api(api)
     (home / 'receipt.json').write_text(json.dumps(receipt))

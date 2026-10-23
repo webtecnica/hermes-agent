@@ -4534,8 +4534,8 @@ export interface PluginCatalogLookupEntry {
   tier?: string
 }
 export interface CanonicalShellExecParams {
-  session_id: string
   command: string
+  session_id?: string | null
   profile?: string | null
 }
 export interface PromptReceiptParams {
@@ -6839,7 +6839,7 @@ export interface CanonicalRpcMethods {
   /** The session.usage dict on demand: what main's classic CLI read off its agent. */
   'session.stats': { params: SessionStatsParams; result: SessionStats }
   'session.steer': { params: CanonicalCorrectionParams; result: CanonicalCorrectionResult }
-  /** Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one safe command for a local session, in its frozen launch cwd (``gateway/session_shell.py``). */
+  /** Ink ``!cmd`` / ``{!cmd}`` and desktop plugin shell execution on the shared owner (``gateway/session_shell.py``). */
   'shell.exec': { params: CanonicalShellExecParams; result: ShellExecResult }
   /** Adopt a registered execution after verifying the live producer claim. */
   'worker.adopt': { params: WorkerScopeParams; result: WorkerExecution }

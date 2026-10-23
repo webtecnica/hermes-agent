@@ -25,33 +25,54 @@ def handlers(connection):
 
 async def shell_exec(connection, ref, params):
     command = params.get('command')
-    if (set(params) - {'session_id', 'profile', 'command'} or not isinstance(ref.session_id, str)
-            or not ref.session_id or not isinstance(command, str) or not command.strip()):
+    session_id = params.get('session_id')
+    if (set(params) - {'session_id', 'profile', 'command'}
+            or (session_id is not None and not isinstance(session_id, str))
+            or not isinstance(command, str) or not command.strip()):
         raise RuntimeStoreError('invalid_params')
-    from gateway.session_busy_controls import authorize
-    authorize(connection, ref, params, 'session:control')
-    authority = connection.authority
-    authority._require_admission_open()
-    from gateway.session_local import authorize_local_source
-    from gateway.session_policy import policy_for_source
-    live = authority.sessions[ref.session_id]
-    # Local terminal sessions only: an API, messaging or A2A session has no composer, and running
-    # commands for it would be a remote-execution surface with no human at the keyboard.
-    if authorize_local_source(authority.runner, live.source) is not True:
-        raise RuntimeStoreError('permission_denied')
-    policy = policy_for_source(authority.runner, live.source)
-    if policy is None:
-        raise RuntimeStoreError('permission_denied')
-    # The frozen terminal policy chose a sandbox (docker, ssh, ...): the owner's host shell is not
-    # that backend, so refuse rather than run on the host behind the session's back.
-    # The refusal names the backend so the client can say where the command would have run.
-    backend = str(json.loads(policy.terminal_json).get('TERMINAL_ENV') or '').strip().lower()
-    if backend not in _LOCAL_BACKENDS:
-        raise RuntimeStoreError('unsupported_terminal_backend', field='terminal.backend', detail=backend)
+
+    target_session_id = ref.session_id or (session_id if isinstance(session_id, str) else '')
+    if target_session_id:
+        from gateway.session_busy_controls import authorize
+        authorize(connection, ref, params, 'session:control')
+        authority = connection.authority
+        authority._require_admission_open()
+        from gateway.session_local import authorize_local_source
+        from gateway.session_policy import policy_for_source
+        live = authority.sessions[target_session_id]
+        # Local terminal sessions only: an API, messaging or A2A session has no composer, and running
+        # commands for it would be a remote-execution surface with no human at the keyboard.
+        if authorize_local_source(authority.runner, live.source) is not True:
+            raise RuntimeStoreError('permission_denied')
+        policy = policy_for_source(authority.runner, live.source)
+        if policy is None:
+            raise RuntimeStoreError('permission_denied')
+        # The frozen terminal policy chose a sandbox (docker, ssh, ...): the owner's host shell is not
+        # that backend, so refuse rather than run on the host behind the session's back.
+        # The refusal names the backend so the client can say where the command would have run.
+        backend = str(json.loads(policy.terminal_json).get('TERMINAL_ENV') or '').strip().lower()
+        if backend not in _LOCAL_BACKENDS:
+            raise RuntimeStoreError('unsupported_terminal_backend', field='terminal.backend', detail=backend)
+        cwd = policy.cwd
+    else:
+        if 'session:control' not in connection.actor.capabilities:
+            raise RuntimeStoreError('permission_denied')
+        if params.get('profile') is not None:
+            from pathlib import Path
+            from hermes_cli.profiles import profile_matches_home
+            profile = params['profile']
+            if not isinstance(profile, str):
+                raise RuntimeStoreError('invalid_params')
+            if profile and not profile_matches_home(profile, Path(connection.authority.profile_id)):
+                raise RuntimeStoreError('profile_mismatch')
+        authority = connection.authority
+        authority._require_admission_open()
+        cwd = os.getcwd()
+
     from tools.approval_detection import detect_dangerous_command, detect_hardline_command
     if detect_hardline_command(command)[0] or detect_dangerous_command(command)[0]:
         raise RuntimeStoreError('dangerous_command')
-    return await asyncio.to_thread(_run, command, policy.cwd)
+    return await asyncio.to_thread(_run, command, cwd)
 
 
 def _run(command, cwd):

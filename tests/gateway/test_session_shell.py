@@ -32,7 +32,9 @@ def test_shell_exec_runs_in_the_session_cwd_behind_the_safety_gates(tmp_path):
     assert Path(ran['stdout'].strip()).resolve() == Path(receipt['session_cwd']).resolve(), receipt
     assert ran['stderr'] == 'key=', receipt
     assert receipt['dangerous'].get('message') == 'dangerous_command', receipt
-    assert receipt['sessionless'] == 4001, receipt
+    sessionless = receipt['sessionless']
+    assert isinstance(sessionless, dict) and sessionless.get('code') == 0, receipt
+    assert Path(sessionless['stdout'].strip()).resolve() == Path(receipt['owner_cwd']).resolve(), receipt
 
 
 @pytest.mark.asyncio
@@ -73,3 +75,45 @@ async def test_shell_exec_refusal_names_a_sandboxed_terminal_backend(tmp_path, m
         terminal['TERMINAL_ENV'] = 'local'
         ran = await call()
         assert ran.get('result', {}).get('stdout', '').strip() == 'ran', ran
+
+
+@pytest.mark.asyncio
+async def test_shell_exec_sessionless_dispatch(tmp_path):
+    """Sessionless shell.exec (used by desktop plugins and tooling) runs in the owner cwd (#143503)."""
+    from types import SimpleNamespace
+
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_controls import AuthorityConnection
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    with SessionDB(db_path=tmp_path / 'state.db') as db:
+        epoch = begin_runtime_epoch(db, instance_id='current')
+        authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id=str(home),
+                                     instance_id='current', db=db, epoch=epoch)
+        connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
+
+        # Succeeded sessionless command
+        ran = await connection.dispatch({'id': 1, 'method': 'shell.exec',
+                                         'params': {'command': 'echo sessionless_ok'}})
+        assert ran.get('result', {}).get('stdout', '').strip() == 'sessionless_ok', ran
+        assert ran.get('result', {}).get('code') == 0, ran
+
+        # Dangerous command is blocked
+        danger = await connection.dispatch({'id': 2, 'method': 'shell.exec',
+                                           'params': {'command': 'rm -rf /'}})
+        assert danger.get('error', {}).get('message') == 'dangerous_command', danger
+
+        # Empty command is refused
+        empty = await connection.dispatch({'id': 3, 'method': 'shell.exec',
+                                          'params': {'command': '   '}})
+        assert empty.get('error', {}).get('code') == 4001, empty
+
+        # Connection without session:control capability is refused
+        no_perm = AuthorityConnection(authority, object(), {'user_id': 'guest', 'capabilities': ['session:read']})
+        refused_perm = await no_perm.dispatch({'id': 4, 'method': 'shell.exec',
+                                               'params': {'command': 'echo fail'}})
+        assert refused_perm.get('error', {}).get('message') == 'permission_denied', refused_perm
+
