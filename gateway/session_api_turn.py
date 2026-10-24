@@ -155,8 +155,8 @@ def admit_api_steps(adapter, **kwargs):
     route = settings.get('route')
     if route and route.get('api_key'):
         alias = settings.get('requested_model')
-        configured = adapter._model_routes.get(alias)
-        if configured != route:
+        configured = adapter._model_routes.get(alias) if alias else None
+        if configured != route and route not in getattr(adapter, '_model_routes', {}).values():
             raise RuntimeStoreError('permission_denied')
         settings['route'] = {k: v for k, v in route.items() if k != 'api_key'}
     payload = json.loads(_json({'text': kwargs['user_message'], 'api_turn_v1': {

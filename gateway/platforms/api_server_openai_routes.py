@@ -748,6 +748,8 @@ class OpenAICompatRoutesMixin:
         route = self._resolve_route(model_alias)
         overrides = _request_agent_overrides(
             body, virtual_model=self._model_name, allow_bare_model=self._direct_model_requests)
+        if route and not overrides.get("requested_model") and model_alias:
+            overrides["requested_model"] = model_alias
         err = self._request_route_conflict_error(
             session_id=session_id, gateway_session_key=gateway_session_key,
             requested_model=overrides.get("requested_model"),

@@ -2637,6 +2637,30 @@ class TestModelRoutesHandlers:
                     "model": "minimax/minimax-m1", "provider": "openrouter",
                 }
 
+    @pytest.mark.asyncio
+    async def test_chat_completions_route_with_api_key_sets_requested_model(self):
+        """When direct_model_requests is false (default), requesting a model_routes alias
+        with an api_key must preserve requested_model so admission check passes (#144082)."""
+        routes = {"agent-thinking": {"model": "custom/model", "provider": "custom", "api_key": "dummy"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "agent-thinking",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                assert resp.status == 200
+                kwargs = mock_run.call_args.kwargs
+                assert kwargs.get("route") == {
+                    "model": "custom/model", "provider": "custom", "api_key": "dummy",
+                }
+                assert kwargs.get("requested_model") == "agent-thinking"
+
 
 class TestModelRoutesAgentCreation:
 
