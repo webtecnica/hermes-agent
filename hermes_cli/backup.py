@@ -495,6 +495,8 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False, dir=str(out_path.parent)) as tmp:
         tmp_db = Path(tmp.name)
     try:
+        if not abs_path.exists():
+            raise FileNotFoundError(f"Database vanished before snapshot: {abs_path}")
         if not _safe_copy_db(abs_path, tmp_db):
             return None
         _write_zip_file(zf, tmp_db, str(rel_path))
@@ -525,6 +527,9 @@ def _write_zip_entries(
                 _write_zip_file(zf, abs_path, str(rel_path))
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
+        except FileNotFoundError:
+            logger.debug("backup skipping vanished file path=%s rel=%s", abs_path, rel_path)
+            continue
         except (PermissionError, OSError, ValueError) as exc:
             on_error(rel_path, exc)
             continue
@@ -647,6 +652,9 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             try:
                 _write_zip_file(zf, abs_path, arcname)
                 total_bytes += abs_path.stat().st_size
+            except FileNotFoundError:
+                logger.debug("backup skipping vanished external file path=%s arcname=%s", abs_path, arcname)
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"{arcname}: {exc}")
     elapsed = time.monotonic() - t0

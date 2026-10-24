@@ -139,3 +139,38 @@ def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatc
     assert _write_full_zip_backup(archive, home) is None
     assert archive.read_bytes() == b"previous-valid-backup"
     assert list(tmp_path.glob(".*.partial")) == []
+
+
+def test_write_zip_entries_skips_vanished_file_without_error(tmp_path) -> None:
+    import zipfile
+    from hermes_cli.backup import _write_zip_entries
+
+    home = tmp_path / "home"
+    home.mkdir()
+    f1 = home / "a.txt"
+    f1.write_bytes(b"hello")
+    f2 = home / "vanished.txt"
+    f2.write_bytes(b"temp")
+
+    # Files discovered in scan phase
+    files = [(f1, Path("a.txt")), (f2, Path("vanished.txt"))]
+
+    # Delete f2 before archive phase
+    f2.unlink()
+
+    errors = []
+    out_zip = tmp_path / "out.zip"
+    with zipfile.ZipFile(out_zip, "w") as zf:
+        total = _write_zip_entries(
+            zf, files, out_zip,
+            on_db_failure=lambda r: errors.append(f"db: {r}"),
+            on_error=lambda r, e: errors.append(f"{r}: {e}"),
+            on_progress=lambda i: None,
+            track_bytes=True,
+        )
+
+    assert errors == []
+    assert total == len(b"hello")
+    with zipfile.ZipFile(out_zip, "r") as zf:
+        assert zf.namelist() == ["a.txt"]
+
