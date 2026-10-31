@@ -57,13 +57,17 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
-    # Branch D: pkill/kill of the gateway process, both token orders. Leading \b keeps "skill" from
-    # matching as "kill".
+    # Branch D: pkill/kill of the gateway process, both token orders. The leading `(?<![\w.])` keeps
+    # "skill" from matching as "kill" (a word tail) AND a Python member call from matching as one (#147020):
+    # in `server.kill()` / `self._proc.kill()` the name after the dot is an attribute, never the executed
+    # command, so the gateway prose later on the line (`print("hermes gateway")`) is not its target. Every
+    # real command position still matches — text start, whitespace, `;`/`&`/`|`, `$(`, backtick, and a path
+    # component (`/usr/bin/kill`, `./kill`), which keeps a wrapper or a script spelling blocked.
     # `taskkill` / `Stop-Process` are the Windows spellings of the same operation; `\bp?kill\b`
     # cannot reach inside `taskkill`, so they are named outright. Service-control forms (`net stop`,
     # `sc stop`) presuppose a service install this guard has no evidence of and stay uncovered.
-    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    r"|(?:(?<![\w.])(?:p?kill|taskkill|stop-process)\b[^\n]*\bhermes\b[^\n]*\bgateway)"
+    r"|(?:(?<![\w.])(?:p?kill|taskkill|stop-process)\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
 
 # Branch E: process killers whose TARGET is the interpreter image hosting the gateway. A supervised
@@ -204,7 +208,7 @@ def contains_host_interpreter_kill(text: str) -> bool:
     name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
     argv lists resolve the same way the shell resolves them."""
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    normalized = _command_text(text)
     kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
     for segment in _iter_command_segments(normalized):
         joined = " ".join(segment)
@@ -228,6 +232,31 @@ def contains_host_interpreter_kill(text: str) -> bool:
 # before matching, mirroring what the shell itself does, rather than loosening `[^\n]*` and risking false
 # positives across genuinely separate lines.
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
+
+# Attribute access spelled with spaces (`server . kill()`), folded to the canonical `server.kill()` so a
+# single fixed-width lookbehind can see the dot. Only whitespace AROUND a dot between two word characters
+# is touched: `hermes . gateway` becomes `hermes.gateway`, which no branch required anyway (a shell runs
+# that as three words), and a path dot (`./kill`, `../bin`) has no word character on both sides. (#147020)
+_MEMBER_ACCESS_SPACING = re.compile(r"(?<=[A-Za-z0-9_])[ \t]*\.[ \t]*(?=[A-Za-z0-9_])")
+
+# The two-character escape `\n` (`\r\n`, `\r`) inside serialized code is a physical line break once that
+# string is evaluated, so the `[^\n]*` between a branch's verb and its gateway token must not walk across
+# it: a killer on one line and gateway prose on the next are two statements, not one command. Only the
+# escape spelling is folded — an escaped backslash (`\\n`: a literal backslash plus `n`) stays inert data.
+_ESCAPED_LINE_BREAK = re.compile(r"(?<!\\)\\(?:r\\n|n|r)")
+
+
+def _command_text(text: str) -> str:
+    """The shell's view of *text* for the direct scans.
+
+    Continuation lines collapse to a space (as the shell does), attribute-access spacing folds to the
+    canonical dot, and escaped line breaks in serialized code become physical lines. Every step is
+    text-shape normalization that runs BEFORE matching: folding a member call removes a verb that is
+    not a command, and restoring a line break only ever shortens a span the `[^\n]*` branches could
+    bridge — neither can turn a non-command into one. (#147020)
+    """
+    folded = _MEMBER_ACCESS_SPACING.sub(".", _SHELL_LINE_CONTINUATION.sub(" ", text))
+    return _ESCAPED_LINE_BREAK.sub("\n", folded)
 
 # Python argv-list punctuation (`subprocess.run(["launchctl", "bootout", ...])`) separates exec'd
 # words with brackets/commas. Stripped only for the token-join re-scan, never from raw text.
@@ -398,7 +427,9 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     Python source); profile-flag form; the same regex on each shell-tokenized segment with quotes/
     escapes resolved (closes splice bypasses like ``kick"start"`` / ``kick\\start``);
     order-independent launchctl pass. Single choke point for every recursion level of
-    ``_contains_unsafe_gateway_action``.
+    ``_contains_unsafe_gateway_action``. Every pass reads ``_command_text``'s normalized text, so a
+    Python member call (``server.kill()``) is never read as a command verb and a serialized ``\\n``
+    escape is a physical line break rather than a bridge between two statements (#147020).
 
     That second pass exists because a real shell resolves quote-splicing (``kick"start"``) and
     backslash-escaping (``kick\\start``) into one literal word — ``kickstart`` — before the command ever
@@ -421,7 +452,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
     text = strip_inert_heredoc_bodies(text)
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    normalized = _command_text(text)
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
         return True
     # Profile-flag form: blocked only when the named profile IS the one running the guard.
@@ -763,7 +794,7 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     nothing), then re-scan with data-sink arguments masked; only a surviving match blocks."""
     if not contains_gateway_lifecycle_command(text):
         return False
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    normalized = _command_text(text)
     return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
 
 

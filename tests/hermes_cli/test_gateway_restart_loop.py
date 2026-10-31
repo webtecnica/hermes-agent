@@ -81,6 +81,43 @@ class TestGatewayLifecyclePattern:
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
 
     @pytest.mark.parametrize("text", [
+        # #147020: a Python member call is not a command verb. The dot between owner and attribute
+        # is attribute access, not the command position a shell sees before `kill`; the gateway
+        # token on the same line is prose (a print, a comment), not the killer's target.
+        'server.kill(); print("hermes gateway")',
+        "await server . kill()  # hermes gateway note",
+        "self._proc.kill()  # SIGTERM is what hermes gateway would need",
+        # The same shape in serialized code, where the escaped break used to let the line-crossing
+        # `[^\\n]*` walk from the attribute call into the next physical line.
+        "code = \"session.kill()\\nprint('hermes gateway')\"",
+    ])
+    def test_python_member_calls_are_not_kill_commands(self, text):
+        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
+        # #147020: in serialized code the two-character escape is a physical line break once the
+        # string is evaluated. The killer sits on the first line, the gateway words on the second,
+        # so they are not one command — no branch may span the break.
+        "code = 'kill 4242'\\nlog('hermes gateway restarted')",
+        "note = 'kill -9 46544'\\nthis describes the hermes gateway deploy",
+    ])
+    def test_escaped_line_break_in_serialized_code_does_not_join_lines(self, text):
+        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
+        # The boundary is the attribute dot ONLY: every real killer spelling next to a member call
+        # keeps blocking, paths included.
+        'pkill -f "hermes gateway"',
+        "sudo pkill -9 hermes gateway",
+        "/usr/bin/pkill -f 'hermes gateway'",
+        "./kill -f hermes gateway",
+        'bash -c "pkill -f hermes gateway"',
+        "kill $(pgrep -f 'hermes gateway')",
+    ])
+    def test_real_kill_forms_stay_blocked(self, text):
+        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
         # #62891: a blocked direct restart/kill laundered through a NEW
         # launchd keepalive job wrapping a helper script, instead of a
         # direct kickstart/unload/stop/restart on the existing service.
