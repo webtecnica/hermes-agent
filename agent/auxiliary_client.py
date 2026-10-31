@@ -1033,13 +1033,18 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> tuple[bool, Optional[Any]]:
-    """Return (pool_exists_for_provider, selected_entry)."""
+def _select_pool_entry(provider: str, *, model: Optional[str] = None) -> tuple[bool, Optional[Any]]:
+    """Return (pool_exists_for_provider, selected_entry).
+
+    *model* scopes the selection to that model's cooldowns (``CredentialPool.select``). Callers
+    that resolve a credential for a non-chat request must pass it, or a chat model's cooldown
+    benches them (#146984).
+    """
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        return True, pool.select(model=model)
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
@@ -2106,13 +2111,19 @@ def _resolve_xai_oauth_for_aux() -> Optional[tuple[str, str]]:
     return _creds_pair(creds)
 
 
-def _resolve_codex_credential_and_base() -> tuple[Optional[str], str]:
+def _resolve_codex_credential_and_base(*, model: Optional[str] = None) -> tuple[Optional[str], str]:
     """``(token, base_url)`` taken from ONE authority, so a Codex key is only ever sent to the host
     it belongs to (#121486): the profile-scoped ``HERMES_CODEX_BASE_URL`` wins; otherwise a pooled
     key goes where that pool entry routes (row URL / ``model.base_url``) and the auth.json OAuth
-    token goes to the ChatGPT default. ``(None, <base>)`` without a usable token."""
+    token goes to the ChatGPT default. ``(None, <base>)`` without a usable token.
+
+    *model* is the model the caller is about to request. Pass it whenever that is not the chat
+    model: an unscoped selection benches a credential on ANY active model cooldown, so a chat
+    model the account cannot use would otherwise report a provider that is fine for *model* as
+    unusable (#146984).
+    """
     override = _codex_base_url_override()
-    pool_present, entry = _select_pool_entry("openai-codex")
+    pool_present, entry = _select_pool_entry("openai-codex", model=model)
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
