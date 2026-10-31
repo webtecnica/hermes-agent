@@ -1764,6 +1764,13 @@ def delete_profile(name: str, yes: bool = False) -> Path:
         if _closed:
             print(f"✓ Released {_closed} session database connection(s) held by this process")
 
+    # Drop this profile's cached PluginManager, its imported plugin modules and their threads: a
+    # process that merely touched the profile (a dashboard request, a kanban dispatch) must not keep
+    # serving its plugins after the home is gone (#146992).
+    with contextlib.suppress(Exception):
+        from hermes_cli.plugins import evict_plugin_manager_for_home
+        evict_plugin_manager_for_home(profile_dir)
+
     # The Desktop serve process routes its agent/errors logs for every profile through one
     # QueueListener. On Windows those ConcurrentRotatingFileHandler instances retain their
     # ``.__*.lock`` files until explicitly closed, so rmtree otherwise fails with WinError 32.

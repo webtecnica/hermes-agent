@@ -2639,6 +2639,42 @@ def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
             reset_hermes_home_override(home_token)
 
 
+@contextlib.contextmanager
+def _foreign_profile_plugin_scope(hermes_home: str) -> Iterator[None]:
+    """Resolve a foreign profile's toolsets WITHOUT importing that profile's plugins here.
+
+    ``_get_platform_tools`` needs the profile's plugin toolset keys. On this process's OWN profile
+    they come from its live registry; on a foreign home they come from the inventory that profile
+    persists when it discovers its plugins (``cache/plugin_toolset_keys.json``), so the pin the
+    worker receives is unchanged. A discovery here would run every ``register()`` of a profile the
+    dispatcher is only building a command line for — threads, DB handles — and leave its
+    ``PluginManager`` and imported modules resident in ``_plugin_managers_by_home`` for the rest of
+    the gateway's life, one per dispatched profile, surviving that profile's deletion (#146992).
+    """
+    from hermes_cli.plugins_discovery import suppress_plugin_discovery
+
+    scope = contextlib.nullcontext() if _is_own_home(hermes_home) else suppress_plugin_discovery()
+    with scope:
+        yield
+
+
+def _is_own_home(hermes_home: str) -> bool:
+    """Whether *hermes_home* is the profile THIS process serves (never evicted, never suppressed)."""
+    from hermes_constants import get_process_hermes_home
+
+    try:
+        return str(Path(hermes_home).resolve()) == str(Path(get_process_hermes_home()).resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
+def _release_foreign_profile_plugin_state(hermes_home: str) -> None:
+    """Drop any manager the resolution left behind for a foreign home (defence in depth)."""
+    from hermes_cli.plugins import evict_plugin_manager_for_home
+
+    evict_plugin_manager_for_home(hermes_home)
+
+
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
@@ -2647,6 +2683,9 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     profile whose top-level ``toolsets`` is only the kanban orchestrator
     surface. ``model_tools`` still appends the task-scoped kanban lifecycle
     tools when ``HERMES_KANBAN_TASK`` is set.
+
+    A foreign profile is read, never loaded: its plugin toolset keys come from its own persisted
+    inventory and its manager is released before the call returns (#146992).
     """
     if not hermes_home:
         return None
@@ -2655,8 +2694,9 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         from hermes_cli.tools_config import _get_platform_tools
 
         with _worker_profile_scope(hermes_home):
-            cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            with _foreign_profile_plugin_scope(hermes_home):
+                cfg = load_config()
+                toolsets = sorted(_get_platform_tools(cfg, "cli"))
         return toolsets or None
     except Exception as exc:
         _kb._log.debug(
@@ -2665,6 +2705,15 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+    finally:
+        try:
+            _release_foreign_profile_plugin_state(hermes_home)
+        except Exception as exc:
+            _kb._log.debug(
+                "kanban worker: could not release plugin state for HERMES_HOME=%r (%s)",
+                hermes_home,
+                exc,
+            )
 
 
 _retagged_workspace_roots: set[str] = set()

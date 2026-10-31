@@ -1648,6 +1648,37 @@ def get_plugin_manager() -> PluginManager:
     return manager
 
 
+def evict_plugin_manager_for_home(home: str | Path) -> bool:
+    """Drop the cached manager for a home this process does not serve, with its plugin state.
+
+    A process that only READS a foreign profile — the kanban dispatcher pinning an assignee's
+    toolsets, a profile delete — must not keep that profile's manager, and the modules/threads its
+    ``register()`` imported, for the rest of the process's life (#146992). The process's own home is
+    never evicted: its manager is the one this process serves, and dropping it would tear down live
+    plugin registrations. Returns whether an entry was removed.
+    """
+    global _plugin_manager
+    try:
+        key = Path(home).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+    if key == _plugin_home_key():
+        return False
+    with _plugin_managers_lock:
+        manager = _plugin_managers_by_home.pop(key, None)
+        if manager is None:
+            return False
+        _clear_plugin_submodules(manager)
+        try:
+            manager.unload()
+        except Exception:
+            logger.debug("evicted plugin-manager unload failed", exc_info=True)
+        if _plugin_manager is manager:
+            # Never leave the module-level slot pointing at a manager this cache no longer owns.
+            _plugin_manager = None
+    return True
+
+
 def _reset_plugin_managers_for_tests() -> None:
     """Test-only: drop every cached manager and its submodules for a fully clean slate."""
     global _plugin_manager, _published_gateway_message_injector, _published_tui_message_injector
@@ -1690,7 +1721,14 @@ def discover_plugins(force: bool = False) -> None:
     if safe_worker_enabled():
         return
     _join_background_discovery()
-    get_plugin_manager().discover_and_load(force=force)
+    manager = get_plugin_manager()
+    first_sweep = force or not manager._discovered
+    manager.discover_and_load(force=force)
+    if first_sweep and manager._discovered:
+        # The persisted inventory is what a process that must NOT import this home's plugins reads
+        # instead (#146992: the kanban dispatcher pinning a worker's toolsets), so every surface that
+        # discovers plugins — not only the interactive CLI's background scan — leaves it fresh.
+        _persist_plugin_toolset_keys()
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
@@ -1751,19 +1789,36 @@ def _persist_plugin_toolset_keys() -> None:
         logger.debug("plugin toolset key persist failed", exc_info=True)
 
 
+def _persisted_plugin_set(cache_field: str) -> Optional[set[str]]:
+    """This home's persisted plugin inventory (``cache/plugin_toolset_keys.json``), or None when it
+    was never written — read without importing a single plugin."""
+    try:
+        blob = json.loads(_plugin_toolset_keys_cache_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    values = blob.get(cache_field) if isinstance(blob, dict) else None
+    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+        return None
+    return set(values)
+
+
 def _nowait_plugin_set(cache_field: str, live: Callable[[PluginManager], set[str]]) -> set[str]:
     """Shared body of the ``*_nowait`` probes: live registry, else last launch's cache, else block."""
+    if plugin_discovery_suppressed():
+        # A config-only read of a profile this process must not import plugins for (the kanban
+        # dispatcher pinning a worker's toolsets, #146992): serve that profile's persisted inventory
+        # and build no manager at all. A manager here would run the foreign plugins' ``register()``
+        # and keep their threads resident in this process for the rest of its life.
+        return _persisted_plugin_set(cache_field) or set()
     manager = get_plugin_manager()
     t = _background_discovery_thread
     in_flight = t is not None and t.is_alive()
     if manager._discovered and not in_flight:
         return live(manager)
     if in_flight:
-        with suppress(Exception):
-            blob = json.loads(_plugin_toolset_keys_cache_path().read_text(encoding="utf-8-sig"))
-            values = blob.get(cache_field) if isinstance(blob, dict) else None
-            if isinstance(values, list) and all(isinstance(v, str) for v in values):
-                return set(values)
+        persisted = _persisted_plugin_set(cache_field)
+        if persisted is not None:
+            return persisted
     discover_plugins()
     return live(manager)
 
