@@ -118,6 +118,26 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert "Credits balance: $12.50" in snapshot.details
 
 
+def test_fetch_account_usage_anthropic_utilization_is_already_percent(monkeypatch):
+    """The OAuth usage API returns ``utilization`` already as a percentage (0-100): a value of
+    ``1`` means 1% used, not a 0-1 fraction that must be scaled by 100 (#147006)."""
+    payload = {
+        "five_hour": {"utilization": 1},
+        "seven_day": {"utilization": 87},
+    }
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda: "mock-oauth-token")
+    monkeypatch.setattr("agent.account_usage._is_oauth_token", lambda token: True)
+    monkeypatch.setattr("agent.account_usage._get_json", lambda url, headers, timeout: payload)
+
+    snapshot = fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    lines = render_account_usage_lines(snapshot)
+    assert "Current session: 99% remaining (1% used)" in lines
+    assert "Current week: 13% remaining (87% used)" in lines
+    assert [window.used_percent for window in snapshot.windows] == [1.0, 87.0]
+
+
 def _register_profile(monkeypatch, profile):
     import providers
 
