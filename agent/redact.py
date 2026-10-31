@@ -316,6 +316,20 @@ _YAML_ASSIGN_RE = re.compile(
     rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
     re.IGNORECASE | re.MULTILINE,
 )
+# Quoted YAML scalar under an (unquoted) key -- ``api_key: "..."`` /
+# ``secret: '...'`` (#147240). _YAML_ASSIGN_RE deliberately skips a value that
+# opens with a quote, and _JSON_FIELD_RE only fires on a double-QUOTED KEY, so
+# ``db_password: "..."`` matched neither pass and the value reached the log,
+# the prompt and the transcript in cleartext. Each alternative keeps the OTHER
+# quote character legal inside the value (``"don't"``, ``'say "hi"'``) and lets
+# the value carry spaces and ``#``; the closing quote must sit at the end of the
+# line (optionally before a YAML comment) so a credential-named key whose value
+# merely CONTAINS an apostrophe, e.g. ``note: it's fine``, is not swept in.
+_YAML_QUOTED_ASSIGN_RE = re.compile(
+    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)"
+    rf"(:[ \t]*+)(?:\"(?P<dq>[^\"\n]*)\"|'(?P<sq>[^'\n]*)')(?=[ \t]*(?:#|$))",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Word-boundary validation for the key patterns above: their classes allow
 # arbitrary affixes (``client_secret``, ``s3.secret-key``), which also matched
@@ -837,6 +851,22 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+def _quoted_assignment_sub(mask):
+    """re.sub callback for a QUOTED ``key: "value"`` scalar (#147240).
+
+    Only the value body is replaced, so the surrounding quotes (and any trailing
+    YAML comment) survive and the line stays valid YAML."""
+    def _sub(m):
+        value = m.group("sq") if m.group("sq") is not None else m.group("dq")
+        quote = "'" if m.group("sq") is not None else '"'
+        # An empty scalar leaks nothing, and _should_redact_assignment() would
+        # rewrite it into a mask that is NOT a valid empty YAML scalar.
+        if not value or not _should_redact_assignment(m.group(1), value, check_keyword=True):
+            return m.group(0)
+        return f"{m.group(1)}{m.group(2)}{quote}{mask(value)}{quote}"
+    return _sub
+
+
 def _assignment_sub(render, *, check_keyword: bool):
     """re.sub callback: keep the match unless the key/value pair (groups[0], groups[-1]) needs redaction."""
     def _sub(m):
@@ -891,10 +921,13 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     if ":" in text and "'" in text:
         text = _redact_python_repr_fields(text)
 
-    # YAML after JSON: quoted values are handled there (_YAML_ASSIGN_RE skips quotes).
+    # YAML after JSON. Unquoted scalars go through _YAML_ASSIGN_RE; a quoted
+    # scalar (``db_password: "..."``) is only reachable through the quoted pass —
+    # _JSON_FIELD_RE needs a QUOTED key, so it never saw the unquoted-key form.
     if ":" in text and "://" not in text:
         text = _YAML_ASSIGN_RE.sub(
             _assignment_sub(lambda g: f"{g[0]}{g[1]}{mask(g[2])}", check_keyword=True), text)
+        text = _YAML_QUOTED_ASSIGN_RE.sub(_quoted_assignment_sub(mask), text)
     return text
 
 
