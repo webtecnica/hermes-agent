@@ -242,6 +242,75 @@ class TestResolveTaskProviderModel:
         assert model is None
 
 
+class TestConfigModelAutoSentinelProviderScope:
+    """`auxiliary.<task>.model: auto` is a sentinel only where Hermes owns the model id.
+
+    A custom (or named custom) endpoint may legitimately serve a model literally called
+    ``auto``; dropping that id made the aux lane inherit the main model and 404 forever
+    (#146983). Builtin providers keep the sentinel: ``auto`` is never one of their ids.
+    """
+
+    @staticmethod
+    def _task_config(**overrides):
+        return {"provider": "custom", "base_url": "http://relay.local/v1", "api_key": "k", **overrides}
+
+    def test_custom_provider_keeps_literal_auto_model(self, monkeypatch):
+        task_config = self._task_config(model="auto")
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: task_config)
+
+        resolved_provider, model, base_url, _api_key, _api_mode = _resolve_task_provider_model(task="compression")
+
+        assert resolved_provider == "custom"
+        assert base_url == "http://relay.local/v1"
+        assert model == "auto"
+
+    def test_custom_provider_keeps_case_variant_auto_model(self, monkeypatch):
+        task_config = self._task_config(model="AUTO")
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: task_config)
+
+        _provider, model, _base_url, _api_key, _api_mode = _resolve_task_provider_model(task="compression")
+
+        assert model == "AUTO"
+
+    def test_named_custom_provider_keeps_literal_auto_model(self, monkeypatch):
+        task_config = {"provider": "beans", "model": "auto"}
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: task_config)
+
+        resolved_provider, model, _base_url, _api_key, _api_mode = _resolve_task_provider_model(task="compression")
+
+        assert resolved_provider == "beans"
+        assert model == "auto"
+
+    @pytest.mark.parametrize("provider", ["anthropic", "openrouter", "openai", "auto"])
+    def test_builtin_provider_still_normalizes_auto_model(self, monkeypatch, provider):
+        """Current behavior preserved: on a first-class lane `auto` means inherit."""
+        task_config = {"provider": provider, "model": "auto"}
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: task_config)
+
+        _resolved_provider, model, _base_url, _api_key, _api_mode = _resolve_task_provider_model(task="compression")
+
+        assert model is None
+
+    def test_literal_auto_reaches_the_custom_client(self, monkeypatch):
+        """End to end: the id resolved from config is the one handed to the custom client."""
+        import agent.auxiliary_client as ac
+
+        task_config = self._task_config(model="auto")
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: task_config)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task="compression")
+        with patch.object(ac, "_create_openai_client", side_effect=lambda **kwargs: MagicMock()):
+            client, client_model = resolve_provider_client(
+                resolved_provider, model=model,
+                explicit_base_url=base_url, explicit_api_key=api_key, api_mode=api_mode,
+            )
+
+        assert client is not None
+        assert client_model == "auto"
+
+
 class TestMoaAggregatorSharedResolution:
     """The shared MoA→aggregator helper and the layers that consume it.
 
@@ -1431,6 +1500,32 @@ class TestIsModelNotFoundError:
         )
         exc.status_code = 404
         # billing keyword wins — payment owns it
+        assert _is_model_not_found_error(exc) is False
+
+    @pytest.mark.parametrize("message", [
+        "Error code: 404 - {'error': {'message': 'The model `auto` is not in the catalog.'}}",
+        "model auto is not in the catalog",
+        "Requested model 'grok-4.5' not in the catalog for this provider",
+    ])
+    def test_catalog_404_is_model_not_found(self, message):
+        """A dropped/id-unknown model answered as "is not in the catalog" must
+        advance the fallback chain instead of aborting it (#146983)."""
+        exc = Exception(message)
+        exc.status_code = 404
+        assert _is_model_not_found_error(exc) is True
+
+    def test_generic_500_is_not_model_not_found(self):
+        """A 500 is an upstream fault, not a stale model id — routing it to the
+        chain would hide the outage behind a different provider."""
+        exc = Exception("Internal error: model lookup failed, catalog unavailable")
+        exc.status_code = 500
+        assert _is_model_not_found_error(exc) is False
+
+    def test_other_family_not_available_is_not_model_not_found(self):
+        """No false positive: availability wording from another provider family
+        stays out of the not-found bucket."""
+        exc = Exception("The model 'o5' is not available for this organization.")
+        exc.status_code = 404
         assert _is_model_not_found_error(exc) is False
 
 

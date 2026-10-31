@@ -537,6 +537,8 @@ _LOCAL_SERVER_ALIASES = {
 }
 
 _ALIAS_TABLE: Optional[dict[str, str]] = None
+# Cached provider names Hermes routes itself (see _provider_lane_names()).
+_PROVIDER_LANE_NAMES: Optional[frozenset] = None
 
 
 def _provider_alias_table() -> dict[str, str]:
@@ -572,6 +574,43 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
             return "custom"
         normalized = main_prov
     return _provider_alias_table().get(normalized, normalized)
+
+
+def _provider_lane_names() -> frozenset:
+    """Every provider name Hermes itself routes (registry, alias table, plugin providers, direct
+    API aliases). Cached: discovery is a filesystem walk, and this runs on every aux resolution."""
+    global _PROVIDER_LANE_NAMES
+    if _PROVIDER_LANE_NAMES is None:
+        names: set = set(_provider_alias_table())
+        with contextlib.suppress(Exception):
+            from hermes_cli.auth import PROVIDER_REGISTRY
+            names.update(PROVIDER_REGISTRY)
+        with contextlib.suppress(Exception):
+            from providers import list_providers
+            names.update(str(p.name).strip().lower() for p in list_providers())
+        with contextlib.suppress(Exception):
+            from hermes_cli.runtime_provider_custom import _DIRECT_API_BASE_URLS
+            names.update(_DIRECT_API_BASE_URLS)
+        _PROVIDER_LANE_NAMES = frozenset(names)
+    return _PROVIDER_LANE_NAMES
+
+
+def _provider_reserves_auto_model_sentinel(provider: Optional[str]) -> bool:
+    """True when ``auto`` is Hermes's own sentinel on *provider*, not a model id.
+
+    ``auxiliary.<task>.model: auto`` means "inherit / auto-detect" — but only on a lane Hermes
+    resolves (a builtin/alias/plugin provider, or ``auto``/``main``/``moa``). A custom endpoint
+    (``custom``, ``custom:<name>``, a ``custom_providers`` name) may legitimately serve a model
+    literally called ``auto``; eating that id made the aux lane inherit the main model and answer
+    HTTP 404 on every request (#146983). Unknown names count as custom: the literal the user wrote
+    is preserved (and fails visibly) instead of being silently replaced.
+    """
+    name = str(provider or "").strip().lower()
+    if not name or name in {"auto", "main", "moa"}:
+        return True
+    if name == "custom" or name.startswith("custom:"):
+        return False
+    return name in _provider_lane_names()
 
 
 # Sentinel from _fixed_temperature_for_model(): callers strip ``temperature`` entirely.
@@ -3485,6 +3524,11 @@ def _is_model_not_found_error(exc: Exception) -> bool:
         "is not a valid model", "no such model", "model not found",
         "the model `",            # OpenAI-style: "The model `X` does not exist"
         "model_not_found", "unknown model",
+        # Catalog-relative wording ("... is not in the catalog"): the provider owns the id space
+        # and this route has no such entry, so the fallback chain must advance instead of
+        # aborting (#146983). Deliberately narrow: plain "not available"/capability phrasing
+        # belongs to other buckets.
+        "not in the catalog",
     ))
 
 
@@ -6198,7 +6242,10 @@ def _resolve_task_provider_model(
     # kwarg needs the same normalization: MoA slots forward preset `model:` fields through it.
     if model and model.lower() == "auto":
         model = None
-    if cfg_model and cfg_model.lower() == "auto":
+    # The config value is a sentinel only on a lane Hermes resolves: a custom endpoint may serve a
+    # model literally called `auto`, and eating it made the aux lane inherit the main model and
+    # 404 on every request (#146983).
+    if cfg_model and cfg_model.lower() == "auto" and _provider_reserves_auto_model_sentinel(provider or cfg_provider):
         cfg_model = None
     resolved_model = model or cfg_model
     # Any moa:// facade endpoint belongs to the facade, not the aggregator's real provider —
