@@ -816,6 +816,11 @@ def finalize_turn(
     _leftover_steer = (getattr(agent, "_drain_leftover_steer", None) or agent._drain_pending_steer)()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+        # The admission flag of the drained batch rides with the text: the follow-up turn it becomes is
+        # a real user row, so an unaddressed one may still end on a bare silence marker (#147041).
+        _leftover_reply_expected = getattr(agent, "_steer_leftover_reply_expected", None)
+        if _leftover_reply_expected is not None:
+            result["pending_steer_reply_expected"] = _leftover_reply_expected
     agent._response_was_previewed = False
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:

@@ -168,10 +168,14 @@ class GatewayBusySessionMixin:
         keeps its usual place ahead of that event instead of vanishing.
         """
         leftover_steer = (result.get("pending_steer") or "").strip()
+        leftover_reply_expected = result.get("pending_steer_reply_expected")
         if leftover_steer:
             steer_prompt, steer_source = self._pinned_channel_inputs(session_key, None, source, internal=True)
             self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
-            pending_event = MessageEvent(text=leftover_steer, source=steer_source, channel_prompt=steer_prompt)
+            pending_event = MessageEvent(
+                text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
+                reply_expected=leftover_reply_expected,
+            )
         adapter._pending_messages[session_key] = pending_event
         logger.info("Deferring queued follow-up for session %s until after its compression-exhausted reset", session_key)
 
@@ -183,6 +187,7 @@ class GatewayBusySessionMixin:
         the next user turn when nothing else is pending, otherwise ahead of / behind it in the FIFO."""
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
         if leftover_steer:
+            leftover_reply_expected = result.get("pending_steer_reply_expected")
             if not pending and not pending_event:
                 pending = leftover_steer
                 logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
@@ -218,9 +223,14 @@ class GatewayBusySessionMixin:
                 )
                 steer_event = MessageEvent(
                     text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
+                    reply_expected=leftover_reply_expected,
                 )
                 if session_key:
                     self._enqueue_fifo(session_key, steer_event, adapter)
+                # The steer is a queued event now, not this turn's pending text: its admission flag
+                # travels on that event and must not be read as the interrupting text's (#147041).
+                if isinstance(result, dict):
+                    result.pop("pending_steer_reply_expected", None)
                 logger.debug(
                     "Enqueued leftover /steer behind pending message for session %s: '%s...'",
                     session_key or "?", leftover_steer[:40],
@@ -404,10 +414,17 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
-        """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
+    def _steer_running_agent(
+        self, running_agent: Any, text: str, *, reply_expected: Optional[bool] = None,
+    ) -> bool:
+        """``running_agent.steer(text, reply_expected=...)`` plus fan-out to its active subagents (see
+        :meth:`_steer_active_subagents`); True when the parent or any child queued it. The admission's
+        ``reply_expected`` rides with the text so a leftover steer's follow-up turn is judged correctly.
+        An agent surface that predates the metadata parameter only ever sees the plain text call."""
+        if reply_expected is None:
+            accepted = bool(running_agent.steer(text))
+        else:
+            accepted = bool(running_agent.steer(text, reply_expected=reply_expected))
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -709,7 +726,8 @@ class GatewayBusySessionMixin:
             )
             if steer_text and (plain_text or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
                 steered = self._try_agent_verb(
-                    running_agent, "steer", steer_text, session_key, event=event
+                    running_agent, "steer", steer_text, session_key, event=event,
+                    reply_expected=event.reply_expected,
                 )
             if steered:
                 self._fold_into_running_turn(running_agent, session_key, event)
@@ -734,13 +752,14 @@ class GatewayBusySessionMixin:
         return "queue"
 
     def _try_agent_verb(
-        self, running_agent, verb: str, text: str, session_key: str, *, event: Optional[MessageEvent] = None
+        self, running_agent, verb: str, text: str, session_key: str, *, event: Optional[MessageEvent] = None,
+        reply_expected: Optional[bool] = None,
     ) -> bool:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
+                return self._steer_running_agent(running_agent, call_text, reply_expected=reply_expected)
             return bool(getattr(running_agent, verb)(call_text))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)

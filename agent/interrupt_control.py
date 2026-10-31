@@ -87,19 +87,40 @@ def _ic_slot(agent, lock_attr: str, slot: str):
     return getattr(agent, slot)
 
 
+def _steer_part(ticket, text: str, reply_expected: Optional[bool] = None) -> tuple:
+    """One buffered steer: ``(ticket, text, reply_expected)``. The admission flag rides WITH the text
+    because a steer the turn never delivers becomes the next user turn, and that turn must be judged
+    like the message that produced it (a message not addressed to the bot may stay silent)."""
+    return (ticket, text, reply_expected)
+
+
 def _steer_parts(agent) -> list:
-    """The buffered steers as ``(ticket, text)`` pairs; ``_pending_steer`` is their newline join. A ticket
-    names one submission (a gateway transfer). A buffer another writer set directly is one ticketless part."""
+    """The buffered steers as ``(ticket, text, reply_expected)`` triples; ``_pending_steer`` is their
+    newline join. A ticket names one submission (a gateway transfer). A buffer another writer set
+    directly is one ticketless part with no admission metadata."""
     pending = _ic_slot(agent, "_pending_steer_lock", "_pending_steer")
-    parts = vars(agent).get("_pending_steer_parts") or []
-    if "\n".join(text for _, text in parts) != (pending or ""):
-        return [(None, pending)] if pending else []
-    return list(parts)
+    parts = [_steer_part(*part) for part in (vars(agent).get("_pending_steer_parts") or [])]
+    if "\n".join(text for _, text, _ in parts) != (pending or ""):
+        return [_steer_part(None, pending)] if pending else []
+    return parts
 
 
 def _set_steer_parts(agent, parts: list) -> None:
     agent._pending_steer_parts = parts
-    agent._pending_steer = "\n".join(text for _, text in parts) or None
+    agent._pending_steer = "\n".join(text for _, text, _ in parts) or None
+
+
+def _steer_batch_reply_expected(flags) -> Optional[bool]:
+    """The ``reply_expected`` of several steers joined into one turn: an addressed one keeps the
+    fallback, an unknown one keeps the pre-existing behaviour, and only an all-unaddressed batch
+    answers False. The precedence is ``MessageEvent.absorb_reply_expected``'s (True > unknown > False)
+    so a steered batch is judged exactly like a merged pending message."""
+    flags = list(flags)
+    if any(flag is True for flag in flags):
+        return True
+    if any(flag is None for flag in flags):
+        return None
+    return False if flags else None
 
 
 def _steer_fates(agent) -> dict:
@@ -114,9 +135,9 @@ def requeue_drained_steer(agent, steer_text: str) -> None:
     with _ic_lock(agent, "_pending_steer_lock"):
         drained, parts = vars(agent).pop("_steer_last_drain", (None, None))
         if drained != steer_text or not parts:
-            parts = [(None, steer_text)]
-        for ticket, _ in parts:
-            _steer_fates(agent).pop(ticket, None)
+            parts = [_steer_part(None, steer_text)]
+        for part in parts:
+            _steer_fates(agent).pop(part[0], None)
         _set_steer_parts(agent, _steer_parts(agent) + parts)
 
 
@@ -301,21 +322,23 @@ class InterruptControlMixin:
             # claimed a hard interrupt supersedes the steer — but nothing gated this wipe on
             # hard_cancel, so a soft clear dropped a live user message with no trace.
             with _ic_lock(self, "_pending_steer_lock"):
-                for ticket, _ in _steer_parts(self):
-                    if ticket is not None:
-                        _steer_fates(self)[ticket] = False
+                for part in _steer_parts(self):
+                    if part[0] is not None:
+                        _steer_fates(self)[part[0]] = False
                 _set_steer_parts(self, [])
         return True
 
-    def steer(self, text: str, *, ticket=None) -> bool:
+    def steer(self, text: str, *, ticket=None, reply_expected: Optional[bool] = None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
         interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
-        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry."""
+        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
+        ``reply_expected`` is the admission's verdict on whether this message needs an answer; it rides
+        with the text, so the follow-up turn a leftover steer becomes is judged like its source."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
-            _set_steer_parts(self, _steer_parts(self) + [(ticket, cleaned)])
+            _set_steer_parts(self, _steer_parts(self) + [_steer_part(ticket, cleaned, reply_expected)])
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
         return True
@@ -401,20 +424,25 @@ class InterruptControlMixin:
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             parts = _steer_parts(self)
             _set_steer_parts(self, [])
-            for ticket, _ in parts:
-                if ticket is not None:
-                    _steer_fates(self)[ticket] = True
+            for part in parts:
+                if part[0] is not None:
+                    _steer_fates(self)[part[0]] = True
             self._steer_last_drain = (text, parts)  # requeue_drained_steer restores its tickets
         return text
 
     def _drain_leftover_steer(self) -> Optional[str]:
         """The turn finalizer's drain: return and clear the ticketless steers (they become the next user
         turn) and keep each ticketed one buffered. A transfer is never a follow-up a restart may discard:
-        settlement withdraws it and its admission goes back to its own queue place."""
+        settlement withdraws it and its admission goes back to its own queue place.
+
+        ``_steer_leftover_reply_expected`` publishes the drained batch's admission flag next to the text
+        returned, so the finalizer's result carries it to the turn the text becomes (#147041)."""
         with _ic_lock(self, "_pending_steer_lock"):
             parts = _steer_parts(self)
+            leftover = [part for part in parts if part[0] is None]
             _set_steer_parts(self, [part for part in parts if part[0] is not None])
-        return "\n".join(text for ticket, text in parts if ticket is None) or None
+        self._steer_leftover_reply_expected = _steer_batch_reply_expected(part[2] for part in leftover)
+        return "\n".join(part[1] for part in leftover) or None
 
     def withdraw_steer(self, ticket) -> bool:
         """Settle one ``steer(text, ticket=...)`` by identity (the gateway's transfer of a queued prompt):

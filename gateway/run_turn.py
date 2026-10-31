@@ -1882,7 +1882,13 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
-        next_reply_expected = pending_event.reply_expected if pending_event is not None else None
+        # A leftover /steer is a user row handed on as plain text (no event): its admission's
+        # reply_expected must ride along, or an unaddressed message whose bare silence marker is
+        # legitimate gets the visible "unexpected silence" fallback (#147041).
+        next_reply_expected = (
+            pending_event.reply_expected if pending_event is not None
+            else (result.get("pending_steer_reply_expected") if pending else None)
+        )
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
