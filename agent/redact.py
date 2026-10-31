@@ -551,6 +551,14 @@ SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "
 _SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
 _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
 
+# Cheap shape gate for _TELEGRAM_RE (#147242): the pattern needs ``\d{8,}:``
+# before it can match anything, so a text without that shape skips the pass. The
+# full scan cost 98 ms on a 2.3 MB payload while holding the GIL. Same run-start
+# lookbehind + possessive run as the pattern itself: a 100k-digit blob must not
+# be retried from every digit (that is the quadratic path the pattern already
+# had to be fixed for).
+_TELEGRAM_SHAPE_RE = re.compile(r"(?<!\d)\d{8,}+:")
+
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
 # anchors the id at the start of its digit run: without it, a long run of digits
 # with no ":<token>" after it (a Unity/YAML ``_typelessdata`` blob in a 2 MB PR
@@ -1120,7 +1128,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         if _has_secret_header_name(text):
             text = _gated_scan(text, lambda snippet: _SECRET_HEADER_RE.sub(_redact_header_value, snippet),
                               join_next=True)
-        text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
+        if _TELEGRAM_SHAPE_RE.search(text):
+            text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
