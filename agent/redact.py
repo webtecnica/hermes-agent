@@ -288,15 +288,16 @@ _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 # as the VALUE of a KEY=... match name a variable; they are not a leaked secret.
 _ENV_LOOKUP_VALUE_RE = re.compile(r"^(?:os\.(?:getenv|environ)|process\.env|\$ENV\{)")
 # Namespaced key: the secret word may sit anywhere in a dotted path.
-# NOTE(perf): possessive quantifiers (nested ``(?:[...]+\.)+`` backtracked
-# exponentially); the ``*`` runs bordering {_SECRET_CFG_NAMES} must stay
-# backtrackable (``app.api.key=``). The lookbehind anchors each attempt to a key
-# run start so re.sub is not quadratic; the match set is unchanged.
+# NOTE(perf, #147257): the run is matched WHOLE and possessively (``++``), so the
+# engine cannot split it into prefix/word/suffix combinations; the "contains a
+# dot and a word-bounded secret word" test that used to be spelled in the pattern
+# (with backtrackable ``*`` runs on both sides of the word) lives in
+# ``_cfg_dotted_sub`` and uses the same ``_key_has_secret_keyword`` the other
+# passes use. The old shape was CUBIC on a run like ``a.token`` repeated: one
+# attempt per run start, then every (word occurrence x dot) combination each
+# scanning the rest of the run.
 _CFG_DOTTED_RE = re.compile(
-    rf"(?<![A-Za-z0-9_.\-])"
-    rf"([A-Za-z0-9_\-]++\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*+"
-    rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]++)"
-    rf"={_CFG_VALUE}",
+    rf"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]++)={_CFG_VALUE}",
     re.IGNORECASE,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
@@ -305,7 +306,7 @@ _CFG_DOTTED_RE = re.compile(
 # and ``cat -n`` emits ``     7\tADS_API_TOKEN: …``. Anchored at ``^`` without it, none of those
 # matched, so the rendered read of a secret-bearing file leaked what the raw text masked.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*{_LINE_NUMBER_GUTTER}(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(^[ \t]*{_LINE_NUMBER_GUTTER}(?:export[ \t]+)?[A-Za-z0-9_\-]++)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -318,7 +319,7 @@ _CFG_ANCHORED_RE = re.compile(
 # stays backtrackable (see _CFG_DOTTED_RE).
 _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
 _YAML_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
+    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]++)(:[ \t]*+)(?!['\"])([^\s&]++)",
     re.IGNORECASE | re.MULTILINE,
 )
 # Quoted YAML scalar under an (unquoted) key -- ``api_key: "..."`` /
@@ -331,7 +332,7 @@ _YAML_ASSIGN_RE = re.compile(
 # line (optionally before a YAML comment) so a credential-named key whose value
 # merely CONTAINS an apostrophe, e.g. ``note: it's fine``, is not swept in.
 _YAML_QUOTED_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)"
+    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]++)"
     rf"(:[ \t]*+)(?:\"(?P<dq>[^\"\n]*)\"|'(?P<sq>[^'\n]*)')(?=[ \t]*(?:#|$))",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -380,7 +381,11 @@ _PASSWORD_KEY_RE = re.compile(r"passwd|password|pass|pw", re.IGNORECASE)
 # because their ``$`` fields start with a digit or carry ``=``/``,``.
 # A leading ``$(`` is a command substitution (``SSH_AUTH_SOCK=$(gpgconf --list-dirs
 # agent-ssh-socket)``): the value token stops at whitespace, so only ``$(gpgconf`` is seen.
-_SHELL_VAR_REF = r"\$(?:\{[A-Za-z_]\w*[^}]*\}|[A-Za-z_]\w*)"
+# NOTE(perf, #147257): ``\w*`` followed by ``[^}]*`` accepted the same characters,
+# so an unclosed ``${`` was retried for every split of the run (quadratic). Since
+# ``\w`` is a subset of ``[^}]``, ``[A-Za-z_][^}]*`` accepts exactly the same
+# strings and the engine has a single way to consume them.
+_SHELL_VAR_REF = r"\$(?:\{[A-Za-z_][^}]*\}|[A-Za-z_]\w*)"
 _PATH_OR_VAR_VALUE_RE = re.compile(rf"^(?:{_SHELL_VAR_REF}|\$\(|~|/)(?:[\w./:-]|{_SHELL_VAR_REF})*$")
 # ``$VAR`` / ``$(cmd`` are unambiguous references. A ``/``- or ``~``-led value is a path only
 # while every segment reads like one: a 16+ char segment mixing case and digits with no ``.``
@@ -468,6 +473,14 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
+# Same field with a key that merely CONTAINS a secret word (``"API_TOKEN"``,
+# ``"DB_PASSWORD"``, ``"client_secret"``, #147240). _JSON_KEY_NAMES above is a
+# closed list of exact names, so those keys fell through while the YAML and env
+# passes accept affixes around the word. The whole quoted key is matched
+# possessively (linear) and the closed-list policy for an exact name is left to
+# the pass above: this one only fires on a word-bounded keyword and, being the
+# second pass, never sees a value that is already a mask.
+_JSON_AFFIXED_FIELD_RE = re.compile(r'"([A-Za-z0-9_.\-]++)"\s*:\s*"([^"\n]+)"', re.IGNORECASE)
 # The same field inside a JSON-encoded string (``{"output": "{\\"api_key\\": \\"…\\"}"}``): every tool result
 # that wraps a config dump in JSON escapes the quotes, so the rule above never saw the value (#115104).
 # The backreference keeps the key's and value's escape depth equal.
@@ -566,7 +579,8 @@ _TELEGRAM_SHAPE_RE = re.compile(r"(?<!\d)\d{8,}+:")
 # quadratic, one core at 100% for hours while holding the GIL.
 _TELEGRAM_RE = re.compile(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
 
-_PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
+_PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----")
+_PRIVATE_KEY_END_RE = re.compile(r"-----END[A-Z ]*PRIVATE KEY-----")
 
 # Database connection strings: protocol://user:PASSWORD@host. The userinfo and
 # password groups forbid whitespace so a match can never span a line break (a
@@ -641,7 +655,10 @@ _TOKEN_BODY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 
 def _compile_prefix_matcher(patterns: list) -> re.Pattern[str]:
-    return re.compile(r"(?<![A-Za-z0-9_-])(" + "|".join(patterns) + r")(?![A-Za-z0-9_-])")
+    # The lookbehind only rejects a token glued to alphanumerics: ``backup-sk-…``,
+    # ``backup_sk-…`` and ``x-ghp_…`` are ordinary places for a credential to
+    # appear (file names, identifiers) and used to come back in clear (#147240).
+    return re.compile(r"(?<![A-Za-z0-9])(" + "|".join(patterns) + r")(?![A-Za-z0-9_-])")
 
 
 _PREFIX_RE = _compile_prefix_matcher(_PREFIX_PATTERNS)
@@ -864,6 +881,33 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+def _redact_private_keys(text: str) -> str:
+    """Mask every ``BEGIN … PRIVATE KEY`` block whose ``END`` line exists.
+
+    ``_PRIVATE_KEY_RE`` (``[\\s\\S]*?`` between the markers) rescanned to the end
+    of the text for EVERY BEGIN line that had no END line: a dump that repeats
+    the BEGIN marker was quadratic — minutes of CPU with the GIL held (#147242).
+    Walking the markers with a cursor is linear: once no END follows a BEGIN,
+    none follows any later BEGIN either, so the scan can stop there. The match
+    set is the same as the regex's (left to right, first END after each BEGIN,
+    nothing overlapping)."""
+    partes = []
+    pos = 0
+    for begin in _PRIVATE_KEY_BEGIN_RE.finditer(text):
+        if begin.start() < pos:
+            continue
+        fim = _PRIVATE_KEY_END_RE.search(text, begin.end())
+        if fim is None:
+            break
+        partes.append(text[pos:begin.start()])
+        partes.append("[REDACTED PRIVATE KEY]")
+        pos = fim.end()
+    if not partes:
+        return text
+    partes.append(text[pos:])
+    return "".join(partes)
+
+
 def _quoted_assignment_sub(mask):
     """re.sub callback for a QUOTED ``key: "value"`` scalar (#147240).
 
@@ -877,6 +921,23 @@ def _quoted_assignment_sub(mask):
         if not value or not _should_redact_assignment(m.group(1), value, check_keyword=True):
             return m.group(0)
         return f"{m.group(1)}{m.group(2)}{quote}{mask(value)}{quote}"
+    return _sub
+
+
+def _cfg_dotted_sub(render):
+    """re.sub callback for a NAMESPACED config key (``app.api.key=value``).
+
+    The pattern matches the key run whole and possessively; deciding whether the
+    run is a credential key (it must carry a dot AND a word-bounded secret word)
+    happens here, where ``_key_has_secret_keyword`` lives, instead of inside the
+    pattern's backtracking (#147257)."""
+    def _sub(m):
+        groups = m.groups()
+        if "." not in groups[0]:
+            return m.group(0)
+        if not _should_redact_assignment(groups[0], groups[-1], check_keyword=True):
+            return m.group(0)
+        return render(groups)
     return _sub
 
 
@@ -977,6 +1038,7 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
     _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
     _redact_yaml = _assignment_sub(lambda g: f"{g[0]}{g[1]}{mask(g[2])}", check_keyword=True)
+    _redact_cfg_dotted = _cfg_dotted_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}")
     _redact_yaml_quoted = _quoted_assignment_sub(mask)
     # The URL policy is a property of the WHOLE text (see the note near the bottom
     # of redact_sensitive_text): a text that carries ``://`` anywhere keeps its
@@ -994,7 +1056,7 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
         # key form. Neither pattern can cross a newline, so line scope is exact.
         if tem_url:
             return snippet
-        snippet = _CFG_DOTTED_RE.sub(_redact_env, snippet)
+        snippet = _CFG_DOTTED_RE.sub(_redact_cfg_dotted, snippet)
         return _CFG_ANCHORED_RE.sub(_redact_env, snippet)
 
     def _yaml_pass(snippet: str) -> str:
@@ -1019,6 +1081,9 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
         if '\\"' in text:
             text = _JSON_FIELD_ESCAPED_RE.sub(
                 _assignment_sub(lambda g: f'{g[0]}: {g[1]}"{mask(g[2])}{g[1]}"', check_keyword=False), text)
+        if _has_secret_word(text):
+            text = _JSON_AFFIXED_FIELD_RE.sub(
+                _assignment_sub(lambda g: f'"{g[0]}": "{mask(g[1])}"', check_keyword=True), text)
 
     # Python mapping repr fields ({'API_KEY': '…'}): single-quoted, so the JSON rule
     # above never sees them — the traceback / pytest-introspection leak shape.
@@ -1131,8 +1196,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         if _TELEGRAM_SHAPE_RE.search(text):
             text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
-    if "BEGIN" in text and "-----" in text:
-        text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+    if "BEGIN" in text and "-----END" in text:
+        text = _redact_private_keys(text)
 
     # Database connection string passwords. With code_file=True, a password group that is a pure ``{...}``
     # brace expression is an f-string template reference (e.g. f"postgresql://{user}:{pass}@{host}"), not a
