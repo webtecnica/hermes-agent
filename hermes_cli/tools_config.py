@@ -626,7 +626,12 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
 
     # Explicit non-configurable entries (custom toolsets, MCP server names) pass through.
     explicit_passthrough = {ts for ts in toolset_names if ts not in explicit_known_keys and ts not in platform_default_keys}
-    enabled_toolsets |= _merge_mcp_servers(config, toolset_names, explicit_passthrough, include_default_mcp_servers)
+    enabled_toolsets |= _merge_mcp_servers(
+        config, toolset_names, explicit_passthrough, include_default_mcp_servers,
+        # An explicitly saved EMPTY list is the zero-tool selection (#82010) for the MCP half too:
+        # without this it fell through to "every enabled server", which is what an ABSENT key means.
+        zero_selection=explicitly_configured and not toolset_names,
+    )
 
     # Legacy profile opt-in is a fallback only. A saved platform list (even
     # empty) is authoritative, so a later disable cannot silently re-enable it.
@@ -731,10 +736,14 @@ def _recover_platform_native_toolsets(enabled_toolsets: set[str], platform: str,
 
 
 def _merge_mcp_servers(
-    config: dict, toolset_names: list[str], explicit_passthrough: set[str], include_default_mcp_servers: bool
+    config: dict, toolset_names: list[str], explicit_passthrough: set[str], include_default_mcp_servers: bool,
+    *, zero_selection: bool = False,
 ) -> set[str]:
     """Explicit passthrough entries plus this platform's MCP servers: listed names form an allowlist, else every
-    globally enabled server (when ``include_default_mcp_servers``); the ``no_mcp`` sentinel disables all."""
+    globally enabled server (when ``include_default_mcp_servers``); the ``no_mcp`` sentinel disables all, and so
+    does an explicitly saved empty platform list (``zero_selection``), which means no tools at all (#147025)."""
+    if zero_selection:
+        return set()
     enabled_mcp_servers = enabled_mcp_server_names(config)
     configured = config.get("mcp_servers") if isinstance(config.get("mcp_servers"), dict) else {}
     known = enabled_mcp_servers | {str(name) for name in configured}

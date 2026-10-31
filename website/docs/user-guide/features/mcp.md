@@ -799,6 +799,21 @@ mcp-<server>
 
 That makes MCP servers easier to reason about at the toolset level.
 
+A platform's `platform_toolsets.<platform>` list decides which of them a session gets. A list that names
+no server gets every enabled server, so narrowing is opt-in:
+
+```yaml
+platform_toolsets:
+  telegram: [web, terminal, gh]   # only the `gh` server, plus those native toolsets
+  email: [web, no_mcp]            # native toolsets, no MCP server at all
+  slack: []                       # nothing: no native toolset and no MCP server
+```
+
+- Naming a server by `mcp-<server>` or by its bare name makes it the allowlist — only that server.
+- The `no_mcp` token keeps every configured server out while the rest of the list applies.
+- An explicitly saved empty list (`platform_toolsets.<platform>: []`) is a zero-tool selection, MCP
+  servers included. Only an **absent** key falls back to the platform default, MCP servers and all.
+
 ## Security model
 
 ### Stdio env filtering

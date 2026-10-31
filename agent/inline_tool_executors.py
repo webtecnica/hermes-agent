@@ -202,7 +202,9 @@ def _scope_in_connected_mcp_servers(agent, result: Any) -> None:
     the turn the result calls it available in. Only the selection changes; ``agent.tools`` does
     not, so the sent tool schema bytes stay the same."""
     enabled = getattr(agent, "enabled_toolsets", None)
-    if enabled is None or "no_mcp" in enabled:  # None already means every toolset
+    # None already means every toolset; an EMPTY selection is the opposite — an explicitly saved zero-tool
+    # platform list (#82010) — and must not be widened with a server the selection never asked for (#147025).
+    if not enabled or "no_mcp" in enabled:
         return
     try:
         targets = json.loads(result).get("targets") or []

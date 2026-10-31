@@ -393,7 +393,9 @@ def adopt_late_connections(agent: Any) -> list[str]:
     if not attempts:
         _LATE_ATTEMPTS.pop(key, None)
     enabled = getattr(agent, "enabled_toolsets", None)
-    if adopted and enabled is not None and "no_mcp" not in enabled:
+    # A zero-toolset selection (explicitly saved ``[]``) stays zero: adoption registers the server, it does
+    # not hand tools to a platform configured with none (#147025). ``no_mcp`` is the documented same intent.
+    if adopted and enabled and "no_mcp" not in enabled:
         agent.enabled_toolsets = [*enabled, *(n for n in adopted if n not in enabled)]
     return adopted
 

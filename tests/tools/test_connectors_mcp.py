@@ -445,8 +445,20 @@ def test_late_attempt_is_never_adopted_by_another_profile(tmp_path):
 
     adopted, registered, agent = _adopt_as(home_a)
     assert adopted == ["linear"] and registered == ["linear"]
-    assert agent.enabled_toolsets == ["linear"]
+    # A zero-toolset selection is not widened by adoption (#147025); the grant is still registered.
+    assert agent.enabled_toolsets == []
     assert mcp._LATE_ATTEMPTS == {}
+
+
+def test_an_adopted_grant_joins_a_live_selection(tmp_path):
+    """Adoption still reaches a session that has toolsets: the server joins the selection."""
+    home = _profile_home(tmp_path, "home")
+    _park_attempt(home)
+    agent = SimpleNamespace(session_id="s1", enabled_toolsets=["terminal"])
+
+    adopted, registered, agent = _adopt_as(home, agent=agent)
+    assert adopted == ["linear"] and registered == ["linear"]
+    assert agent.enabled_toolsets == ["terminal", "linear"]
 
 
 def test_late_attempt_keyed_by_detached_path_uses_calling_profile(tmp_path):
@@ -498,5 +510,6 @@ def test_e2e_carded_oauth_park_and_adopt_stay_inside_their_profile(tmp_path):
         agent_a = SimpleNamespace(session_id="s1", enabled_toolsets=[])
         with _as_home(home_a):
             assert mcp.adopt_late_connections(agent_a) == ["linear"]
-        assert registered == ["linear"] and agent_a.enabled_toolsets == ["linear"]
+        # Registered for the owner, but a zero-toolset selection stays zero (#147025).
+        assert registered == ["linear"] and agent_a.enabled_toolsets == []
         assert mcp._LATE_ATTEMPTS == {}

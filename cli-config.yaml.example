@@ -1450,6 +1450,14 @@ gateway:
 #   platform_toolsets:
 #     discord: [web, vision, skills, todo]
 #
+# MCP servers (the `mcp_servers` block below) join the selection automatically: a
+# platform whose list names no server gets every enabled one. Narrow that with:
+#   - name a server in the list    -> only that server (its tools are mcp-<name>)
+#   - add the `no_mcp` token       -> no MCP server, e.g. [web, no_mcp]
+#   - leave the list empty (`[]`)  -> no tools at all, MCP servers included
+# An absent key is NOT the empty list: it keeps the platform default below, MCP
+# servers included.
+#
 # If not set, defaults are:
 #   cli:           hermes-cli            (everything + cronjob management)
 #   telegram:      hermes-telegram       (terminal, file, web, vision, image, tts, browser, skills, todo, cronjob, messaging)
