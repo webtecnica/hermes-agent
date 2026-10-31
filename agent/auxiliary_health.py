@@ -44,10 +44,11 @@ def fallback_candidate_unavailable_reason(exc: Exception) -> Optional[str]:
     """Why a fallback candidate cannot serve this walk (``_FALLBACK_REASONS`` label), or None.
 
     The same capacity classes that admitted the primary failure into the chain (payment/quota,
-    rate limit, connection, route-incompatible model, malformed response) mean "this lane is out
-    for now, try the next configured one"; anything else (a 400 request-shape error, a ValueError)
-    is the caller's bug and must still propagate. Auth errors are excluded on purpose: they have
-    their own refresh-then-quarantine path in the candidate helpers (#106367)."""
+    rate limit, connection, route-incompatible model, a model id the lane's catalog lacks, malformed
+    response) mean "this lane is out for now, try the next configured one"; anything else (a 400
+    request-shape error, a ValueError) is the caller's bug and must still propagate. Auth errors are
+    excluded on purpose: they have their own refresh-then-quarantine path in the candidate helpers
+    (#106367)."""
     from agent.auxiliary_client import _FALLBACK_REASONS
     return next(
         (label for predicate, label in _FALLBACK_REASONS if label != "auth error" and predicate(exc)),
@@ -64,6 +65,9 @@ _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
     "rate limit": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "connection error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    # A model id missing from the candidate's catalog can reappear after a catalog refresh; a
+    # model-specific miss must not hold the lane out for the long default TTL.
+    "model not found": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
 }
 
 

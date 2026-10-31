@@ -7613,6 +7613,9 @@ class _LadderStep(NamedTuple):
 _FALLBACK_REASONS: tuple[tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
     (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
+    # A model id this route's catalog does not have is the same class as "cannot serve this model":
+    # the chain must advance (skipping only that model) instead of dying on the primary (#146983).
+    (_is_model_not_found_error, "model not found"),
     (_is_invalid_aux_response_error, "invalid provider response"),
     # A status-less in-stream ``error`` event (SSE committed 200) is a route failure (#101538).
     (_is_statusless_structured_provider_error, "structured provider error"),

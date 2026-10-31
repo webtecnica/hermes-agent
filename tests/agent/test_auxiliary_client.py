@@ -1564,6 +1564,52 @@ class TestIsModelNotFoundError:
         assert _is_model_not_found_error(exc) is False
 
 
+class TestModelNotFoundAdvancesFallbackChain:
+    """A model-id 404 must reach the configured chain instead of aborting the ladder (#146983)."""
+
+    @staticmethod
+    def _route():
+        import agent.auxiliary_client as ac
+
+        return ac._LadderRoute(
+            None, "compression", "", False, "http://freellmapi.local/v1", "freellmapi",
+            "auto", None, None, None, "auto", None, {"provider": "freellmapi"}, 30.0,
+        )
+
+    def test_catalog_404_yields_the_configured_fallback(self, monkeypatch):
+        import agent.auxiliary_client as ac
+
+        exc = Exception("Model 'qwen3.8-flash' is not in the catalog.")
+        exc.status_code = 404
+        fallback = MagicMock(name="fallback-client")
+        seen: dict = {}
+
+        def _chain(task, provider, **kwargs):
+            seen.update({"task": task, "provider": provider, **kwargs})
+            return fallback, "fb-model", "fallback_chain[0](freellmapi)"
+
+        monkeypatch.setattr(ac, "_try_configured_fallback_chain", _chain)
+        step = next(ac._ladder_provider_fallback(exc, self._route()))
+
+        assert step.kind == "fallback"
+        client, model, _label = step.args
+        assert client is fallback and model == "fb-model"
+        # The failed model is skipped, the lane itself is not burned.
+        assert seen["reason"] == "model not found"
+        assert seen["failed_model"] == "auto"
+
+    def test_generic_500_still_aborts_the_ladder(self, monkeypatch):
+        """Non-regression: a 500 must not be laundered into a provider hop."""
+        import agent.auxiliary_client as ac
+
+        exc = Exception("Internal error: catalog service unavailable")
+        exc.status_code = 500
+        monkeypatch.setattr(ac, "_try_configured_fallback_chain",
+                            lambda *a, **kw: pytest.fail("chain must not be reached for a 500"))
+
+        assert list(ac._ladder_provider_fallback(exc, self._route())) == []
+
+
 class TestIsModelIncompatibleError:
     """_is_model_incompatible_error detects 400s where the route cannot run
     the model at all (capability mismatch), distinct from not-found and
