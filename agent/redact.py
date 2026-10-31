@@ -245,7 +245,12 @@ _PREFIX_PATTERNS = [
 # ``token=``, ``KEYBOARD=``, ``PASSAGE=``) do not match — those are handled by the config/form/URL paths,
 # and a bare ``password=…`` in a form body must not be swallowed greedily by ``\S+``. See #77484.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
-_ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2")
+# The lookbehind anchors every attempt to the start of an upper-case identifier
+# run: a match that begins INSIDE a ``[A-Z0-9_]`` run is found from the start of
+# that run anyway (the prefix class is bounded at 50 chars), so the match set is
+# unchanged, while a long hex/Base64 blob — one unbroken run — is no longer
+# re-tried at every byte (that scan alone was 0.09 ms/KiB, see #147257).
+_ENV_ASSIGN_RE = re.compile(rf"(?<![A-Z0-9_])([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2")
 # Lowercase env names: only underscore-boundary forms (``openai_key=``) — NOT
 # bare ``password=``/``token=``, which appear in prose, URLs, and form bodies.
 # The lookbehind anchors each attempt to the start of an identifier run; without
@@ -877,6 +882,77 @@ def _assignment_sub(render, *, check_keyword: bool):
     return _sub
 
 
+# Linear pre-gate for the assignment passes (#147257). Every alternative of
+# ``_ENV_ASSIGN_RE``/``_ENV_ASSIGN_LOWER_RE``/``_CFG_*_RE``/``_YAML_*_RE``
+# contains one of these words, so a text without any of them cannot match and
+# every pass is skipped — a superset gate, never a false negative. ``key`` is
+# accepted here although ``_CFG_SECRET_WORD_RE`` only takes the ``api_key``
+# forms, because the lowercase ENV pattern also matches a bare ``key=``.
+# A plain ``in`` scan per word is used instead of an IGNORECASE alternation: the
+# regex form cost ~8 us per short line (0.35 s of a 1 s call on a 2 MB dump),
+# while the C substring search stays below a microsecond.
+_SECRET_WORDS = ("key", "pass", "pw", "token", "secret", "credential", "auth")
+
+
+def _redact_header_value(m: re.Match) -> str:
+    """Keep the header name and mask the single opaque value after it."""
+    return m.group(1) + _mask_token(m.group(2))
+
+
+def _has_secret_header_name(text: str) -> bool:
+    """True when an ``x-api-key: …`` style header can be present (exact gate).
+
+    Plain ``in`` on a lowered copy: an IGNORECASE alternation over the raw text
+    costs as much as the pass it was meant to skip (100 ms on 2.3 MB)."""
+    low = text.lower()
+    return any(name in low for name in SECRET_HEADER_NAME_LIST)
+
+
+def _has_secret_word(snippet: str) -> bool:
+    """True when an assignment pass can match ``snippet`` (exact superset gate)."""
+    low = snippet.lower()
+    return any(word in low for word in _SECRET_WORDS)
+
+# Above this size the passes scan line by line and only touch the lines that
+# carry a secret word. A multi-MB tool result is mostly opaque payload and
+# prose: scanning every byte of it through five backtracking patterns (0.1
+# ms/KiB each) is what made one call take seconds while holding the GIL
+# (#147257/#147242). Below the threshold the single whole-text scan is cheaper
+# than splitting, and it is the hot path (one log line at a time).
+_ASSIGN_LINE_SCAN_MIN_CHARS = 8192
+
+
+def _gated_scan(text: str, apply, *, join_next: bool = False) -> str:
+    """Run ``apply`` only where a match is possible (see _ASSIGN_LINE_SCAN_MIN_CHARS).
+
+    ``apply`` must be a pass whose matches never span more than one line, except
+    for the ENV passes (``join_next=True``): their ``\\s*=\\s*`` can consume the
+    newline, so a candidate line is also re-scanned together with the line after
+    it — a match can only cross the boundary when the key ends the line (``=``
+    on the next one) or when the value starts on it. Neither shape is common, so
+    the extra scan costs one line, never the whole text.
+    """
+    if len(text) < _ASSIGN_LINE_SCAN_MIN_CHARS:
+        return apply(text)
+    linhas = text.split("\n")
+    i = 0
+    while i < len(linhas):
+        if _has_secret_word(linhas[i]):
+            linhas[i] = apply(linhas[i])
+            if join_next and i + 1 < len(linhas) and (linhas[i].endswith("=") or "=" not in linhas[i]):
+                juntas = apply(linhas[i] + "\n" + linhas[i + 1])
+                if "\n" in juntas:
+                    linhas[i], _, linhas[i + 1] = juntas.partition("\n")
+                else:
+                    # The pattern swallowed the line break itself (``\s*`` around
+                    # ``=``): the next line was absorbed into this one, exactly as
+                    # the whole-text pass does, so it must not survive as a blank.
+                    linhas[i] = juntas
+                    del linhas[i + 1]
+        i += 1
+    return "\n".join(linhas)
+
+
 def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     """ENV / config / JSON / YAML assignment passes (skipped for code files). Passes
     that would match ``token=``/``key=`` URL params skip ``://`` text (web-URL query
@@ -885,29 +961,49 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     ``mask_nonreusable`` masks the assignments with the ``«redacted:…»`` sentinel that
     ``file_read=True`` already uses for prefix-matched credentials. Without it an agent
     that read a secret-bearing file would hold a head/tail mask shaped like a real but
-    truncated key and could write it back as a dead credential (#35519)."""
+    truncated key and could write it back as a dead credential (#35519).
+
+    Each pattern family is applied through ``_gated_scan``: on a large text only the
+    lines carrying a secret word are scanned, which is what keeps one call at
+    milliseconds instead of seconds on a multi-MB payload (#147257)."""
     mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
-    if "=" in text:
-        _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
-        text = _ENV_ASSIGN_RE.sub(_redact_env, text)
-        if "://" not in text:  # lowercase names would match URL params
-            # Skip URLs — the query string may contain ``token=``/``key=`` params that are intentionally
-            # passed through (see note near the bottom of this function; _redact_strict_url_credentials
-            # handles the opt-in case). The uppercase regex above is all-caps-only, so it never matches URL
-            # params; the lowercase one would (issue #77484).
-            text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
-        # The keyword pre-gate is exact and matters: _CFG_DOTTED_RE backtracks
-        # quadratically on long unbroken [A-Za-z0-9_.\-] runs.
-        # Lowercase/dotted config keys (issue #16413). Skip URLs entirely — web-URL query params are
-        # intentionally passed through (see note near the bottom of this function); _DB_CONNSTR_RE still
-        # guards connection-string passwords. Extra gate: every _CFG_*_RE match requires a secret keyword in
-        # the key, so a text without any secret keyword cannot match — skipping is exact. This matters
-        # because _CFG_DOTTED_RE backtracks quadratically on long unbroken [A-Za-z0-9_.\-] runs (e.g.
-        # base64/hex blobs in compaction payloads); the linear keyword scan prevents that pathological path
-        # on secret-free text.
-        if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-            text = _CFG_DOTTED_RE.sub(_redact_env, text)
-            text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+    _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
+    _redact_yaml = _assignment_sub(lambda g: f"{g[0]}{g[1]}{mask(g[2])}", check_keyword=True)
+    _redact_yaml_quoted = _quoted_assignment_sub(mask)
+    # The URL policy is a property of the WHOLE text (see the note near the bottom
+    # of redact_sensitive_text): a text that carries ``://`` anywhere keeps its
+    # web-URL query params untouched, so the decision is made once, not per line.
+    tem_url = "://" in text
+
+    def _env_pass(snippet: str) -> str:
+        snippet = _ENV_ASSIGN_RE.sub(_redact_env, snippet)
+        if not tem_url:  # lowercase names would match URL query params
+            snippet = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, snippet)
+        return snippet
+
+    def _cfg_pass(snippet: str) -> str:
+        # Lowercase/dotted config keys (issue #16413), and the line-anchored bare
+        # key form. Neither pattern can cross a newline, so line scope is exact.
+        if tem_url:
+            return snippet
+        snippet = _CFG_DOTTED_RE.sub(_redact_env, snippet)
+        return _CFG_ANCHORED_RE.sub(_redact_env, snippet)
+
+    def _yaml_pass(snippet: str) -> str:
+        # YAML after JSON. Unquoted scalars go through _YAML_ASSIGN_RE; a quoted
+        # scalar (``db_password: "..."``) is only reachable through the quoted pass —
+        # _JSON_FIELD_RE needs a QUOTED key, so it never saw the unquoted-key form.
+        if tem_url or ":" not in snippet:
+            return snippet
+        snippet = _YAML_ASSIGN_RE.sub(_redact_yaml, snippet)
+        return _YAML_QUOTED_ASSIGN_RE.sub(_redact_yaml_quoted, snippet)
+
+    if "=" in text and _has_secret_word(text):
+        # ``\s*=\s*`` is the only thing here that may cross a line break, so the
+        # ENV pass also re-scans a candidate line together with the next one.
+        text = _gated_scan(text, _env_pass, join_next=True)
+        # _CFG_SECRET_WORD_RE is a subset of _has_secret_word: the gate stays exact.
+        text = _gated_scan(text, _cfg_pass)
 
     if ":" in text and '"' in text:
         text = _JSON_FIELD_RE.sub(
@@ -921,13 +1017,8 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     if ":" in text and "'" in text:
         text = _redact_python_repr_fields(text)
 
-    # YAML after JSON. Unquoted scalars go through _YAML_ASSIGN_RE; a quoted
-    # scalar (``db_password: "..."``) is only reachable through the quoted pass —
-    # _JSON_FIELD_RE needs a QUOTED key, so it never saw the unquoted-key form.
-    if ":" in text and "://" not in text:
-        text = _YAML_ASSIGN_RE.sub(
-            _assignment_sub(lambda g: f"{g[0]}{g[1]}{mask(g[2])}", check_keyword=True), text)
-        text = _YAML_QUOTED_ASSIGN_RE.sub(_quoted_assignment_sub(mask), text)
+    if ":" in text and _has_secret_word(text):
+        text = _gated_scan(text, _yaml_pass)
     return text
 
 
@@ -1024,7 +1115,11 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
 
     if ":" in text:
-        text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
+        # Header assignments are the same shape as the passes above and were
+        # scanned over the whole text too (#147257): 100 ms of a 2.3 MB call.
+        if _has_secret_header_name(text):
+            text = _gated_scan(text, lambda snippet: _SECRET_HEADER_RE.sub(_redact_header_value, snippet),
+                              join_next=True)
         text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
     if "BEGIN" in text and "-----" in text:
