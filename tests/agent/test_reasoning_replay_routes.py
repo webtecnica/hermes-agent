@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.message_sanitization import (
-    apply_reasoning_content_policy, reapply_reasoning_echo, reasoning_replay_route, rejected_reasoning_carriers,
+    REASONING_CARRIERS, apply_reasoning_content_policy, reapply_reasoning_echo, reasoning_replay_route,
+    rejected_reasoning_carriers, route_reasoning_carriers,
 )
 from agent.transports.chat_completions import ChatCompletionsTransport
 
@@ -57,6 +58,35 @@ def test_each_route_gets_exactly_the_carriers_it_reads(provider, base_url, model
     # A reasoning-less turn is never padded outside the must-echo tier.
     assert "reasoning_content" not in bare
     assert _TURN["reasoning_details"] is _DETAILS and "reasoning" in _TURN  # history untouched
+
+
+_REMOTE_CUSTOM = "https://one-api.example.com/v1"  # strict OpenAI-compatible aggregator
+_LOCAL_CUSTOM = "http://127.0.0.1:8080/v1"  # llama.cpp / SGLang on the operator's box
+
+
+def test_custom_provider_is_a_billing_class_not_a_local_engine():
+    """``custom`` only means "user-declared endpoint": a remote one reads the standard alias only,
+    a loopback one keeps the local pair (#147026, #146945 — strict hosts 400 on the pair)."""
+    assert route_reasoning_carriers("custom", _REMOTE_CUSTOM) == frozenset({"reasoning_content"})
+    assert route_reasoning_carriers("custom", _LOCAL_CUSTOM) == frozenset({"reasoning_content", "reasoning"})
+
+
+@pytest.mark.parametrize("provider,base_url", [
+    ("ollama-cloud", "https://ollama.com/v1"),
+    ("lmstudio", _REMOTE_CUSTOM),  # a local engine behind a tunnel keeps reading both
+    ("upstage", "https://api.upstage.ai/v1"),
+    ("upstage", _REMOTE_CUSTOM),
+])
+def test_named_local_engine_providers_keep_the_local_pair(provider, base_url):
+    assert route_reasoning_carriers(provider, base_url) == frozenset({"reasoning_content", "reasoning"})
+
+
+def test_stored_reasoning_replay_body_carries_one_key_on_a_remote_custom_route():
+    turn, _ = _wire("custom", _REMOTE_CUSTOM)
+    assert [k for k in REASONING_CARRIERS if k in turn] == ["reasoning_content"]
+    assert turn["reasoning_content"] == "thought"
+    local, _ = _wire("custom", _LOCAL_CUSTOM)
+    assert [k for k in REASONING_CARRIERS if k in local] == ["reasoning_content", "reasoning"]
 
 
 def test_must_echo_pads_and_aliased_gemini_keeps_its_signature():
