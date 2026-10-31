@@ -310,6 +310,41 @@ class TestConfigModelAutoSentinelProviderScope:
         assert client is not None
         assert client_model == "auto"
 
+    def test_reported_config_shape_keeps_literal_auto(self, tmp_path, monkeypatch):
+        """The reported shape: a `providers:` entry whose catalog exposes a literal `auto` id,
+        with `auxiliary.compression.provider: <name>` and `model: auto` in a real config.yaml."""
+        import hermes_yaml as yaml
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(yaml.safe_dump({
+            "model": {"default": "main-model", "provider": "freellmapi"},
+            "providers": {"freellmapi": {"base_url": "http://freellmapi.local/v1", "api_key": "k"}},
+            "auxiliary": {"compression": {"provider": "freellmapi", "model": "auto"}},
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        resolved_provider, model, _base_url, _api_key, _api_mode = _resolve_task_provider_model(task="compression")
+
+        assert resolved_provider == "freellmapi"
+        assert model == "auto"
+
+        # …and the endpoint resolution layer hands `auto` to that custom provider.
+        import agent.auxiliary_client as ac
+
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch.object(ac, "_create_openai_client", side_effect=_capture_create):
+            client, client_model = resolve_provider_client(resolved_provider, model=model, task="compression")
+
+        assert client is not None
+        assert client_model == "auto"
+        assert captured.get("base_url") == "http://freellmapi.local/v1"
+
 
 class TestMoaAggregatorSharedResolution:
     """The shared MoA→aggregator helper and the layers that consume it.
