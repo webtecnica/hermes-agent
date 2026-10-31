@@ -10,10 +10,11 @@ No LLM, no real platform connections.
 """
 
 import asyncio
+import importlib.util
 import sys
 import uuid
 from datetime import datetime, timezone, UTC
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -33,11 +34,38 @@ E2E_MESSAGE_SETTLE_DELAY = 0.3
 
 # Platform library mocks
 
-# Ensure telegram module is available (mock it if not installed)
+def _real_module_available(name: str) -> bool:
+    """True only when *name* is a real, importable module — not a stand-in.
+
+    ``sys.modules`` alone cannot answer that question, and that is what broke
+    this conftest (issue #147239):
+
+    * an installed SDK that nobody imported yet is *absent* from ``sys.modules``
+      (this conftest runs before any adapter import), so "in sys.modules" is not
+      "installed"; and
+    * ``hasattr(mod, "__file__")`` is an attribute-presence test, not a "this is
+      the real SDK" test: any stand-in carrying a ``__file__`` attribute (a mock
+      configured to look like a module, a hand-built stub) passes it as real.
+
+    So: an entry already in ``sys.modules`` counts only when it really is a
+    module, and everything else is decided by asking the import machinery.
+    """
+    if name in sys.modules:
+        mod = sys.modules[name]
+        if mod is None:
+            return False  # import of this name is explicitly blocked
+        return isinstance(mod, ModuleType)
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (AttributeError, ImportError, ValueError):
+        # Missing parent package, or a stale sys.modules entry without a spec.
+        return False
+
+
 def _ensure_telegram_mock():
     """Install mock telegram modules so TelegramAdapter can be imported."""
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return # Real library installed
+    if _real_module_available("telegram"):
+        return  # Real library installed — never shadow it with a mock
 
     telegram_mod = MagicMock()
     telegram_mod.Update = MagicMock()
@@ -65,8 +93,8 @@ def _ensure_telegram_mock():
 # Ensure discord module is available (mock it if not installed)
 def _ensure_discord_mock():
     """Install mock discord modules so DiscordAdapter can be imported."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return # Real library installed
+    if _real_module_available("discord"):
+        return  # Real library installed — never shadow it with a mock
 
     discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()
@@ -97,8 +125,8 @@ def _ensure_discord_mock():
 
 def _ensure_slack_mock():
     """Install mock slack modules so SlackAdapter can be imported."""
-    if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
-        return  # Real library installed
+    if _real_module_available("slack_bolt") and _real_module_available("slack_sdk"):
+        return  # Real libraries installed — never shadow them with mocks
 
     slack_bolt = MagicMock()
     slack_bolt.async_app.AsyncApp = MagicMock
