@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import (
-    shape_failure_error, file_mutation_result_landed, has_failure_marker, is_guardrail_refusal, is_rate_limited)
+    GUARDRAIL_REFUSAL_KEY, shape_failure_error, file_mutation_result_landed, has_failure_marker,
+    is_guardrail_refusal, is_rate_limited)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset({
@@ -436,8 +438,8 @@ class ToolCallGuardrailController:
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
-        result_hash = _result_hash(result, tool_name)
         previous = self._no_progress.get(signature)
+        result_hash = _streak_result_hash(result, tool_name, previous[0] if previous is not None else None)
         repeat_count = previous[1] + 1 if previous is not None and previous[0] == result_hash else 1
         self._no_progress[signature] = (result_hash, repeat_count)
         if warnings and repeat_count >= self.config.no_progress_warn_after:
@@ -460,7 +462,12 @@ class ToolCallGuardrailController:
         """
         is_plain_str = isinstance(result, str)
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        result_hash = _result_hash(result, tool_name) if is_plain_str else ""
+        previous_hash = (
+            self._identical_streak_result_hash
+            if is_plain_str and signature == self._identical_streak_sig
+            else None
+        )
+        result_hash = _streak_result_hash(result, tool_name, previous_hash) if is_plain_str else ""
 
         if is_plain_str and (signature, result_hash) == (self._identical_streak_sig, self._identical_streak_result_hash):
             self._identical_streak_count += 1
@@ -629,13 +636,145 @@ def _without_execute_code_metadata(parsed: Any) -> Any:
     return cleaned
 
 
+# ── Result identity: what the model learned, not how the harness counted ────────────────
+# (#146846) A result hash taken over the whole canonical JSON is only stable if the payload
+# is stable. It is not: the harness narrates its OWN repetition back to the model -- from the
+# 3rd identical search file_tools attaches "_warning: You have run this exact search 3
+# times consecutively", from the 4th it refuses with BLOCKED + ``already_searched=4`` -- and a
+# parallel ripgrep traversal lists the same 0-match paths in a different order each run. Every
+# replay then hashed "new": _no_progress never passed 1, the identical-call streak never
+# reached 2, and the ONE tool the guardrail exists to hold was the one that could not trip it.
+#
+# Folded out (all of it harness bookkeeping, none of it anything the model could learn):
+#   * the harness's own call notes -- ``_warning``/``_hint`` -- which describe the CALL (how many
+#     times it repeated, where to page next) and appear only from the 3rd repeat on, so keeping
+#     them made the 3rd repeat of a search look structurally new even after the count was folded;
+#   * repeat counters -- the ``already_*`` keys the harness writes to report a repeat, and the
+#     count inside a result-level notice sentence ("you have run this exact search 4 times");
+#   * the ORDER of the paths inside those notices -- same set of paths, same finding.
+# Kept verbatim: the entire payload the model actually learns from -- matches, files, counts,
+# total_count, a real ``error`` body, and the text of a result-level notice minus the counter.
+# A result that says something new therefore still hashes differently and still resets the
+# counter, so this can only make the guardrail MORE sensitive, never blind (fail-closed).
+_HARNESS_REPEAT_COUNTER_KEYS = frozenset({"already_read", "already_searched"})
+
+# Notes the harness attaches about the CALL (leading underscore is its convention). They are not
+# part of what the tool was asked for: _warning counts the repeat, _hint tells the model where to
+# page. Dropped, so the call that finally carries one is still the same call.
+_HARNESS_CALL_NOTE_KEYS = frozenset({"_warning", "_hint"})
+
+# Notes about the FINDING, which the model must still be able to tell apart: a search result's
+# ``warning`` sentence (the 0-match probe's paths) and ``_omitted`` (how many credential-bearing
+# results were hidden). Kept; only their counters and path order are folded.
+_HARNESS_RESULT_NOTE_KEYS = frozenset({"warning", "_omitted"})
+
+# "… this exact search 4 times in a row": a repeat counter. Folded ONLY when the number is
+# immediately followed by a repetition noun, so a count that IS the finding -- "3 match(es)",
+# "5 file(s)" -- is not touched and a search that found something else stays a different result.
+_REPEAT_COUNT_RE = re.compile(
+    r"\b\d+(?:st|nd|rd|th)?(?=\s*(?:times\b|time\(s\)\b|consecutive\b|consecutively\b))"
+)
+# A maximal comma-separated run inside a note -- the tool joins 0-match probe paths with ",".
+# Only genuine path tokens inside such a run are reordered; prose and numbers stay in place.
+_COMMA_RUN_RE = re.compile(r"[^,()\[\]{}\n]+(?:,\s+[^,()\[\]{}\n]+)+")
+_FILE_EXT_RE = re.compile(r"\.[A-Za-z0-9_]{1,8}$")
+# Punctuation a path can be glued to when a sentence introduces the list ("... file(s): a.py").
+_ITEM_PREFIX_PUNCT = ":;=»«…—–"
+
+
+def _looks_like_path(token: str) -> bool:
+    """Cheap, conservative path test: no spaces, and a separator or a file extension."""
+    if not token or " " in token:
+        return False
+    return "/" in token or "\\" in token or bool(_FILE_EXT_RE.search(token))
+
+
+def _sorted_comma_run(match: re.Match[str]) -> str:
+    """Sort the path tokens of one comma run; leave the rest of its prose in place.
+
+    Each element is split into its first word (the candidate path) and whatever trails it, after
+    dropping the punctuation that glued it to the sentence ("... file(s): a.py, b.py — the
+    pattern's casing may be wrong."). Prose keeps its position; a run with fewer than two paths is
+    returned untouched.
+    """
+    raw = match.group(0)
+    paths: list[str] = []
+    prose: list[str] = []
+    for item in raw.split(","):
+        item = item.strip()
+        stripped = item.lstrip(_ITEM_PREFIX_PUNCT + "\"'([{ \t")
+        prefix = item[: len(item) - len(stripped)]
+        word, _sep, rest = stripped.partition(" ")
+        word = word.strip()
+        if _looks_like_path(word):
+            paths.append(word)
+            if prefix:
+                prose.append(prefix)
+            if rest:
+                prose.append(rest)
+        else:
+            prose.append(item)
+    if len(paths) < 2:
+        return raw
+    # Canonical form: the sorted set first, then whatever prose trailed the enumeration.
+    return ", ".join(sorted(paths)) + (" " + " ".join(prose) if prose else "")
+
+
+def _fold_harness_note(note: str) -> str:
+    """Fold the repeat counter and the path-list order out of one harness notice."""
+    return _COMMA_RUN_RE.sub(_sorted_comma_run, _REPEAT_COUNT_RE.sub("<n>", note))
+
+
+def _hashable_result(value: Any) -> Any:
+    """Strip harness loop bookkeeping from a parsed tool result, recursively."""
+    if isinstance(value, Mapping):
+        # A refusal declares itself: its ``error`` body is harness prose ("BLOCKED: ... 4 times
+        # in a row"), so its counter is folded too. A real failure's error text is NOT touched --
+        # those bytes are the finding.
+        refusal = value.get(GUARDRAIL_REFUSAL_KEY) is True
+        folded = {}
+        for key, item in value.items():
+            if key in _HARNESS_REPEAT_COUNTER_KEYS or key in _HARNESS_CALL_NOTE_KEYS:
+                continue
+            if isinstance(item, str) and (
+                key in _HARNESS_RESULT_NOTE_KEYS or (refusal and key == "error")
+            ):
+                folded[key] = _fold_harness_note(item)
+            else:
+                folded[key] = _hashable_result(item)
+        return folded
+    if isinstance(value, list):
+        # Element order inside a payload field stays as produced: for matches/files that order is
+        # part of what the model receives (line order, ranking), so reordering it IS a change.
+        return [_hashable_result(item) for item in value]
+    return value
+
+
+def _streak_result_hash(result: str | None, tool_name: str, previous_hash: str | None) -> str:
+    """Identity of ``result`` for a repeat streak.
+
+    A harness REFUSAL ("BLOCKED: ... you have run this exact search 4 times in a row") reports the
+    repeat, not new output: it continues the streak instead of restarting it. Without this, the
+    harness escalating from "3rd identical search, here is a warning" to "BLOCKED" would hand the
+    model a fresh counter right at the moment the loop became undeniable.
+    """
+    if previous_hash is not None and is_guardrail_refusal(result):
+        return previous_hash
+    return _result_hash(result, tool_name)
+
+
 def _result_hash(result: str | None, tool_name: str = "") -> str:
+    """Hash what the model LEARNED from ``result`` -- not how the harness counted it.
+
+    ``_hashable_result`` folds out the harness's own loop bookkeeping; see the comment
+    above it for why that cannot hide a real change.
+    """
     parsed = safe_json_loads(result or "")
     if parsed is None:
         return _sha256(result or "")
     if tool_name == "execute_code":
         parsed = _without_execute_code_metadata(parsed)
-    return _sha256(_canonical_json(parsed))
+    return _sha256(_canonical_json(_hashable_result(parsed)))
 
 
 _BOOL_WORDS = {w: True for w in ("1", "true", "yes", "on", "enabled")} | {w: False for w in ("0", "false", "no", "off", "disabled")}
