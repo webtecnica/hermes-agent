@@ -4,6 +4,7 @@ defs plus the budgeted, byte-stable catalog listing embedded in the bridge."""
 from __future__ import annotations
 
 import functools
+import logging
 import math
 import re
 import threading
@@ -11,7 +12,16 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-import snowballstemmer
+_SNOWBALL_IMPORT_ERROR: Optional[BaseException] = None
+try:  # Optional at runtime: lean installs and pre-PM updaters on <3.14 may lack the wheel.
+    import snowballstemmer
+    _HAS_SNOWBALL = True
+except Exception as _exc:  # ImportError, or a broken wheel raising at import time
+    snowballstemmer = None  # type: ignore[assignment]
+    _HAS_SNOWBALL = False
+    _SNOWBALL_IMPORT_ERROR = _exc
+
+logger = logging.getLogger("tools.tool_search_catalog")
 
 # Reserved bridge names: a user/plugin/MCP tool may not take them (registry override
 # protection rejects such registrations).
@@ -37,21 +47,50 @@ class CatalogEntry:
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _thread_local = threading.local()
+_STEMMER_UNSET = object()
+_stem_fallback_logged = False
+_stem_fallback_lock = threading.Lock()
+
+
+def _log_stem_fallback_once(reason: object) -> None:
+    """Say why stemming is off exactly once per process — not once per stemmed token."""
+    global _stem_fallback_logged
+    with _stem_fallback_lock:
+        if _stem_fallback_logged:
+            return
+        _stem_fallback_logged = True
+    logger.warning(
+        "snowballstemmer unavailable (%s): tool_search falls back to unstemmed tokens, so "
+        "plural/singular variants no longer match (\"issues\" will not find create_issue). "
+        "Install snowballstemmer to restore stemming.", reason)
 
 
 @functools.lru_cache(maxsize=16384)
 def _stem(token: str) -> str:
     """Stem one token, memoized across stateless catalog rebuilds. Snowball stemmers carry
     mutable parsing state and bridge dispatch runs on parallel tool-call threads, so the
-    stemmer is one-per-thread, created lazily."""
-    if getattr(_thread_local, "stemmer", None) is None:
-        _thread_local.stemmer = snowballstemmer.stemmer("english")
-    return _thread_local.stemmer.stemWord(token)
+    stemmer is one-per-thread, created lazily. Without a usable stemmer the token is
+    returned unstemmed — exact word forms still match, and the fallback is cached per
+    thread (and per token by the lru_cache) instead of retried on every call."""
+    stemmer = getattr(_thread_local, "stemmer", _STEMMER_UNSET)
+    if stemmer is _STEMMER_UNSET:
+        if not _HAS_SNOWBALL:
+            _log_stem_fallback_once(_SNOWBALL_IMPORT_ERROR)
+            stemmer = None
+        else:
+            try:
+                stemmer = snowballstemmer.stemmer("english")
+            except Exception as exc:  # a broken wheel: degrade, do not fail the bridge
+                _log_stem_fallback_once(exc)
+                stemmer = None
+        _thread_local.stemmer = stemmer  # cached even when None
+    return token if stemmer is None else stemmer.stemWord(token)
 
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase alphanumeric tokens, Snowball-stemmed (English); shared by the index and
-    query paths so "issues" matches ``create_issue``."""
+    """Lowercase alphanumeric tokens, Snowball-stemmed (English) when the wheel is present;
+    shared by the index and query paths so "issues" matches ``create_issue``. Without the
+    wheel the tokens stay unstemmed on both paths, so exact forms still match."""
     return [_stem(token.lower()) for token in _TOKEN_RE.findall(text)] if text else []
 
 
