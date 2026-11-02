@@ -2959,6 +2959,19 @@ _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 # Top-level keys whose sub-keys are accepted without deep checking.
 _OPEN_SUBKEY_TOP_LEVEL_KEYS = _OPEN_DICT_TOP_LEVEL_KEYS | _DYNAMIC_TOP_LEVEL_KEYS | _SCHEMA_DEFINED_DICT_KEYS
 
+# Nested containers whose immediate children ARE user-supplied names, even though the top-level key
+# they sit under is schema-defined. ``agent.personalities.<name>`` is the runtime-preferred alias of
+# the open top-level ``personalities.<name>`` (``personality.available_personalities`` reads both,
+# ``agent.`` winning), so the schema walk has to stop at the container exactly like it stops at the
+# root. Registered as FULL paths — never as "any dict under agent" — so typos elsewhere stay caught.
+_OPEN_NESTED_DICT_PATHS = frozenset({("agent", "personalities")})
+
+
+def _nested_open_children(prefix: list[str]) -> set[str]:
+    """Immediate child names of the registered nested open dicts at *prefix* (typo-hint candidates)."""
+    key = tuple(prefix)
+    return {path[-1] for path in _OPEN_NESTED_DICT_PATHS if path[:-1] == key}
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -3008,6 +3021,13 @@ def _validate_schema_key(key: str) -> tuple[bool, Optional[str]]:
     if top in _OPEN_SUBKEY_TOP_LEVEL_KEYS:
         return True, None
 
+    # A registered nested open dict (``agent.personalities.<name>``) validates its own path and
+    # everything below it: the segments after the container are user-chosen names, so none of them
+    # can be a typo — same rule the open top-level containers get above (#147685).
+    for prefix_len in range(2, len(segments) + 1):
+        if tuple(segments[:prefix_len]) in _OPEN_NESTED_DICT_PATHS:
+            return True, None
+
     # Walk DEFAULT_CONFIG: a nested ``platforms`` container, a scalar leaf, or an EMPTY dict hit
     # before the path is consumed all accept. An empty dict is a free-form mapping section
     # (``compression.model_thresholds.<model>``, ``terminal.docker_env.<VAR>``,
@@ -3033,7 +3053,7 @@ def _validate_schema_key(key: str) -> tuple[bool, Optional[str]]:
                 and _validate_config_key(rest)[0]
             ):
                 return False, rest
-            sibling = _suggest_closest_key(seg, set(node.keys()))
+            sibling = _suggest_closest_key(seg, set(node.keys()) | _nested_open_children(consumed))
             if sibling is not None:
                 return False, ".".join(consumed + [sibling])
             return False, None

@@ -1134,3 +1134,64 @@ class TestProviderSwitchClearsBaseUrl:
         assert "Cleared" not in out
         # Unknown host: kept, but the user is told the old route still applies (from #113725).
         assert ("still applies" in out) == ("proxy.internal" in seed["base_url"])
+
+
+class TestNestedOpenDictPersonalitiesKey:
+    """``agent.personalities.<name>`` is a real write target (#147685).
+
+    ``personality.available_personalities`` reads the open top-level ``personalities`` AND
+    ``agent.personalities`` (the latter wins), but only the top-level form was an open dict in the
+    schema walk: the nested path came back as a wrong prefix of ``personalities.<name>``, so
+    ``hermes config set agent.personalities.demo ...`` exited 1 without ``--force``. The reader is
+    the authority here — a path it consumes must be writable.
+    """
+
+    def _seed(self, tmp_path, data: dict):
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    @pytest.mark.parametrize("name", ["demo", "revisor"])
+    def test_subkey_written_without_force_and_read_back(self, _isolated_hermes_home, name):
+        from hermes_cli.config import _validate_config_key
+        from hermes_cli.personality import available_personalities
+
+        self._seed(_isolated_hermes_home, {"agent": {"max_turns": 5}})
+        key = f"agent.personalities.{name}"
+        assert _validate_config_key(key) == (True, None)
+
+        set_config_value(key, "texto de teste")
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["agent"]["personalities"][name] == "texto de teste"
+        assert saved["agent"]["max_turns"] == 5
+        # The alias must not shadow a duplicate at the root: the nested form is what got written.
+        assert "personalities" not in saved
+        assert available_personalities(saved)[name] == "texto de teste"
+
+    def test_container_itself_is_a_known_key(self, _isolated_hermes_home, capsys):
+        from hermes_cli.config import _validate_config_key, get_config_value
+
+        self._seed(_isolated_hermes_home, {"agent": {"personalities": {"demo": "texto de teste"}}})
+        # Same verdict as the open top-level form it aliases (``personalities`` / ``personalities.x``).
+        assert _validate_config_key("agent.personalities") == _validate_config_key("personalities")
+        assert _validate_config_key("agent.personalities") == (True, None)
+
+        get_config_value("agent.personalities")
+        assert "demo" in capsys.readouterr().out
+
+    def test_real_typos_still_refused(self, _isolated_hermes_home, capsys):
+        from hermes_cli.config import _validate_config_key
+
+        self._seed(_isolated_hermes_home, {"agent": {"max_turns": 5}})
+        # Top-level misspelling: verdict unchanged (same-length typo -> did-you-mean notice, not a
+        # refusal), and the nested alias did not loosen the top-level open-dict walk.
+        assert _validate_config_key("personalitys.demo") == (False, "personalities.demo")
+        # A misspelled container name is still unknown, now with the registered container as hint.
+        assert _validate_config_key("agent.personalitys.demo") == (False, "agent.personalities")
+        # A wrong PREFIX of the now-known nested path is a positive mismatch -> refused (#112003),
+        # naming the correct path. Written silently before this fix.
+        with pytest.raises(SystemExit):
+            set_config_value("gateway.agent.personalities.demo", "x")
+        assert "agent.personalities.demo" in capsys.readouterr().err
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved == {"agent": {"max_turns": 5}}
