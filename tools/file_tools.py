@@ -1055,7 +1055,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 output_mode: str = "content", context: int = 0,
                 order: str = "discovery",
                 task_id: str = "default") -> str:
-    """Search for content or files."""
+    """Search for content or files.
+
+    Content mode: ``total_count`` counts matching lines. Lines pulled in by
+    ``context`` are returned in ``matches`` flagged ``is_context`` and page by match.
+    """
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
@@ -1294,7 +1298,7 @@ _MACOS_SEARCH_NOTE = (" On macOS, broad searches above the user home automatical
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents." + _MACOS_SEARCH_NOTE + "\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls. Discovery order is the fast bounded default; exact global newest-first order is an explicit opt-in and may scan the full tree.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents." + _MACOS_SEARCH_NOTE + "\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts. `total_count` counts matching lines only: neighboring lines requested with `context` are returned in `matches` with `is_context: true` and never inflate it.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls. Discovery order is the fast bounded default; exact global newest-first order is an explicit opt-in and may scan the full tree.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1302,11 +1306,11 @@ SEARCH_FILES_SCHEMA = {
             "target": {"type": "string", "enum": ["content", "files"], "description": "'content' searches inside file contents, 'files' searches for files by name", "default": "content"},
             "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
             "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
-            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
-            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
+            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50); in content mode it counts matches, and the context lines around them are returned with the page", "default": 50},
+            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0); in content mode it skips matches", "default": 0},
             "order": {"type": "string", "enum": ["discovery", "modified"], "description": "File-search order: 'discovery' is fast bounded traversal order; 'modified' is exact global newest-first and may scan the full tree; ignored for content", "default": "discovery"},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only). They are returned in 'matches' with is_context=true and are not counted in total_count", "default": 0}
         },
         "required": ["pattern"]
     }

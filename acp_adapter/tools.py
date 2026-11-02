@@ -268,7 +268,10 @@ def _format_search_files_result(tool_name: str, data: Args, args: Args) -> Optio
             continue
         path = str(_first(match, "path", "file", "filename", default="?"))
         line = match.get("line") or match.get("line_number")
-        lines.append(f"- {path}:{line}" if line else f"- {path}")
+        # ``is_context`` rows are neighboring lines, not hits: say so instead of
+        # presenting them as matches (#147722).
+        suffix = " (context)" if match.get("is_context") else ""
+        lines.append(f"- {path}:{line}{suffix}" if line else f"- {path}{suffix}")
         if content := str(match.get("content") or match.get("text") or "").strip():
             lines.append(f"  {_truncate_text(' '.join(content.split()), 300)}")
     if bool(data.get("truncated")) or len(matches) > shown:

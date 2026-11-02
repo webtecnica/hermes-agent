@@ -12,7 +12,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from tools.file_operations import ShellFileOperations
-from tools.file_operations_search import _parse_search_context_line
+from tools.file_operations_common import ExecuteResult, SearchMatch, SearchResult
+from tools.file_operations_search import _PERMISSION_SEARCH_HINT, _parse_search_context_line
 
 
 # =========================================================================
@@ -263,10 +264,114 @@ class TestSearchContextParsing:
             )
 
         assert result.error is None
-        assert result.total_count == 1
+        # A lone neighbor line is context, not a hit: it rides in ``matches`` flagged
+        # and never reaches total_count (#147722).
+        assert result.total_count == 0
+        assert len(result.matches) == 1
+        assert result.matches[0].is_context is True
         assert result.matches[0].path == "dir/file-12-name.py"
         assert result.matches[0].line_number == 8
         assert result.matches[0].content == "context here"
+        assert result.to_dict()["matches"][0]["is_context"] is True
+
+
+# =========================================================================
+# Context lines come back flagged and are never counted as matches (#147722)
+# =========================================================================
+
+_CONTEXT_OUTPUT = (
+    "dir/a.py:3:needle here\n"
+    "dir/a.py-4-before a\n"
+    "dir/b.py:9:needle again\n"
+    "dir/b.py-10-after b\n"
+)
+
+
+def _ops_with_mock_env() -> ShellFileOperations:
+    env = MagicMock()
+    env.cwd = "/tmp"
+    return ShellFileOperations(env)
+
+
+class TestContextLinesAreNotMatches:
+    """``total_count`` counts matching lines; ``context`` rows come back flagged."""
+
+    @staticmethod
+    def _grep_result(limit: int = 10, offset: int = 0) -> SearchResult:
+        ops = _ops_with_mock_env()
+        with patch.object(ops, "_exec") as mock_exec:
+            mock_exec.return_value = MagicMock(exit_code=0, stdout=_CONTEXT_OUTPUT)
+            return ops._search_with_grep(
+                "needle", path=".", file_glob=None, limit=limit, offset=offset,
+                output_mode="content", context=1,
+            )
+
+    def test_context_rows_are_flagged_and_not_counted(self):
+        result = self._grep_result()
+
+        assert result.total_count == 2
+        assert [(m.line_number, m.is_context) for m in result.matches] == [
+            (3, False), (4, True), (9, False), (10, True)]
+        assert [m.get("is_context", False) for m in result.to_dict()["matches"]] == [
+            False, True, False, True]
+        assert result.truncated is False
+
+    def test_limit_pages_matches_and_keeps_their_context(self):
+        # limit counts MATCHES: one match per page, with the context rows around it.
+        first = self._grep_result(limit=1, offset=0)
+        assert first.total_count == 2
+        assert [(m.line_number, m.is_context) for m in first.matches] == [(3, False), (4, True)]
+        assert first.truncated is True
+
+        second = self._grep_result(limit=1, offset=1)
+        assert second.total_count == 2
+        assert [(m.line_number, m.is_context) for m in second.matches] == [(9, False), (10, True)]
+        assert second.truncated is False
+
+    def test_path_grouped_text_marks_context_rows(self):
+        entries = [SearchMatch("a.py", n, f"row{n}", is_context=(n % 2 == 0)) for n in range(1, 6)]
+        dumped = SearchResult(matches=entries, total_count=3).to_dict(densify=True)
+
+        assert dumped["matches_text"].split("\n")[1] == "  1: row1"
+        assert dumped["matches_text"].split("\n")[2] == "  ~2: row2"
+        assert "prefixed with '~'" in dumped["matches_format"]
+
+    def test_multi_root_merge_sums_matches_and_keeps_every_row(self):
+        ops = _ops_with_mock_env()
+        first = SearchResult(
+            matches=[SearchMatch("/one/a.md", 2, "hit a"),
+                     SearchMatch("/one/a.md", 3, "ctx a", is_context=True)], total_count=1)
+        second = SearchResult(
+            matches=[SearchMatch("/two/b.md", 7, "hit b"),
+                     SearchMatch("/two/b.md", 8, "ctx b", is_context=True)], total_count=1)
+
+        with patch.object(ops, "_path_exists_probe", return_value=ExecuteResult(stdout="exists")), \
+                patch.object(ops, "_search_content", side_effect=[first, second]):
+            merged = ops._try_multi_path_search(
+                "hit", "/one,/two", "content", None, 10, 0, "content", 1)
+
+        assert merged is not None and merged.error is None
+        # :849 sums each root's MATCH count, not its row count.
+        assert merged.total_count == 2
+        assert [(m.path, m.line_number, m.is_context) for m in merged.matches] == [
+            ("/one/a.md", 2, False), ("/one/a.md", 3, True),
+            ("/two/b.md", 7, False), ("/two/b.md", 8, True)]
+
+    def test_context_only_merge_still_reads_as_having_results(self):
+        # :858: a root whose payload is context rows only still has something to show,
+        # so the merged warning must not claim nothing matched.
+        ops = _ops_with_mock_env()
+        child = SearchResult(matches=[SearchMatch("/one/a.md", 3, "ctx", is_context=True)],
+                             total_count=0, warning=f"partial read. {_PERMISSION_SEARCH_HINT}")
+
+        with patch.object(ops, "_path_exists_probe", return_value=ExecuteResult(stdout="exists")), \
+                patch.object(ops, "_search_content", side_effect=[child, SearchResult()]):
+            merged = ops._try_multi_path_search(
+                "hit", "/one,/two", "content", None, 10, 0, "content", 1)
+
+        assert merged.total_count == 0
+        assert len(merged.matches) == 1
+        assert _PERMISSION_SEARCH_HINT not in (merged.warning or "")
 
 
 # =========================================================================

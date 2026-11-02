@@ -103,6 +103,10 @@ class SearchMatch:
     line_number: int
     content: str
     mtime: float = 0.0  # Modification time for sorting
+    # A neighboring line the engine printed because the caller asked for ``context``.
+    # It travels in the same list as real matches so the model keeps the surrounding
+    # code, but it is not a match: flagged here and excluded from ``total_count``.
+    is_context: bool = False
 
 
 @dataclass
@@ -138,9 +142,23 @@ class SearchResult:
             if m.path != current_path:
                 lines.append(m.path)
                 current_path = m.path
+            # A context row keeps its place but carries a ``~`` before the line number,
+            # so the grouped text never claims a neighboring line is a match.
+            prefix = "  ~" if m.is_context else "  "
             # rstrip only: leading indentation is meaningful code and kept verbatim.
-            lines.append(f"  {m.line_number}: {m.content.rstrip()}")
+            lines.append(f"{prefix}{m.line_number}: {m.content.rstrip()}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _match_entry(m: SearchMatch) -> dict[str, object]:
+        """One serialized match row. ``is_context`` appears only on the rows that need
+        it, so a plain match result keeps the exact shape it had before context
+        marking existed."""
+        entry: dict[str, object] = {
+            "path": m.path, "line": m.line_number, "content": m.content}
+        if m.is_context:
+            entry["is_context"] = True
+        return entry
 
     def to_dict(self, densify: bool = False) -> dict:
         result: dict[str, object] = {"total_count": self.total_count}
@@ -150,13 +168,12 @@ class SearchResult:
                 # Self-describing so the model never guesses the block's shape.
                 result["matches_format"] = (
                     "path-grouped: each file path on its own line, followed by "
-                    "indented '<line>: <content>' rows for matches in that file"
+                    "indented '<line>: <content>' rows for matches in that file; "
+                    "rows for context lines are prefixed with '~' ('~<line>: <content>')"
                 )
                 result["matches_text"] = dense
             else:
-                result["matches"] = [
-                    {"path": m.path, "line": m.line_number, "content": m.content} for m in self.matches
-                ]
+                result["matches"] = [self._match_entry(m) for m in self.matches]
         if self.files:
             result["files"] = self.files
         if self.counts:

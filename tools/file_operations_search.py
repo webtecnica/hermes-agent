@@ -418,12 +418,37 @@ _MATCH_LINE_RE = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
 _OUTPUT_MODE_FLAGS = {"files_only": "-l", "count": "-c"}
 
 
+def _page_matches(entries: list[SearchMatch], offset: int, limit: int) -> list[SearchMatch]:
+    """Slice ONE PAGE of ``limit`` MATCHES starting at match ordinal ``offset``.
+
+    ``offset``/``limit`` page matches, not rows: the page stops right before the next
+    page's first match, so the context rows around each match ride along with it (a
+    page holds at most ``limit`` match rows plus their surrounding context). The first
+    page starts at row 0 so the leading context of its first match survives; later
+    pages start at their own first match. With ``context == 0`` every row is a match
+    and this is exactly ``entries[offset:offset + limit]``.
+    """
+    match_positions = [i for i, entry in enumerate(entries) if not entry.is_context]
+    if not match_positions:
+        # A payload made only of context rows (a lone neighbor line) has no match to
+        # page on; it belongs to the first page, as before.
+        return entries[:limit] if offset == 0 else []
+    if offset >= len(match_positions):
+        return []
+    start = 0 if offset == 0 else match_positions[offset]
+    stop_ordinal = offset + limit
+    stop = match_positions[stop_ordinal] if stop_ordinal < len(match_positions) else len(entries)
+    return entries[start:stop]
+
+
 def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                          context: int, warning: Optional[str] = None) -> SearchResult:
     """Parse rg/grep ``| head`` output into a SearchResult (shared by both engines).
     Exit codes: 0=matches, 1=none, 2=error — but both tools return 2 on PARTIAL
     errors (one unreadable file), so an error is surfaced only when exit==2 AND no
-    usable payload remains. ``warning`` is attached to files_only/content results."""
+    usable payload remains. ``warning`` is attached to files_only/content results.
+    Content mode counts matches only: with ``context > 0`` the neighboring lines are
+    returned in ``matches`` flagged ``is_context`` and never reach ``total_count``."""
     stdout, limit_reason = _search_stdout_and_limit(result)
     diagnostics, payload = _split_tool_diagnostics(stdout)
     if result.exit_code in _SHELL_EXEC_FAILURE_CODES:
@@ -474,7 +499,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
         return SearchResult(
             counts=counts, total_count=sum(counts.values()),
             truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning, **skip)
-    matches = []
+    matches: list[SearchMatch] = []
     for line in lines:
         if line == "--":
             continue
@@ -488,10 +513,14 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
         if context > 0:
             parsed = _parse_search_context_line(line)
             if parsed:
-                matches.append(SearchMatch(path=parsed[0], line_number=parsed[1], content=parsed[2][:500]))
-    total = len(matches)
+                matches.append(SearchMatch(path=parsed[0], line_number=parsed[1], content=parsed[2][:500],
+                                           is_context=True))
+    # ``total_count`` counts MATCHES: context rows travel in ``matches`` for the model
+    # to read but are not hits, and must not inflate the number the model reports
+    # (or the number a multi-root merge sums).
+    total = sum(1 for match in matches if not match.is_context)
     return SearchResult(
-        matches=matches[offset:offset + limit], total_count=total,
+        matches=_page_matches(matches, offset, limit), total_count=total,
         truncated=total > offset + limit or bool(limit_reason), limit_reason=limit_reason, warning=warning,
         **skip,
     )
@@ -848,7 +877,7 @@ class SearchMixin:
                 merged.counts.update(sub.counts)
                 merged.total_count += sub.total_count
                 merged.truncated = merged.truncated or sub.truncated
-            merged.matches = merged.matches[:limit]
+            merged.matches = _page_matches(merged.matches, 0, limit)
             merged.files = merged.files[:limit]
         note = f"path contained {len(parts)} entries; searched {len(existing)} that exist"
         if missing:
@@ -1320,7 +1349,11 @@ class SearchMixin:
         ``line_cap`` appends ``| cut -c1-2000`` for engines without --max-columns
         (grep): bounds giant single-line matches at the pipe layer; skipped for
         files_only/count where lines are paths/counts."""
-        fetch_limit = limit + offset + (200 if context > 0 else 0)
+        # A content search with context prints up to (1 + 2*context) rows per match, so a
+        # full page of `limit` matches needs that many rows: scale the window or the head
+        # would cut a page short. files_only/count print one row per result — unchanged.
+        rows_per_match = 1 + 2 * context if context > 0 and output_mode == "content" else 1
+        fetch_limit = (limit + offset) * rows_per_match + (200 if context > 0 else 0)
         if line_cap:  # grep/find pipelines: shell only, with the column cap
             parts = cmd_parts + ["|", "head", "-n", str(fetch_limit)]
             if output_mode not in ("files_only", "count"):
