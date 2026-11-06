@@ -6,6 +6,7 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 """
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -22,6 +23,29 @@ def test_probe_config_health_flags_null_sections():
     msg = _probe_config_health({"agent": None, "display": None, "model": {}})
     assert "agent" in msg and "display" in msg
     assert "model" not in msg
+
+
+def test_probe_config_health_ignores_null_keys_whose_default_is_null():
+    """#149921: the shipped template parses to ``None`` for keys whose null IS the documented
+    default (``max_concurrent_sessions: null``, bare ``gateway:``) and for ``providers`` whose
+    default is ``{}``; warning there is pure noise on a default install. The real case — a
+    structural section left empty — must stay loud."""
+    import hermes_yaml as yaml
+
+    from tui_gateway.server import _probe_config_health
+
+    root = Path(__file__).resolve().parents[2]
+    cfg = yaml.safe_load((root / "cli-config.yaml.example").read_text(encoding="utf-8"))
+    # Pin the exact null set the template parses to: a new bare top-level key must be a deliberate
+    # decision (either exempt it above or expect the warning), not silent test drift.
+    assert sorted(k for k, v in cfg.items() if v is None) == ["gateway", "max_concurrent_sessions"]
+    assert _probe_config_health(cfg) == ""
+
+    assert _probe_config_health({"max_concurrent_sessions": None}) == ""
+    assert _probe_config_health({"providers": None}) == ""
+
+    msg = _probe_config_health({"agent": None})
+    assert "empty section" in msg and "`agent`" in msg
 
 
 def test_apply_model_switch_does_not_leak_process_env():

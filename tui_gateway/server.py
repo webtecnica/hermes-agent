@@ -1347,12 +1347,50 @@ def _probe_credentials(agent) -> str:
     return ""
 
 
+#: Top-level ``config.yaml`` keys for which a bare ``key:`` (YAML ``None``) IS the documented default,
+#: so the "empty section" probe must stay quiet: nothing nested can be dropped. Provenance is inline;
+#: :func:`_null_is_documented_default` re-checks each claim against the live defaults at call time.
+_NULL_IS_DEFAULT_TOP_LEVEL_KEYS: dict[str, str] = {
+    # Scalar ``Optional[int] = None`` (gateway/config.py:618) shipped as ``null`` both in DEFAULT_CONFIG
+    # (hermes_cli/config_defaults.py:42) and in cli-config.yaml.example:1065 → null only means "unset".
+    "max_concurrent_sessions": "hermes_cli/config_defaults.DEFAULT_CONFIG['max_concurrent_sessions'] is None",
+    # DEFAULT_CONFIG declares ``"providers": {}`` (hermes_cli/config_defaults.py:23): a bare key means
+    # "no per-provider overrides", i.e. the same empty mapping the default already is.
+    "providers": "hermes_cli/config_defaults.DEFAULT_CONFIG['providers'] == {}",
+    # cli-config.yaml.example:1418 ships a bare ``gateway:`` heading; DEFAULT_CONFIG['gateway'] is a
+    # mapping and hermes_cli/config.py::_deep_merge ignores a ``None`` override over a dict section
+    # (#58277), so every shipped gateway default still applies.
+    "gateway": "cli-config.yaml.example:1418 bare key; DEFAULT_CONFIG['gateway'] is a mapping",
+}
+
+
+def _null_is_documented_default(key: str) -> bool:
+    """True when a bare ``key:`` in config.yaml equals the shipped default (nothing is dropped).
+
+    Only keys listed in :data:`_NULL_IS_DEFAULT_TOP_LEVEL_KEYS` qualify — the warning stays loud for
+    real structural sections (``agent:``, ``display:``, ``memory:``, ``model:`` …). The default itself
+    is re-read from ``DEFAULT_CONFIG`` so the list cannot drift: if a default becomes a real value,
+    the key stops being exempt.
+    """
+    if key not in _NULL_IS_DEFAULT_TOP_LEVEL_KEYS:
+        return False
+    with contextlib.suppress(Exception):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        if key not in DEFAULT_CONFIG:
+            return False
+        default = DEFAULT_CONFIG[key]
+        # ``None``: null IS the default. ``dict``: ``_deep_merge`` ignores a None override over a dict
+        # section (hermes_cli/config.py, #58277), so the shipped defaults still apply.
+        return default is None or isinstance(default, dict)
+    return False
+
+
 def _probe_config_health(cfg: dict) -> str:
     """Warn on bare YAML keys (`agent:` → None, silently dropping nested settings) and an unknown ``display.personality``."""
     if not isinstance(cfg, dict):
         return ""
     warnings: list[str] = []
-    if null_keys := sorted(k for k, v in cfg.items() if v is None):
+    if null_keys := sorted(k for k, v in cfg.items() if v is None and not _null_is_documented_default(k)):
         keys = ", ".join(f"`{k}`" for k in null_keys)
         warnings.append(f"config.yaml has empty section(s): {keys}. Remove the line(s) or set them to `{{}}` — "
                         f"empty sections silently drop nested settings.")
