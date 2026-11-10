@@ -145,6 +145,13 @@
       "entries": [
         "hermes_cli.plugin_session:session_client"
       ]
+    },
+    {
+      "source": "user-guide/features/plugins.md § A plugin with its own chat client",
+      "entries": [
+        "hermes_cli.chat_launch",
+        "hermes_cli.gateway_chat:shell_client_env"
+      ]
     }
   ]
 }
