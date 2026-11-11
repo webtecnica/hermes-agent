@@ -902,7 +902,7 @@ class TestDebugShareEndpoint:
         monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
         monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
 
-        r = self.client.post("/api/ops/debug-share", json={"redact": False})
+        r = self.client.post("/api/ops/debug-share", json={"consent": True, "redact": False})
         assert r.status_code == 200
         assert r.json()["redacted"] is False
 
@@ -916,10 +916,26 @@ class TestDebugShareEndpoint:
         monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
         monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
 
-        # No JSON body at all — should default redact=True.
-        r = self.client.post("/api/ops/debug-share")
+        r = self.client.post("/api/ops/debug-share", json={"consent": True})
         assert r.status_code == 200
         assert r.json()["redacted"] is True
+
+    @pytest.mark.parametrize("body", [None, {}, {"redact": True}, {"consent": False}])
+    def test_missing_consent_is_refused_without_uploading(self, monkeypatch, body):
+        """An empty/unconfirmed POST must never publish logs (#94876)."""
+        import hermes_cli.debug as dbg
+
+        uploads = []
+        monkeypatch.setattr(dbg, "upload_to_pastebin",
+                            lambda c, expiry_days=7: uploads.append(c) or "https://paste.rs/x")
+        monkeypatch.setattr(dbg, "_schedule_auto_delete", lambda *a, **k: None)
+        monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
+        monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
+
+        r = (self.client.post("/api/ops/debug-share") if body is None
+             else self.client.post("/api/ops/debug-share", json=body))
+        assert r.status_code == 400
+        assert uploads == []
 
     def test_upload_failure_returns_502(self, monkeypatch):
         import hermes_cli.debug as dbg
@@ -933,7 +949,7 @@ class TestDebugShareEndpoint:
         monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
         monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
 
-        r = self.client.post("/api/ops/debug-share", json={"redact": True})
+        r = self.client.post("/api/ops/debug-share", json={"consent": True, "redact": True})
         assert r.status_code == 502
 
 
