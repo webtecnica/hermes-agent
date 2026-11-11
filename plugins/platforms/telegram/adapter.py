@@ -206,6 +206,7 @@ from plugins.platforms.telegram.telegram_network import (
     proxy_target_hosts)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import TelegramSendPathRecoveryMixin, mark_send_path_recovered
+from plugins.platforms.telegram.telegram_flood_cooldown import TelegramFloodCooldownMixin
 from plugins.platforms.telegram.telegram_send_errors import LOST, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind
 from plugins.platforms.telegram.telegram_typing_gate import typing_may_fire
 from plugins.platforms.telegram.telegram_group_observe import apply_group_observe_attribution, observed_media_note, shared_sender_suffix
@@ -440,7 +441,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin, TelegramSendPathRecoveryMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin, TelegramSendPathRecoveryMixin, TelegramFloodCooldownMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -5178,26 +5179,6 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 if not getattr(lock, "_waiters", None):  # nobody queued: drop the entry (bounded dict)
                     locks.pop(key, None)
 
-    def _record_send_flood_cooldown(self, chat_id: Any, wait: float) -> SendResult:
-        """A send refused with ``retry_after=wait`` arms a per-chat window during which ``send()`` fails
-        closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
-        unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
-        until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
-        return _flood_cap_result(wait)
-
-    def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
-        """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
-        until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        key = str(normalize_telegram_chat_id(chat_id))
-        deadline = until.get(key)
-        if deadline is None:
-            return None
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining > 0:
-            return remaining
-        until.pop(key, None)
-        return None
 
     # --- shared per-chat send+edit pacing budget (#116312) -----------------------------------------
     # One slot per chat that sendMessage AND editMessageText both draw from (Telegram counts them
