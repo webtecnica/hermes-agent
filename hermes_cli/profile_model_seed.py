@@ -1,13 +1,13 @@
 """Copy the model and its selected custom endpoint into a new profile, and merge that endpoint
 over same-identity entries the new profile already has."""
 
-from hermes_cli.config import _expand_env_vars, find_provider_entry
-from hermes_cli.config_providers import _normalize_custom_provider_entry
+from hermes_cli.config import _expand_env_vars
 from hermes_cli.providers import custom_provider_aliases
 from hermes_cli.runtime_provider_custom import (
     _get_named_custom_provider,
     _normalize_custom_provider_name,
     _shadowed_by_builtin,
+    named_custom_provider_config_path,
 )
 
 
@@ -46,44 +46,28 @@ def _resolve(provider: str, view: dict):
     return _get_named_custom_provider(provider, config=view, resolve_credentials=False)
 
 
-def _source_of(cfg: dict, resolved: dict):
-    """Where in *cfg* the resolver found *resolved*: ``("providers", key)`` or
-    ``("custom_providers", index)``. Keyed results carry ``provider_key``; legacy results do not
-    (their normalizer runs without one), so they are located by normalized name and URL."""
-    key, entry = find_provider_entry(cfg.get("providers"), resolved.get("provider_key"))
-    if entry is not None:
-        return "providers", key
-    custom = cfg.get("custom_providers")
-    for index, entry in enumerate(custom if isinstance(custom, list) else ()):
-        normalized = _normalize_custom_provider_entry(entry)
-        if normalized and (normalized["name"], normalized["base_url"]) == (
-            resolved["name"],
-            resolved["base_url"],
-        ):
-            return "custom_providers", index
-    return None
-
-
 def launch_model_seed(source_cfg: dict) -> dict:
     """The config a fresh profile needs to run the launch profile's model: its ``model`` block plus
     the endpoint definition it points at. ``model.provider: custom:lab`` alone is "Unknown provider"
     on the first turn. The selected ``providers:`` or ``custom_providers:`` entry is copied as
     written (``${VAR}`` refs stay refs), and an exact ``providers.<built-in>`` / ``providers.custom``
     key travels for its tuning even without a URL. ``{}`` when the launch profile has no model."""
+    return _selected_model_seed(source_cfg)[0]
+
+
+def _selected_model_seed(source_cfg: dict) -> tuple[dict, bool]:
     model_cfg = source_cfg.get("model")
     if not model_cfg:
-        return {}
+        return {}, False
     seed = {"model": model_cfg}
     provider = _requested_provider(model_cfg)
     if provider is None:
-        return seed
+        return seed, False
     requested = _normalize_custom_provider_name(provider)
     providers = source_cfg.get("providers")
     providers = providers if isinstance(providers, dict) else {}
-    # Resolve and locate on ONE view so the found key/index addresses the raw entry.
-    view = _routing_view(source_cfg)
-    selected = _resolve(provider, view)
-    if selected is None:
+    found = named_custom_provider_config_path(provider, _routing_view(source_cfg))
+    if found is None:
         exact = providers.get(provider)
         # Bare ``custom`` runs as provider ``custom`` and reads ``providers.custom`` tuning too.
         if (
@@ -92,16 +76,14 @@ def launch_model_seed(source_cfg: dict) -> dict:
             and (requested == "custom" or _shadowed_by_builtin(requested))
         ):
             seed["providers"] = {provider: exact}
-        return seed
-    found = _source_of(view, selected)
-    if found is not None:
-        section, where = found
-        seed[section] = (
-            {where: providers[where]}
-            if section == "providers"
-            else [source_cfg["custom_providers"][where]]
-        )
-    return seed
+        return seed, False
+    section, where = found
+    seed[section] = (
+        {where: providers[where]}
+        if section == "providers"
+        else [source_cfg["custom_providers"][where]]
+    )
+    return seed, True
 
 
 def _aliases(entry, key: str = "") -> frozenset[str]:
@@ -141,9 +123,7 @@ def prepare_inherited_endpoint_seed(source_cfg: dict) -> tuple[dict, frozenset[s
     Unlike fresh seeding, inheritance can retain a different destination .env. Capture claims
     now: resolving again there would let an empty URL or disabled selector hide collisions.
     """
-    seed = launch_model_seed(source_cfg)
-    provider = _requested_provider(seed.get("model"))
-    selected = bool(provider and _resolve(provider, _routing_view(seed)) is not None)
+    seed, selected = _selected_model_seed(source_cfg)
 
     def freeze(entry):
         return {k: _expand_env_vars(v) if k in {"name", "provider_key", "enabled"} else v
