@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Thread
 from unittest.mock import Mock
 
+import hermes_yaml
 import pytest
 
 from hermes_cli import config, models_validate, profiles
@@ -154,8 +155,7 @@ def test_inherit_source_selection_destination_secret_refs(launch, validation, le
     config.atomic_config_write(source / "config.yaml", raw)
     # The writer canonicalizes too: use the raw backend fixture boundary for legacy input.
     if legacy:
-        import yaml
-        (source / "config.yaml").write_text(yaml.safe_dump(raw))
+        (source / "config.yaml").write_text(hermes_yaml.safe_dump(raw))
     config.atomic_config_write(target / "config.yaml", {"model": {"temperature": 0.3, "custom_model": {"extra_body": {"keep": True}}}})
     before = (source / "config.yaml").read_bytes()
     with profile_config_scope(source):
@@ -183,7 +183,6 @@ def test_inherit_source_selection_destination_secret_refs(launch, validation, le
 
 @pytest.mark.parametrize("layout", ["root", "api_base", "complete"])
 def test_inherit_destination_legacy_route(launch, validation, layout):
-    import yaml
     from hermes_cli.config_effective import load_user_config_effective
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -199,7 +198,7 @@ def test_inherit_destination_legacy_route(launch, validation, layout):
     if layout == "complete":
         destination["provider"] = "custom"
         destination["model"]["name"] = "keep-model"
-    (target / "config.yaml").write_text(yaml.safe_dump(destination))
+    (target / "config.yaml").write_text(hermes_yaml.safe_dump(destination))
     before = (target / "config.yaml").read_bytes()
     assert inherit_launch_model(target) is (layout != "complete")
     if layout == "complete":
