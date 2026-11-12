@@ -355,7 +355,7 @@ from plugins.platforms.telegram.telegram_chunking import (
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
 from gateway.platforms.helpers import (
-    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, caption_is_command, compile_mention_patterns, prompt_id_counter)
+    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, caption_is_command, compile_mention_patterns, hash_for_log, prompt_id_counter)
 
 # Internal safety bounds (not user knobs): no reconnect/teardown path may hang on a dead CLOSE-WAIT
 # socket PTB's polling task is blocked on in epoll.
@@ -3063,7 +3063,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         text = (self._status_online_text if online else self._status_offline_text)[:120]  # Telegram cap
         try:
             await bot.set_my_short_description(short_description=text)
-            logger.info("[%s] Set bot status indicator to %r", self.name, text)
+            logger.info("[%s] Set bot status indicator to %r", self.name, text)  # health: allow HX017 -- configured status string
         except Exception as e:
             logger.debug("[%s] Failed to set bot status indicator to %r: %s", self.name, text, _redact_telegram_error_text(e))
 
@@ -4627,7 +4627,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             tmp = response_path.with_suffix(".tmp")
             tmp.write_text(answer, encoding="utf-8")
             tmp.replace(response_path)
-            logger.info("Telegram update prompt answered '%s' by user %s", answer, getattr(query.from_user, "id", "unknown"))
+            logger.info("Telegram update prompt answered '%s' by user %s", answer, hash_for_log(getattr(query.from_user, "id", None)))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
             return
