@@ -132,6 +132,44 @@ def merge_endpoint_seed(dst_cfg: dict, seed: dict) -> dict:
             *(_aliases(e) for e in seed_custom),
         )
 
+    return _merge_endpoint_seed(dst_cfg, seed, claimed)
+
+
+def prepare_inherited_endpoint_seed(source_cfg: dict) -> tuple[dict, frozenset[str]]:
+    """Prepare in source scope; identity/eligibility travel, URL and credentials stay raw.
+
+    Unlike fresh seeding, inheritance can retain a different destination .env. Capture claims
+    now: resolving again there would let an empty URL or disabled selector hide collisions.
+    """
+    seed = launch_model_seed(source_cfg)
+    provider = _requested_provider(seed.get("model"))
+    selected = bool(provider and _resolve(provider, _routing_view(seed)) is not None)
+
+    def freeze(entry):
+        return {k: _expand_env_vars(v) if k in {"name", "provider_key", "enabled"} else v
+                for k, v in entry.items()}
+
+    if selected:
+        if "providers" in seed:
+            seed["providers"] = {k: freeze(v) for k, v in seed["providers"].items()}
+        if "custom_providers" in seed:
+            seed["custom_providers"] = [freeze(v) for v in seed["custom_providers"]]
+    claimed = frozenset().union(
+        *(_aliases(e, str(k)) for k, e in (seed.get("providers") or {}).items()),
+        *(_aliases(e) for e in seed.get("custom_providers") or []),
+    ) if selected else frozenset()
+    return seed, claimed
+
+
+def merge_inherited_endpoint_seed(dst_cfg: dict, prepared: tuple[dict, frozenset[str]]) -> dict:
+    """Merge in destination scope using source-prepared claims, never reselecting the seed."""
+    seed, claimed = prepared
+    return _merge_endpoint_seed(dst_cfg, seed, claimed)
+
+
+def _merge_endpoint_seed(dst_cfg: dict, seed: dict, claimed: frozenset[str]) -> dict:
+    seed_providers = seed.get("providers") or {}
+    seed_custom = seed.get("custom_providers") or []
     merged = dict(dst_cfg)
     dst_providers = dst_cfg.get("providers")
     if isinstance(dst_providers, dict) or seed_providers:
