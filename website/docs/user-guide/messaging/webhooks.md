@@ -517,6 +517,8 @@ This returns the webhook URL and an auto-generated HMAC secret. Configure your s
 
 New subscriptions are pinned to `--signature generic` (timestamp-bound V2 or Standard Webhooks) unless you pass `--signature github`, `gitlab` or `linear` for a provider that signs its own way. Updating an existing subscription keeps its pin.
 
+The dashboard's **New subscription** form (web dashboard and desktop app) has the same choice as a **Signature** select, defaulting to `generic`; pick GitHub, GitLab or Linear for routes those services deliver to. Through the API, `POST /api/webhooks` takes an optional `signature` (`generic`, `github`, `gitlab` or `linear`; anything else is a `422`): a new route without it is pinned to `generic`, and a re-POST without it keeps the stored pin.
+
 ### List subscriptions
 
 ```bash
