@@ -592,13 +592,19 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 logger.debug("[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)")
                 return _ok()
             text = self._clean_mention_text(text)
-        media_urls, media_types, msg_type = await self._collect_attachments(record)
-        if not text and media_urls:
+        chat_type = "group" if is_group else "dm"
+        # The fetch spends the server password and disk on a sender-chosen file: only the gateway's explicit
+        # True permits it. The message still dispatches so the runner applies denial/pairing.
+        has_attachments = bool(record.get("attachments"))
+        media_urls, media_types, msg_type = [], [], MessageType.TEXT
+        if has_attachments and self._is_sender_authorized(sender, chat_type, session_chat_id) is True:
+            media_urls, media_types, msg_type = await self._collect_attachments(record)
+        if not text and (media_urls or has_attachments):
             text = "(attachment)"
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
         source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
-                                   chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
+                                   chat_type=chat_type, user_id=sender, user_name=sender,
                                    chat_id_alt=chat_identifier)
         event = MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=payload,
