@@ -4930,16 +4930,15 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
             # host base_url names is never intended. Explicit api_key or the placeholder only.
             custom_key = _normalize_api_key(req.explicit_api_key) or "no-key-required"
         else:
-            # Only THIS route's credentials may reach an explicit custom URL: the same-origin main
-            # key or the owning providers: entry's own key. A global OPENAI_API_KEY is never a
-            # route credential — sending a live OpenAI key to a third-party endpoint is
-            # credential misdirection (#145452). The env-driven custom route resolves elsewhere
-            # (config through _try_custom_endpoint, bare env OPENAI_BASE_URL deliberately not at
-            # all); this arm is reached only for an explicit base_url.
+            # The route's own credential (same-origin main key, then the owning providers: entry's
+            # key) must beat the ambient OPENAI_API_KEY: ahead of them it reached a self-hosted
+            # proxy that declares its own key_env (#145452). OPENAI_API_KEY stays the documented
+            # last resort for a base_url that declares no credential at all.
             custom_key = (
                 _normalize_api_key(req.explicit_api_key)
                 or _read_main_api_key_if_same_origin(custom_base)
                 or declared_custom_key_for_base_url(custom_base, req.original_provider or provider)
+                or _scoped_key_env("OPENAI_API_KEY")
                 or "no-key-required"  # local servers don't need auth
             )
         if not custom_base:
