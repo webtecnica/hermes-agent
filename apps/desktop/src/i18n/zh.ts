@@ -2406,7 +2406,7 @@ export const zhOverrides = {
       backup: '创建备份',
       backupDesc: '打包配置、记忆、技能与会话',
       debugShare: '调试分享',
-      debugShareDesc: '上传脱敏报告与日志，获取可分享链接（6 小时后自动删除）',
+      debugShareDesc: '上传摘要（版本、配置键名、错误计数；不含日志文本），获取可分享链接（6 小时后自动删除）',
       debugShareRunning: '正在上传调试报告…',
       debugShareLinks: '分享链接',
       debugShareFailed: '调试分享失败',

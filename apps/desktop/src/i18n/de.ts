@@ -2873,7 +2873,7 @@ export const deOverrides = {
       backupDesc: 'Konfiguration, Memories, Skills und Sessions als ZIP packen',
       debugShare: 'Debug-Freigabe',
       debugShareDesc:
-        'Einen geschwärzten Bericht + Logs hochladen, teilbare Links erhalten (wird nach 6h automatisch gelöscht)',
+        'Eine Zusammenfassung hochladen (Versionen, Konfigurationsschlüssel, Fehlerzähler; kein Logtext), teilbaren Link erhalten (wird nach 6h automatisch gelöscht)',
       debugShareRunning: 'Debug-Bericht wird hochgeladen...',
       debugShareLinks: 'Freigabelinks',
       debugShareFailed: 'Debug-Freigabe fehlgeschlagen',

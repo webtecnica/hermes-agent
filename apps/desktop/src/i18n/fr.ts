@@ -2882,7 +2882,7 @@ export const frOverrides = {
       backupDesc: 'Archiver en zip la configuration, les mémoires, les skills et les sessions',
       debugShare: 'Partage de débogage',
       debugShareDesc:
-        'Téléverser un rapport expurgé + journaux, obtenir des liens partageables (auto-suppression après 6h)',
+        'Téléverser un résumé (versions, clés de configuration, compteurs d’erreurs ; aucun texte de journal), obtenir un lien partageable (auto-suppression après 6h)',
       debugShareRunning: 'Téléversement du rapport de débogage...',
       debugShareLinks: 'Liens de partage',
       debugShareFailed: 'Échec du partage de débogage',

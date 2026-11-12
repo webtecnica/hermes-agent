@@ -2864,7 +2864,7 @@ export const esOverrides = {
       backupDesc: 'Comprimir la configuración, memorias, skills y sesiones en un archivo ZIP',
       debugShare: 'Compartir datos de depuración',
       debugShareDesc:
-        'Sube un informe y registros con datos sensibles ocultos y obtén enlaces para compartir (se eliminan automáticamente en 6 h)',
+        'Sube un resumen (versiones, claves de configuración, recuentos de errores; sin texto de registros) y obtén un enlace para compartir (se elimina automáticamente en 6 h)',
       debugShareRunning: 'Subiendo informe de depuración…',
       debugShareLinks: 'Enlaces para compartir',
       debugShareFailed: 'No se pudieron compartir los datos de depuración',

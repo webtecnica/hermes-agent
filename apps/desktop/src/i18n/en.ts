@@ -2477,7 +2477,7 @@ export const en: Translations = {
       backup: 'Create backup',
       backupDesc: 'Zip config, memories, skills, and sessions',
       debugShare: 'Debug share',
-      debugShareDesc: 'Upload a redacted report + logs, get shareable links (auto-deletes in 6h)',
+      debugShareDesc: 'Upload a summary (versions, config keys, error counts; no log text), get a shareable link (auto-deletes in 6h)',
       debugShareRunning: 'Uploading debug report...',
       debugShareLinks: 'Share links',
       debugShareFailed: 'Debug share failed',
