@@ -199,6 +199,22 @@ def ingress_fingerprint(payload, raw=None):
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+# Delivery-envelope fields that are transport, not identity: an adapter that leaves
+# ``MessageEvent.timestamp`` at its default stamps every frame it builds, so the same inbound
+# re-sent arrives bearing a new arrival time. ``ingress_fingerprint`` already drops the provider
+# headers; this is the one stamp that reaches the envelope itself.
+_TRANSPORT_FIELDS = ('timestamp',)
+
+
+def _delivery_identity(payload):
+    """*payload* without its transport fields: what a redelivery must reproduce to be a replay."""
+    envelope = payload.get('native_text_v1') if isinstance(payload, dict) else None
+    if not isinstance(envelope, dict):
+        return payload
+    return {**payload, 'native_text_v1': {key: value for key, value in envelope.items()
+                                          if key not in _TRANSPORT_FIELDS}}
+
+
 def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload, raw=None):
     """A redelivered native message (lost provider ACK, Relay buffer replay) re-downloads its media
     under a fresh disposable staging name, so its captured path differs from the committed one.
@@ -207,8 +223,10 @@ def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload,
     capture (whose now-unowned copy is collected) and the admission digest decides the rest, so
     changed bytes or any other changed field still conflict. A delivery committed in
     ``pre_gateway_dispatch``-rewritten form resolves to its committed payload when the resend matches
-    the fingerprint recorded at ingress (``ingress_fingerprint``); a changed resend, or a row
-    committed before fingerprints, is compared exactly as above."""
+    the fingerprint recorded at ingress (``ingress_fingerprint``); a text-only delivery, whose
+    envelope differs from the committed one only by its arrival stamp, resolves to the committed
+    payload the same way (``_delivery_identity``, #155150); a changed resend, or a row committed
+    before fingerprints, is compared exactly as above."""
     fresh = payload.get('native_text_v1', {}).get('media') or []
     with db._read_ctx() as conn:
         row = conn.execute('SELECT status, payload_json FROM session_admissions WHERE principal_id=? AND '
@@ -216,6 +234,12 @@ def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload,
     retained = json.loads(row[1]) if row is not None else {}
     recorded = retained.get('native_text_v1', {}).get('ingress_sha256')
     if recorded is not None and recorded == ingress_fingerprint(payload, raw):
+        resolved = retained
+    elif not fresh and row is not None and _delivery_identity(payload) == _delivery_identity(retained):
+        # Text-only: nothing was captured, so the only field a resend can differ in without being a
+        # different input is the stamp its adapter put on the envelope. Same provider id, source and
+        # text is a replay of the row that committed it, and that row answers with the arrival time
+        # of the delivery that actually ran.
         resolved = retained
     else:
         committed = retained.get('native_text_v1', {}).get('media')
