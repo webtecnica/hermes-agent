@@ -14,6 +14,7 @@ policy check, not a sandbox: a script that writes there through its own logic is
 
 from __future__ import annotations
 
+import ast
 import glob
 import itertools
 import os
@@ -46,6 +47,8 @@ _WRITEISH_CODE = re.compile(
     r"(?:write|append)File(?:Sync)?|(?:rm|unlink|rename|mkdir|copyFile|cp)Sync|"
     r"(?:^|[\s;|&])>{1,2}|\bsed\s+-i|\b(?:mv|rm|cp|tee|touch)\s", re.IGNORECASE)
 _SEPARATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", "|&", ";;"})
+# Any of these in an open() mode string means the file is written.
+_WRITE_MODES = "wax+"
 
 
 def _skill_usage():
@@ -363,7 +366,8 @@ def _check_interpreter(verb: str, args: list[str], scope: _Scope) -> str | None:
         if verb in ("bash", "sh", "zsh", "dash", "ksh") and scope.depth < 3:
             reason = _command_refusal(code, scope.cwd, scope.locked, scope.record, scope.depth + 1)
         else:
-            reason = _code_refusal(code, scope.locked, scope.record, scope.cwd)
+            lang = "python" if _PYTHON_HEADER.match(verb) else "other"
+            reason = _code_refusal(code, scope.locked, scope.record, scope.cwd, lang, scope.depth + 1)
         if reason:
             return reason
     return None
@@ -380,19 +384,157 @@ def _argv_refusal(argv: list[str], cwd: str, locked, record, depth: int,
     return next((r for check in _ARGV_CHECKS if (r := check(verb, argv[1:], scope))), None)
 
 
-def _code_refusal(code: str, locked, record, cwd: str = "") -> str | None:
-    """Inline interpreter code that looks like it writes AND names a locked skill (or the record),
-    or runs with its working directory inside one (relative paths)."""
-    from hermes_constants import get_hermes_home
-    if not _WRITEISH_CODE.search(code):
-        return None
-    if cwd and (reason := _hit(cwd, locked, record)):
-        return reason
-    home, hermes_home = os.path.expanduser("~"), str(get_hermes_home())
-    text = code.replace("$HERMES_HOME", hermes_home).replace("~", home)
+_MAX_CODE_DEPTH = 3
+_PYTHON_HEADER = re.compile(r"^python[0-9.]*$")
+_SHELL_HEADER = re.compile(r"^(?:bash|sh|zsh|dash|ksh)$")
+_HEREDOC_TAG = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_OS_PATH_WRITES = frozenset({
+    "rename", "renames", "replace", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs",
+    "symlink", "link"})
+_SHUTIL_COPY_LAST = frozenset({"copy", "copy2", "copyfile", "copytree", "move"})
+_SHUTIL_REMOVE = frozenset({"rmtree", "rmdir"})
+_BARE_PATH_WRITES = frozenset({"rmtree", "remove", "unlink", "rename", "replace"})
+_PATH_METHOD_WRITES = frozenset({"write_text", "write_bytes", "unlink", "rmdir", "touch", "mkdir",
+                                 "rename", "replace", "symlink_to", "hardlink_to"})
+_PATH_TYPES = frozenset({"Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"})
+_DYNAMIC_WRITES = frozenset({"system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv",
+                             "spawnve", "spawnvp", "spawnvpe", "execv", "execve", "execvp", "execvpe",
+                             "execl", "execle", "execlp", "eval", "exec", "execfile"})
+
+
+def _py_strings(node, names: dict[str, list[str]]) -> list[str] | None:
+    """Literal strings an AST expression may denote (None: not statically known)."""
+    if isinstance(node, ast.Constant):
+        return [node.value] if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        return names.get(node.id)
+    if isinstance(node, ast.JoinedStr):
+        out = [""]
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                vals: list[str] | None = [part.value]
+            elif isinstance(part, ast.FormattedValue):
+                vals = _py_strings(part.value, names)
+            else:
+                return None
+            if vals is None:
+                return None
+            out = [head + tail for head in out for tail in vals]
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+        left, right = _py_strings(node.left, names), _py_strings(node.right, names)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Div):
+            return [os.path.join(a, b) for a in left for b in right]
+        return [a + b for a in left for b in right]
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        if name in _PATH_TYPES and node.args:
+            return _py_strings(node.args[0], names)
+        if name in ("join", "joinpath"):
+            out = [""]
+            for arg in node.args:
+                vals = _py_strings(arg, names)
+                if vals is None:
+                    return None
+                out = [os.path.join(head, tail) for head in out for tail in vals]
+            return out
+        if name == "cwd" and not node.args:
+            return [os.getcwd()]
+        if name == "expanduser" and node.args:
+            vals = _py_strings(node.args[0], names)
+            return [os.path.expanduser(v) for v in vals] if vals else None
+    return None
+
+
+def _py_path_like(node, names: dict[str, list[str]]) -> bool:
+    """Whether *node* plausibly denotes a path (a Path(...) call, a literal-bound name, `x / y`)."""
+    if isinstance(node, ast.Name):
+        return node.id in names
+    if isinstance(node, ast.BinOp):
+        return isinstance(node.op, ast.Div)
+    if isinstance(node, ast.Call):
+        func = node.func
+        return (func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")) in _PATH_TYPES
+    return isinstance(node, ast.Attribute)
+
+
+def _py_write_destinations(tree: ast.Module) -> tuple[list[str], bool]:
+    """``(literal write destinations, saw a write whose destination is not statically known)``.
+
+    Only the argument of a write call is a destination: the path named by a read is not.
+    """
+    names: dict[str, list[str]] = {}
+    dests: list[str] = []
+    unresolved = False
+    nodes = sorted(ast.walk(tree), key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)))
+    for node in nodes:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            vals = _py_strings(node.value, names)
+            if vals:
+                names[node.targets[0].id] = vals
+            else:
+                names.pop(node.targets[0].id, None)
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        attr = func.attr if isinstance(func, ast.Attribute) else ""
+        name = func.id if isinstance(func, ast.Name) else attr
+        owner = func.value.id if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) else ""
+        path_owner = isinstance(func, ast.Attribute) and _py_path_like(func.value, names)
+        targets: list[ast.expr | None] = []
+        mode_node: ast.expr | None = None
+        if attr == "open" and path_owner:
+            targets = [func.value]
+            mode_node = node.args[0] if node.args else None
+        elif attr == "open" or name == "open":
+            if owner == "os":  # os.open(path, flags): the flags are not a mode string
+                unresolved = True
+                continue
+            targets = [node.args[0] if node.args else None]
+            mode_node = node.args[1] if len(node.args) > 1 else None
+        elif attr in ("write_text", "write_bytes"):
+            targets = [func.value]
+        elif owner == "shutil" and attr in _SHUTIL_COPY_LAST:
+            targets = [node.args[1] if len(node.args) > 1 else None]
+        elif (owner == "shutil" and attr in _SHUTIL_REMOVE) or (owner == "os" and attr in _OS_PATH_WRITES):
+            targets = list(node.args)
+        elif attr in _PATH_METHOD_WRITES and path_owner:
+            targets = [func.value]
+        elif isinstance(func, ast.Name) and name in _BARE_PATH_WRITES:
+            targets = list(node.args)
+        elif name in _DYNAMIC_WRITES and (not isinstance(func, ast.Attribute) or owner in ("os", "subprocess")):
+            unresolved = True
+            continue
+        else:
+            continue
+        if mode_node is None and name == "open":
+            for kw in node.keywords:
+                if kw.arg == "mode":
+                    mode_node = kw.value
+        if mode_node is None and name == "open":
+            continue  # no mode: open() defaults to "r", a read
+        if mode_node is not None:
+            modes = _py_strings(mode_node, names)
+            if not modes or not any(any(ch in m for ch in _WRITE_MODES) for m in modes):
+                if not modes:
+                    unresolved = True
+                continue
+        for target in targets:
+            vals = _py_strings(target, names) if target is not None else None
+            if vals is None:
+                unresolved = True
+            else:
+                dests.extend(vals)
+    return dests, unresolved
+
+
+def _mention_refusal(text: str, locked) -> str | None:
+    """Conservative fallback: any mention of a locked skill's root or `skills/<name>` segment."""
     skills_root = os.path.realpath(_skill_usage()._skills_dir())
-    if ".usage.json" in text:
-        return RECORD_REFUSAL
     for name, root in locked:
         rel = os.path.relpath(root, skills_root) if skills_root and _inside(root, skills_root) else ""
         if root in text or (rel and f"skills/{rel}" in text) or f"skills/{os.path.basename(root)}" in text:
@@ -400,11 +542,97 @@ def _code_refusal(code: str, locked, record, cwd: str = "") -> str | None:
     return None
 
 
+def _heredoc_body(code: str) -> tuple[str, str] | None:
+    """``(header line, body)`` for the first ``<<TAG`` heredoc in *code*; None when there is none."""
+    match = _HEREDOC_TAG.search(code)
+    if match is None:
+        return None
+    head_end = code.find("\n", match.end())
+    if head_end < 0:
+        return None
+    tag, body = match.group(2), []
+    for line in code[head_end + 1:].splitlines():
+        if line.strip() == tag:
+            return code[:head_end], "\n".join(body)
+        body.append(line)
+    return code[:head_end], "\n".join(body)
+
+
+def _header_verb(header: str) -> str:
+    for argv, _targets, _separator in reversed(list(_segments(_tokens(header)))):
+        argv = _strip_wrappers(argv)
+        if argv:
+            return os.path.basename(argv[0])
+    return ""
+
+
+def _leading_cwd(header: str, cwd: str) -> str:
+    """The cwd the heredoc-fed interpreter runs in: replay the ``cd``s that precede it."""
+    env = _shell_env()
+    for argv, _targets, _separator in _segments(_tokens(header)):
+        argv = _strip_wrappers(argv)
+        if not argv:
+            continue
+        if argv[0] in ("cd", "pushd") and len(argv) > 1 and argv[1] != "-":
+            cwd = _expand(argv[1], cwd, env)[0]
+            continue
+        break
+    return cwd
+
+
+def _code_refusal(code: str, locked, record, cwd: str = "", lang: str = "python",
+                  depth: int = 0) -> str | None:
+    """Inline interpreter code that WRITES into a locked skill (or the record), or runs with its
+    working directory inside one. Destinations come from the write calls themselves, so naming a
+    locked skill as a read source (or an unrelated checkout with the same ``skills/<name>`` segment)
+    is not a hit. Code whose write destination cannot be resolved falls back to the mention check."""
+    from hermes_constants import get_hermes_home
+    if not _WRITEISH_CODE.search(code):
+        return None
+    if cwd and (reason := _hit(cwd, locked, record)):
+        return reason
+    home, hermes_home = os.path.expanduser("~"), str(get_hermes_home())
+    text = code.replace("$HERMES_HOME", hermes_home).replace("~", home)
+    if ".usage.json" in text:
+        return RECORD_REFUSAL
+    fallback = _mention_refusal(text, locked)
+    if depth >= _MAX_CODE_DEPTH:
+        return fallback  # too deeply nested to parse: fail closed on any mention
+    heredoc = _heredoc_body(code)
+    if heredoc is not None:
+        header, body = heredoc
+        body_cwd = _leading_cwd(header, cwd or os.getcwd())
+        if reason := _hit(body_cwd, locked, record):
+            return reason
+        verb = _header_verb(header)
+        if _SHELL_HEADER.match(verb):
+            return _command_refusal(body, body_cwd, locked, record, depth + 1)
+        if _PYTHON_HEADER.match(verb):
+            return _code_refusal(body, locked, record, body_cwd, "python", depth + 1)
+        return fallback if not body.strip() else _code_refusal(
+            body, locked, record, body_cwd, "other", depth + 1)
+    if lang != "python":
+        return fallback  # JS/Ruby/PowerShell inline: not parsed, mention check only
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return fallback
+    dests, unresolved = _py_write_destinations(tree)
+    if unresolved:
+        return fallback
+    base = cwd or os.getcwd()
+    for dest in dests:
+        for path in _expand(dest, base):
+            if reason := _hit(path, locked, record):
+                return reason
+    return None
+
+
 _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 
 
 def _command_refusal(command: str, cwd: str, locked, record, depth: int = 0) -> str | None:
-    if "<<" in command and (reason := _code_refusal(command, locked, record, cwd)):
+    if "<<" in command and (reason := _code_refusal(command, locked, record, cwd, depth=depth)):
         return reason  # heredoc-fed interpreter body
     env = _shell_env()
     subshells: list[str] = []  # cwd to restore when each ( ... ) closes

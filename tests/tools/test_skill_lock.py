@@ -70,6 +70,16 @@ def test_file_tools_refuse_a_locked_skill_and_its_record(locked_home):
     ("git -C {L} log --oneline", False),
     ("tar xf {H}/a.tar -C {H}", False),
     ("python3 -c \"print(open('{L}/SKILL.md').read())\"", False),
+    # Issue #154700: naming a locked skill on the READ side does not make it the write destination.
+    ("python3 -c \"d=open('{L}/SKILL.md').read(); open('{H}/out.txt','w').write(d)\"", False),
+    ("python3 -c \"d=open('{L}/SKILL.md').read(); open('{H}/skills/ops/free-skill/out.txt','w').write(d)\"", False),
+    ("python3 - <<'PY'\nd=open('{L}/SKILL.md').read()\nopen('{H}/h.txt','w').write(d)\nPY", False),
+    # An independent checkout that merely contains the 'skills/<name>' segment is not the locked skill.
+    ("python3 -c \"open('{H}/checkout/skills/locked-skill/out.txt','w').write('x')\"", False),
+    ("python3 - <<'PY'\nopen('{L}/SKILL.md','w').write('x')\nPY", True),
+    ("cd {L} && python3 - <<'PY'\nopen('SKILL.md','w').write('x')\nPY", True),
+    ("bash - <<'SH'\necho x > {L}/SKILL.md\nSH", True),
+    ("bash - <<'SH'\ncat {L}/SKILL.md > {H}/out.txt\nSH", False),
     ("find {H}/skills -name SKILL.md -exec cat {{}} +", False),
     ("p={H}/out.txt; echo x > \"$p\"", False),
     ("cp -r {H}/new-skill {H}/skills/ops/new-skill", False),
