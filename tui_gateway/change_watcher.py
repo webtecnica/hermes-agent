@@ -197,11 +197,12 @@ _SESSION_SIGNATURE_FIELDS = (
     "cwd", "git_branch", "git_repo_root", "title", "title_source", "profile_name",
     "archived", "pinned", "hidden", "last_read_at", "handoff_state",
 )
-# path -> (database/WAL mtime, session-table digest, whether that is a fallback rather than a
-# read answer). The mtime guard keeps the normal 0.5 s watch pass stat-only; SQLite is read only
-# after another process actually commits (and for ``utils.RACY_MTIME_WINDOW_NS`` after it, see
-# _settled_mtime).
-_sessions_db_sig_cache: dict[str, tuple[object, tuple | None, bool]] = {}
+# path -> (raw database/WAL mtime, digest, whether the digest is a fallback rather than a read
+# answer, whether that read was confirmed after the mtime settled). The mtime guard keeps the normal
+# 0.5 s watch pass stat-only; SQLite is read only after another process actually commits. The raw
+# mtime rides beside the digest so a pass inside the racy window answers from cache (see
+# _db_content_sig).
+_sessions_db_sig_cache: dict[str, tuple[object, tuple | None, bool, bool]] = {}
 
 
 _MTIME_FALLBACK = "mtime-fallback"
@@ -209,16 +210,27 @@ _MTIME_FALLBACK = "mtime-fallback"
 
 def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime: None):
     """``read(conn, mtime)`` over a read-only connection, cached behind the DB/WAL mtime so a watch pass
-    stays stat-only until another process commits. ``read`` returns ``(signature, is_fallback)``. A failed
-    read after a good answer keeps it and leaves the cached mtime stale so the next pass re-reads (answer ->
-    fallback -> answer would broadcast twice); otherwise the answer is ``fallback(mtime)``."""
+    stays stat-only until another process commits. ``read`` returns ``(signature, is_fallback)``.
+
+    Confirm-once (#154960): a commit landing in the tick of a read leaves the DB/WAL mtime unchanged,
+    so an answer read while that mtime is still racily clean is cached *unconfirmed*. Later passes
+    inside the window answer from cache instead of re-scanning the table, and the first pass after the
+    mtime settles does exactly one confirmation read — the one that catches a commit from that same
+    tick. Staleness is bounded by ``utils.RACY_MTIME_WINDOW_NS``, under the 2 s ``sessions.changed``
+    broadcast floor, so the guarantee becomes "seen within ~2 s", not "seen on the next 0.5 s tick".
+
+    A failed read after a good answer keeps it and leaves the entry unconfirmed so the next pass
+    re-reads (answer -> fallback -> answer would broadcast twice); otherwise the answer is
+    ``fallback(mtime)``.
+    """
     mtime = _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))
     cache_key = str(db_path)
     cached = cache.get(cache_key)
-    if cached is not None and cached[0] == mtime:
+    racy = _mtime_racy(mtime)
+    if cached is not None and cached[0] == mtime and (racy or cached[3]):
         return cached[1]
     if not db_path.exists():
-        cache[cache_key] = (mtime, None, True)
+        cache[cache_key] = (mtime, None, True, True)
         return None
     conn = None
     try:
@@ -233,8 +245,31 @@ def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime: 
     finally:
         if conn is not None:
             conn.close()
-    cache[cache_key] = (_settled_mtime(mtime), signature, is_fallback)
+    cache[cache_key] = (mtime, signature, is_fallback, not racy)
     return signature
+
+
+def _session_rows_query(conn, fields, available) -> str:
+    """The signature SELECT, in a stable order that needs no per-row index seek (#154960).
+
+    ``sessions.id`` is a TEXT PRIMARY KEY, so ``ORDER BY id`` planned as a scan of
+    ``sqlite_autoindex_sessions_1`` plus one table seek per row (115 MB of ``rchar`` per pass on a
+    31.7k-session install). ``rowid`` is the table's own b-tree key: ordering by it is the plain scan
+    SQLite does anyway — no sorter, no seek — and the digest only needs *some* order that is stable
+    across passes, not a meaningful one. A store with no usable rowid (``WITHOUT ROWID``, or a
+    declared column of that name shadowing the implicit key) keeps the old order.
+    """
+    order = ""
+    if "rowid" not in available:
+        try:
+            conn.execute("SELECT rowid FROM sessions LIMIT 0")
+        except Exception:  # health: allow BLE001 -- WITHOUT ROWID stores raise here; order by id instead
+            pass
+        else:
+            order = " ORDER BY rowid"
+    if not order and "id" in available:
+        order = " ORDER BY id"
+    return f"SELECT {', '.join(fields)} FROM sessions{order}"
 
 
 def _session_rows_sig(conn, mtime):
@@ -245,9 +280,8 @@ def _session_rows_sig(conn, mtime):
         # A state.db without a readable sessions table (foreign schema, legacy or transient file): keep
         # the old mtime contract so any move still wakes the sidebar instead of silently never broadcasting.
         return (_MTIME_FALLBACK, mtime), True
-    order = " ORDER BY id" if "id" in available else ""
     digest = hashlib.blake2b(digest_size=16)
-    for row in conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}"):
+    for row in conn.execute(_session_rows_query(conn, fields, available)):
         digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
         digest.update(b"\0")
     return (fields, digest.digest()), False
@@ -269,17 +303,13 @@ def _session_db_content_sig(db_path: Path):
 
 # Filesystem timestamps come from a coarse clock (~4 ms ticks; whole seconds on some filesystems) and
 # SQLite commits in place, so a commit landing in the tick of a read leaves the DB/WAL mtime unchanged.
-# A digest read while the mtime is that fresh must not become a cache hit ("racily clean", as in git's
-# index): it is cached under a key no mtime equals, so the next tick re-reads the rows.
-_RACY_MTIME = object()
-
-
-def _settled_mtime(mtime):
-    """``mtime`` when it is old enough to trust as a cache key, else a never-matching sentinel."""
+# A digest read while the mtime is that fresh is "racily clean" (as in git's index): it is not trusted
+# as "nothing was written since", but it is not re-read on every tick either — _db_content_sig answers
+# from cache while the window lasts and confirms with one read once the mtime settles.
+def _mtime_racy(mtime) -> bool:
+    """True while ``mtime`` is too recent to rule out a same-tick write after the stat."""
     from utils import mtime_is_racy  # function-local: bodies are rebound onto server.py's globals
-    if mtime is None or mtime_is_racy(mtime):
-        return _RACY_MTIME
-    return mtime
+    return mtime is None or mtime_is_racy(mtime)
 
 
 def _watched_homes() -> tuple[Path, ...]:
@@ -379,7 +409,7 @@ def _room_rows_sig(conn, _mtime) -> dict:
     return room_change_rows(conn), False
 
 
-_room_store_sig_cache: dict[str, tuple[object, dict | None, bool]] = {}
+_room_store_sig_cache: dict[str, tuple[object, dict | None, bool, bool]] = {}
 
 
 def _groups_sig() -> dict:
@@ -423,7 +453,7 @@ def _wake_room_drivers() -> None:
     groups watch already cached: no store access of its own."""
     from tui_gateway.hosted_room_service import live_room_services
     heads = {store: {room_id: part.next_seq for room_id, part in rows.items()}
-             for store, (_mtime, rows, _fallback) in _room_store_sig_cache.items() if rows}
+             for store, (_mtime, rows, _fallback, _confirmed) in _room_store_sig_cache.items() if rows}
     moved = {store for store, rooms in heads.items() if _groups_woken_heads.get(store, rooms) != rooms}
     _groups_woken_heads.clear()
     _groups_woken_heads.update(heads)

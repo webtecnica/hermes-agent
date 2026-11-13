@@ -314,7 +314,7 @@ def test_a_failed_read_keeps_a_good_answer_but_not_a_fallback(tmp_path, monkeypa
     db.write_bytes(b"")
     cache, mtimes, answers = {}, iter((1, 2, 3, 4)), iter(("good", RuntimeError("busy")))
     monkeypatch.setattr(server, "_newest_mtime_ns", lambda _paths: next(mtimes))
-    monkeypatch.setattr(server, "_settled_mtime", lambda mtime: mtime)
+    monkeypatch.setattr(server, "_mtime_racy", lambda _mtime: False)
 
     def read(_conn, _mtime):
         answer = next(answers, RuntimeError("busy"))
@@ -327,7 +327,7 @@ def test_a_failed_read_keeps_a_good_answer_but_not_a_fallback(tmp_path, monkeypa
 
     assert sig() == "good"
     assert sig() == "good", "a busy read after a good answer keeps it"
-    cache[str(db)] = (2, ("fallback", 2), True)
+    cache[str(db)] = (2, ("fallback", 2), True, True)
     assert sig() == ("fallback", 3)
     assert sig() == ("fallback", 4), "after a fallback, a newer one replaces it"
 
