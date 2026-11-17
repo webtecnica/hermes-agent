@@ -415,6 +415,191 @@ class TestStandaloneSend:
 
 
 # ---------------------------------------------------------------------------
+# 10b. Notification title (#156887)
+# ---------------------------------------------------------------------------
+#
+# A publish with no X-Title makes ntfy fall back to the topic name as the
+# notification heading, which on a private/randomly-suffixed topic is an opaque
+# token (`alfred-404f6688a123`) on the user's lock screen. Both call sites now
+# resolve a heading: metadata["title"] -> extra["title"] -> NTFY_HOME_CHANNEL_NAME.
+
+
+class TestPublishTitle:
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("NTFY_HOME_CHANNEL_NAME", raising=False)
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+
+    @staticmethod
+    def _adapter(extra=None, token="", markdown=False):
+        merged = {"topic": "hermes-in", **(extra or {})}
+        if token:
+            merged["token"] = token
+        if markdown:
+            merged["markdown"] = True
+        return NtfyAdapter(PlatformConfig(enabled=True, extra=merged))
+
+    @staticmethod
+    def _client():
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "id-1"}
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        return client
+
+    def _send_headers(self, adapter, client, **kwargs):
+        _run(adapter.send("hermes-in", "hi", **kwargs))
+        return client.post.call_args[1]["headers"]
+
+    def _standalone_headers(self, pconfig, client):
+        with patch.object(_ntfy, "httpx") as mock_httpx:
+            mock_httpx.AsyncClient.return_value = client
+            result = _run(_standalone_send(pconfig, "hermes-in", "hi"))
+        assert result["success"] is True
+        return client.post.call_args[1]["headers"]
+
+    # -- send() ------------------------------------------------------------
+
+    def test_send_metadata_title_becomes_x_title(self):
+        adapter = self._adapter()
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client, metadata={"title": "Cron: daily report"})
+
+        assert headers["X-Title"] == "Cron: daily report"
+        assert headers["X-Tags"] == _ntfy._ECHO_TAG
+
+    def test_send_metadata_title_wins_over_extra_and_home_name(self, monkeypatch):
+        monkeypatch.setenv("NTFY_HOME_CHANNEL_NAME", "Alerts Channel")
+        adapter = self._adapter(extra={"title": "Configured"})
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client, metadata={"title": "Explicit"})
+
+        assert headers["X-Title"] == "Explicit"
+
+    def test_send_falls_back_to_extra_title(self):
+        adapter = self._adapter(extra={"title": "Configured"})
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client)
+
+        assert headers["X-Title"] == "Configured"
+
+    def test_send_falls_back_to_home_channel_name(self, monkeypatch):
+        monkeypatch.setenv("NTFY_HOME_CHANNEL_NAME", "Alerts Channel")
+        adapter = self._adapter()
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client)
+
+        assert headers["X-Title"] == "Alerts Channel"
+
+    def test_send_without_any_title_sends_no_x_title(self):
+        adapter = self._adapter()
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client)
+
+        assert "X-Title" not in headers
+        # Nothing else moved: today's header order is unchanged without a title.
+        assert list(headers) == ["Content-Type", "X-Tags"]
+
+    def test_send_title_strips_control_characters(self):
+        adapter = self._adapter()
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(
+            adapter, client, metadata={"title": "Cron\r\njob\tfailed\nX-Evil: 1"})
+
+        assert headers["X-Title"] == "Cron job failed X-Evil: 1"
+        assert not any(ch in headers["X-Title"] for ch in "\r\n\t")
+
+    def test_send_non_ascii_title_degrades_without_raising(self):
+        adapter = self._adapter()
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client, metadata={"title": "Aviso café 日本語"})
+
+        assert headers["X-Title"].isascii()
+        assert headers["X-Title"].startswith("Aviso cafe")
+        assert headers["X-Tags"] == _ntfy._ECHO_TAG
+
+    def test_send_non_string_title_falls_through(self, monkeypatch):
+        monkeypatch.setenv("NTFY_HOME_CHANNEL_NAME", "Alerts Channel")
+        adapter = self._adapter()
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client, metadata={"title": {"nested": "obj"}})
+
+        assert headers["X-Title"] == "Alerts Channel"
+
+    def test_send_preserves_header_order_with_title(self):
+        adapter = self._adapter(token="tok")
+        client = self._client()
+        adapter._http_client = client
+
+        headers = self._send_headers(adapter, client, metadata={"title": "Heads up"})
+
+        assert list(headers) == ["Authorization", "Content-Type", "X-Tags", "X-Title"]
+
+    # -- _standalone_send() ------------------------------------------------
+
+    def test_standalone_extra_title_becomes_x_title(self):
+        pconfig = MagicMock()
+        pconfig.extra = {"topic": "hermes-in", "title": "Cron: daily report"}
+        client = self._client()
+
+        headers = self._standalone_headers(pconfig, client)
+
+        assert headers["X-Title"] == "Cron: daily report"
+        assert headers["X-Tags"] == _ntfy._ECHO_TAG
+
+    def test_standalone_falls_back_to_home_channel_name(self, monkeypatch):
+        monkeypatch.setenv("NTFY_HOME_CHANNEL_NAME", "Alerts Channel")
+        pconfig = MagicMock()
+        pconfig.extra = {"topic": "hermes-in"}
+        client = self._client()
+
+        headers = self._standalone_headers(pconfig, client)
+
+        assert headers["X-Title"] == "Alerts Channel"
+
+    def test_standalone_without_any_title_sends_no_x_title(self):
+        pconfig = MagicMock()
+        pconfig.extra = {"topic": "hermes-in"}
+        client = self._client()
+
+        headers = self._standalone_headers(pconfig, client)
+
+        assert "X-Title" not in headers
+        assert list(headers) == ["Content-Type", "X-Tags"]
+
+    def test_standalone_preserves_header_order_with_title_and_markdown(self, monkeypatch):
+        monkeypatch.setenv("NTFY_MARKDOWN", "true")
+        pconfig = MagicMock()
+        pconfig.extra = {"topic": "hermes-in", "title": "Heads up"}
+        client = self._client()
+
+        headers = self._standalone_headers(pconfig, client)
+
+        assert list(headers) == ["Content-Type", "X-Tags", "X-Markdown", "X-Title"]
+        assert headers["X-Tags"] == _ntfy._ECHO_TAG
+
+
+# ---------------------------------------------------------------------------
 # 11. register() — plugin-side metadata
 # ---------------------------------------------------------------------------
 

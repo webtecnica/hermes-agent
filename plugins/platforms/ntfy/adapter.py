@@ -7,12 +7,15 @@ NTFY_TOKEN, NTFY_PUBLISH_TOPIC, NTFY_MARKDOWN ("true"/"1"/"yes"), NTFY_ALLOWED_U
 NTFY_ALLOW_ALL_USERS (dev only), NTFY_HOME_CHANNEL, NTFY_HOME_CHANNEL_NAME.
 Identity: ntfy has no authenticated user; ``title`` is publisher-controlled and NOT used for
 authorization. Each topic is one trusted channel (``user_id`` == topic). Protect it with a read token.
+Outbound publishes send ``X-Title`` resolved as ``metadata["title"]`` → ``extra["title"]`` →
+``NTFY_HOME_CHANNEL_NAME``; without one ntfy falls back to the topic token as the heading.
 """
 
 import asyncio
 import json
 import logging
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timezone, UTC
 from typing import Any, Dict, List, Optional
@@ -49,6 +52,7 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 STREAM_TIMEOUT_SECONDS = 90  # ntfy keepalive default is 55s; give margin
 _ECHO_TAG = "hermes-agent"  # tag added to outgoing messages for echo-loop prevention
 _MARKDOWN_TRUTHY = ("1", "true", "yes")
+_MAX_TITLE_CHARS = 120  # notification headings are a glance-length line, not a body
 
 
 def _build_auth_header(token: str) -> dict[str, str]:
@@ -66,16 +70,68 @@ def _build_auth_header(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _publish_headers(token: str, markdown: bool, *, auth_first: bool = True) -> dict[str, str]:
-    """Headers for a publish POST: auth (if any), plain-text body, echo tag, optional X-Markdown.
+def _sanitize_title(raw: Any) -> str:
+    """Make a publisher-supplied heading safe to send; ``""`` when nothing usable is left.
+
+    Whitespace is collapsed and control characters are dropped — a bare CR/LF would let the
+    value smuggle extra header lines. httpx encodes header values as ASCII (0.28 raises
+    ``UnicodeEncodeError`` otherwise), so anything outside ASCII is transliterated and then
+    replaced: a bad title must never be able to raise inside the publish path.
+    """
+    try:
+        if not isinstance(raw, str):
+            return ""
+        text = "".join(" " if (ch.isspace() or unicodedata.category(ch).startswith("Z")) else ch for ch in raw)
+        text = "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
+        text = " ".join(text.split())
+        if not text:
+            return ""
+        try:
+            text.encode("ascii")
+        except UnicodeEncodeError:
+            folded = " ".join(unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").split())
+            text = folded or " ".join(text.encode("ascii", "replace").decode("ascii").split())
+        return text[:_MAX_TITLE_CHARS].strip()
+    except Exception:  # noqa: BLE001 — never fail a publish over a heading
+        return ""
+
+
+def _resolve_title(metadata: Optional[dict[str, Any]], extra: dict[str, Any]) -> str:
+    """Notification heading: ``metadata["title"]`` → ``extra["title"]`` → ``NTFY_HOME_CHANNEL_NAME``.
+
+    ``title`` only picks what a push shows; it is publisher-controlled and never drives
+    identity (``user_id`` stays the topic). Values that sanitize to empty are skipped so a
+    blank override falls through to the next source instead of blanking the heading.
+    """
+    for candidate in (
+        (metadata or {}).get("title") if hasattr(metadata or {}, "get") else None,
+        (extra or {}).get("title") if hasattr(extra or {}, "get") else None,
+        _get_scoped_secret("NTFY_HOME_CHANNEL_NAME", ""),
+    ):
+        title = _sanitize_title(candidate)
+        if title:
+            return title
+    return ""
+
+
+def _publish_headers(
+    token: str, markdown: bool, *, auth_first: bool = True, title: Optional[str] = None,
+) -> dict[str, str]:
+    """Headers for a publish POST: auth (if any), plain-text body, echo tag, optional
+    X-Markdown and X-Title.
 
     ``auth_first`` pins the header order each call site has always sent on the wire.
+    ``X-Title`` is appended last so no existing position moves; a resolved title is what
+    keeps ntfy from showing the raw topic token as the notification heading.
     """
     auth = _build_auth_header(token)
     base = {"Content-Type": "text/plain; charset=utf-8", "X-Tags": _ECHO_TAG}
     headers = {**auth, **base} if auth_first else {**base, **auth}
     if markdown:
         headers["X-Markdown"] = "true"
+    safe_title = _sanitize_title(title)
+    if safe_title:
+        headers["X-Title"] = safe_title
     return headers
 
 
@@ -278,7 +334,9 @@ class NtfyAdapter(BasePlatformAdapter):
         publish_topic = (metadata or {}).get("publish_topic") or self._publish_topic or chat_id
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
-        headers = _publish_headers(self._token, bool((self.config.extra or {}).get("markdown", False)))
+        headers = _publish_headers(
+            self._token, bool((self.config.extra or {}).get("markdown", False)),
+            title=_resolve_title(metadata, self.config.extra or {}))
         if len(content) > self.MAX_MESSAGE_LENGTH:
             logger.warning(
                 "[%s] Message truncated from %d to %d chars (ntfy limit)",
@@ -344,7 +402,7 @@ async def _standalone_send(
     token = _extra_or_secret(extra, "token", "NTFY_TOKEN")
     markdown_env = _get_scoped_secret("NTFY_MARKDOWN", "").strip().lower()
     markdown = bool(extra.get("markdown")) or markdown_env in _MARKDOWN_TRUTHY
-    headers = _publish_headers(token, markdown, auth_first=False)
+    headers = _publish_headers(token, markdown, auth_first=False, title=_resolve_title(None, extra))
     body = _truncate_body(message, context="ntfy standalone")
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
