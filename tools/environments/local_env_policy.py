@@ -51,8 +51,11 @@ _STATIC_PROVIDER_ENV_BLOCKLIST = frozenset({
     # from here, at import, would re-mirror them over a plugin's own registry entry.
     "NOUS_API_KEY", "QWEN_API_KEY",
     # Hermes' own secrets read in code: the anonymous-inference secret, dashboard auth
-    # (basic, OIDC, drain) and the Google Meet realtime key.
-    "HERMES_ANON_API_SECRET", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+    # (basic, OIDC, drain) and the Google Meet realtime key. The basic-auth username is
+    # stripped alongside its password: half a credential authenticates nothing, so the
+    # child loses no capability while the pair never leaves the parent (#156922).
+    "HERMES_ANON_API_SECRET", "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
     "HERMES_DASHBOARD_BASIC_AUTH_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_MEET_REALTIME_KEY",
 })
@@ -640,10 +643,12 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     # enumerated here to stay stripped on the inherit_credentials=True path.
     "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_DELIVERY_KEY",
     "EMAIL_PASSWORD", "HERMES_DASHBOARD_SESSION_TOKEN", "HERMES_TUI_SIDECAR_URL", "HERMES_TUI_GATEWAY_URL",
-    # Dashboard auth: the basic-auth password and session-signing secret, the OIDC client
-    # secret and the drain bearer. They let a holder mint or forge dashboard sessions, and no
-    # child (credentialed CLIs included) consumes them.
-    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+    # Dashboard auth: the basic-auth username/password pair and session-signing secret, the OIDC
+    # client secret and the drain bearer. They let a holder mint or forge dashboard sessions, and no
+    # child (credentialed CLIs included) consumes them. The username rides along with its password:
+    # stripping only half the pair left the child logging a false "username set, no password" (#156922).
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
