@@ -11,8 +11,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from contextlib import suppress
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -21,6 +23,13 @@ _BOOLS = ("accessibility", "screen_recording", "screen_recording_capturable")
 CUA_DRIVER_BUNDLE_ID = "com.trycua.driver"  # the only identity TCC rows and the private daemon are keyed to
 _TCC_SERVICES = {"accessibility": "Accessibility", "screen_recording": "ScreenCapture"}  # status field -> tccutil service
 TCC_FIELDS = tuple(_TCC_SERVICES)
+
+# ``cua-driver doctor --json`` costs ~1.8 s on Windows (#157424) and the desktop Capabilities tab re-reads the
+# status every time it appears, so the probe half of the payload is memoized for a few seconds. Only a HEALTHY
+# read is cached: a timeout or a failed doctor must never sit behind the TTL as a stale/blank answer.
+_STATUS_CACHE_TTL = 30.0
+_status_cache: dict[tuple, tuple[float, dict[str, Any]]] = {}
+_status_cache_lock = threading.Lock()
 
 def stale_tcc_grant_hint(*missing: str) -> str:
     """Recovery text for grants the daemon reports missing while System Settings shows the CuaDriver toggle ON.
@@ -82,10 +91,68 @@ def _mac_permissions(binary: str, out: dict[str, Any]) -> None:
             if isinstance(data.get("source"), dict):
                 out["source"] = data["source"]
 
+def _status_cache_key(backend: str, binary: str, plat: str) -> tuple:
+    """``(backend, binary, platform, binary stat)`` — the inputs the probe half of the payload derives from.
+
+    The profile is not keyed separately: ``computer_use.backend`` and the resolved binary are the only
+    profile-scoped inputs folded into the payload, and two profiles that share both share the payload (they
+    differ elsewhere in the dict only through values recomputed on every call). ``mtime_ns``/``size`` change on
+    every driver install or upgrade, which retires the entry without a hook inside the installer.
+    """
+    stamp = None
+    with suppress(OSError):
+        info = os.stat(binary)
+        stamp = (info.st_mtime_ns, info.st_size)
+    return (backend, binary, plat, stamp)
+
+
+def invalidate_status_cache() -> None:
+    """Drop every cached probe: a permission grant, a driver upgrade or a backend switch can change the answer."""
+    with _status_cache_lock:
+        _status_cache.clear()
+
+
+def _probe(binary: str, plat: str) -> dict[str, Any]:
+    """The expensive half of the payload: ``--version``, ``doctor`` and (macOS) the TCC rows."""
+    version = None
+    with suppress(Exception):
+        version = (_run(binary, "--version", timeout=5).stdout or "").strip() or None
+    doctor = _doctor(binary)
+    tcc: dict[str, Any] = {"source": None, "error": None, **{k: None for k in _BOOLS}}
+    if plat == "darwin":
+        _mac_permissions(binary, tcc)
+    return {"version": version, "doctor": doctor, "source": tcc["source"], "error": tcc["error"],
+            "bools": {k: tcc[k] for k in _BOOLS}}
+
+
+def _probe_cached(backend: str, binary: str, plat: str) -> dict[str, Any]:
+    """``_probe`` behind a short TTL, under a lock (the gateway serves requests on threads).
+
+    Failures bypass the cache entirely: ``doctor`` returning nothing, or the macOS TCC probe erroring, is
+    reported as-is on every call so a broken driver cannot read as healthy for the whole TTL. Two requests that
+    miss at the same moment may both probe — the lock never covers a subprocess, so one slow probe cannot block
+    another profile's status read.
+    """
+    key = _status_cache_key(backend, binary, plat)
+    with _status_cache_lock:
+        hit = _status_cache.get(key)
+    if hit is not None and hit[0] > time.monotonic():
+        return hit[1]
+    probes = _probe(binary, plat)
+    if probes["doctor"] is None or probes["error"] is not None:
+        with _status_cache_lock:
+            _status_cache.pop(key, None)
+        return probes
+    with _status_cache_lock:
+        _status_cache[key] = (time.monotonic() + _STATUS_CACHE_TTL, probes)
+    return probes
+
+
 def computer_use_status(driver_cmd: Optional[str] = None) -> dict[str, Any]:
     """OS-aware readiness for the desktop card; key order is an API payload contract. ``ready`` is the single signal the
     UI keys off: macOS = both TCC grants, elsewhere = driver health (no TCC model); ``None`` = unknown (binary missing /
-    probe failed). ``can_grant`` is macOS-only."""
+    probe failed). ``can_grant`` is macOS-only. The driver probes behind the cua path are memoized for
+    ``_STATUS_CACHE_TTL`` seconds (see ``_probe_cached``); the dict itself is rebuilt on every call."""
     from plugins.computer_use import DEFAULT_BACKEND, configured_backend_name, get_active_provider
     from tools.computer_use.cua_backend_driver import resolve_cua_driver_cmd  # same resolver as the tool itself
     plat, name = sys.platform, configured_backend_name()
@@ -105,17 +172,18 @@ def computer_use_status(driver_cmd: Optional[str] = None) -> dict[str, Any]:
         return out
     if not binary:
         return out
-    with suppress(Exception):
-        out["version"] = (_run(binary, "--version", timeout=5).stdout or "").strip() or None
-    doctor = _doctor(binary)
-    if doctor is not None:
-        out["checks"] = doctor["checks"]
+    probes = _probe_cached(name, binary, plat)
+    out["version"] = probes["version"]
+    out["source"] = probes["source"]
+    out["error"] = probes["error"]
+    out.update({k: v for k, v in probes["bools"].items() if v is not None})
+    if probes["doctor"] is not None:
+        out["checks"] = [dict(check) for check in probes["doctor"]["checks"]]  # copies: callers never share cache state
     if plat == "darwin":
-        _mac_permissions(binary, out)
         if out["error"] is None:
             out["ready"] = out["accessibility"] is True and out["screen_recording"] is True
-    elif doctor is not None:
-        out["ready"] = doctor["ok"]  # no TCC model off macOS
+    elif probes["doctor"] is not None:
+        out["ready"] = probes["doctor"]["ok"]  # no TCC model off macOS
     return out
 
 def request_permissions_grant(driver_cmd: Optional[str] = None) -> int:
@@ -138,3 +206,6 @@ def request_permissions_grant(driver_cmd: Optional[str] = None) -> int:
     except Exception as exc:  # pragma: no cover - defensive
         print(f"cua-driver permissions grant failed: {exc}", file=sys.stderr)
         return 2
+    finally:
+        # A grant attempt rewrites the TCC rows (or leaves them denied) either way: no cached probe may survive it.
+        invalidate_status_cache()
