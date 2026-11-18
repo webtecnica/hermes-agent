@@ -354,6 +354,16 @@ def _adopt_secondary_home(home: Path) -> bool:
     return enable_profile_log_routing([*sorted(known), resolved])
 
 
+# Standalone defaults for a profile that declares no usable ``logging.max_size_mb`` /
+# ``logging.backup_count``. Read per home by the router as well (#157547), so a routed profile
+# falls back to the same values it would get running on its own.
+_DEFAULT_LOG_MAX_SIZE_MB = 5
+_DEFAULT_LOG_BACKUP_COUNT = 3
+# The only file whose rotation follows ``logging.*`` (setup_logging applies those keys to
+# agent.log alone; errors/gateway/gui keep the fixed spec below).
+_AGENT_LOG_FILENAME = "agent.log"
+
+
 def setup_logging(
     *,
     hermes_home: Optional[Path] = None,
@@ -390,8 +400,8 @@ def setup_logging(
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
     level_name = (log_level or cfg_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
-    backups = backup_count or cfg_backup or 3
+    max_bytes = (max_size_mb or cfg_max_size or _DEFAULT_LOG_MAX_SIZE_MB) * 1024 * 1024
+    backups = backup_count or cfg_backup or _DEFAULT_LOG_BACKUP_COUNT
 
     from agent.redact import RedactingFormatter  # lazy: circular at module load
 
@@ -702,6 +712,25 @@ class _ProfileRoutingFileHandler(logging.Handler):
         self.release_profile(home)
         return True
 
+    def _rotation_for_home(self, home: Path) -> tuple[int, int]:
+        """``(max_bytes, backup_count)`` for *home*'s copy of this router's file.
+
+        The launch limits were resolved once by ``setup_logging`` and describe the launch
+        profile only: reusing them for every routed home silently ignored a served profile's own
+        ``logging.max_size_mb`` / ``logging.backup_count`` (#157547). Each routed home therefore
+        resolves its own ``config.yaml``, exactly as a standalone run of that profile does, and a
+        home that declares nothing gets the standalone defaults rather than the launch profile's
+        values. Only ``agent.log`` follows ``logging.*``; the component logs keep the limits of
+        the handler whose file they share.
+        """
+        if home == self._default_home or self._filename != _AGENT_LOG_FILENAME:
+            return self._max_bytes, self._backup_count
+        _, max_size_mb, backup_count = _read_logging_config(home / "config.yaml")
+        return (
+            _positive_int(max_size_mb, _DEFAULT_LOG_MAX_SIZE_MB) * 1024 * 1024,
+            _positive_int(backup_count, _DEFAULT_LOG_BACKUP_COUNT),
+        )
+
     def _handler_for_home(self, home: Path) -> Optional[_ManagedRotatingFileHandler]:
         """The open handler for *home*; ``None`` once the router or that home is retired."""
         with self._profile_handlers_lock:
@@ -712,9 +741,10 @@ class _ProfileRoutingFileHandler(logging.Handler):
         # ``logging.shutdown`` (uvicorn's ``dictConfig``) holds that lock while it acquires each
         # handler's lock and closes it (``close`` takes ``_profile_handlers_lock``). Holding
         # either router lock here deadlocked the QueueListener against ``dictConfig`` (T23).
+        max_bytes, backup_count = self._rotation_for_home(home)
         built = _new_file_handler(
-            home / "logs" / self._filename, level=self.level, max_bytes=self._max_bytes,
-            backup_count=self._backup_count, formatter=self.formatter,
+            home / "logs" / self._filename, level=self.level, max_bytes=max_bytes,
+            backup_count=backup_count, formatter=self.formatter,
         )
         built._skip_write_when_dir_missing = home != self._default_home
         built._never_reopen_after_close = True
@@ -1030,18 +1060,33 @@ def _add_rotating_handler(
     _register_queued_handler(handler)
 
 
-def _read_logging_config():
-    """Best-effort read of ``logging.*`` from config.yaml."""
+def _positive_int(value, default: int) -> int:
+    """*value* as a positive int, else *default* (a hand-edited config must not break writing)."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _read_logging_config(config_path: Optional[Path] = None):
+    """Best-effort read of ``logging.*`` from the config.yaml at *config_path*.
+
+    *config_path* defaults to the launch home's ``config.yaml``. A routed profile passes its own
+    path: the effective-config cache is keyed by config path, so each home gets its own file
+    (managed overlay included) instead of the launch profile's (#157547).
+    """
     try:
         # Prefer the shared effective-config cache (managed overlay included, so an administrator
         # can pin logging.*) so this reuses hermes_cli.main's early parse (one config.yaml parse
         # per process); fall back to a direct parse for bare hermes_logging consumers.
+        if config_path is None:
+            config_path = get_config_path()
         try:
             from hermes_cli.config_effective import load_user_config_effective
-            cfg = load_user_config_effective(get_config_path())
+            cfg = load_user_config_effective(config_path)
         except Exception:
             from hermes_cli.config_backend import config_exists, read_config_doc
-            config_path = get_config_path()
             cfg = (read_config_doc(config_path) or {}) if config_exists(config_path) else {}
         if not cfg:
             return (None, None, None)
