@@ -718,6 +718,46 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[l
 
 # ---- Main entry point ----
 
+# Fence delimiters around a code argument (#157155). A whole line qualifies only when it holds
+# nothing but the delimiter: three or more backticks (optionally with an info string such as
+# ``python``), a tilde fence, or a bare <code>/<pre> tag.
+_FENCE_OPEN_RE = re.compile(r"^(?:`{3,}[ \t]*[A-Za-z0-9_+./-]*|~{3,}|<code>|<pre>)$", re.IGNORECASE)
+_FENCE_CLOSE_RE = re.compile(r"^(?:`{3,}|~{3,}|</code>|</pre>)$", re.IGNORECASE)
+_FENCE_STRIPPED_NOTICE = "fence line stripped before compile"
+
+
+def _strip_edge_fence_lines(code: str) -> tuple[str, bool]:
+    """Drop at most one fence-delimiter line from each edge of *code* (#157155).
+
+    Models routinely wrap ``execute_code`` source in a markdown/HTML fence, and the fence lines
+    then reach ``compile`` and raise ``SyntaxError``. Only whole delimiter lines at the very
+    start/end are eligible: a fence-looking line inside the body is still the caller's code and
+    keeps failing exactly as before. Returns the source (the original object when nothing
+    matched, so an unfenced call ships byte-identically) and whether anything was stripped.
+    """
+    lines = code.splitlines(keepends=True)
+    if not lines:
+        return code, False
+    start = 1 if _FENCE_OPEN_RE.match(lines[0].strip()) else 0
+    end = len(lines)
+    if end > start and _FENCE_CLOSE_RE.match(lines[-1].strip()):
+        end -= 1
+    if start == 0 and end == len(lines):
+        return code, False
+    return "".join(lines[start:end]), True
+
+
+def _annotate_fence_stripped(result_json: str) -> str:
+    """Add the edge-fence notice to a JSON tool result; a non-JSON payload passes through."""
+    try:
+        body = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(body, dict):
+        return result_json
+    body["notice"] = _FENCE_STRIPPED_NOTICE
+    return json.dumps(body, ensure_ascii=False)
+
 
 def execute_code(
     code: str,
@@ -745,6 +785,12 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided. execute_code requires a non-empty 'code' "
                           "parameter containing Python source. To run shell commands, use terminal(command=...) instead.")
+    # Normalize an edge fence once, on the host, before any backend sees the source (#157155):
+    # the local session kernel, the remote kernel and the per-call script ship all inherit it.
+    code, _fence_stripped = _strip_edge_fence_lines(code)
+    if _fence_stripped and not code.strip():
+        return tool_error("No code provided after stripping a fence line. execute_code requires "
+                          "'code' to contain Python source between (not instead of) the fences.")
     # Gated on PID-file ownership, not the inherited env marker.
     # Hard-block gateway-lifecycle commands, mirroring the terminal_tool guard (#68289): without this,
     # execute_code is a straight bypass — the terminal() path refuses `launchctl bootout ai.hermes.gateway`,
@@ -789,16 +835,18 @@ def execute_code(
     from tools.environments.sandbox_scope import hosted_scope
     # A hosted agent's code runs only in its sandbox, never in a kernel on this host.
     if env_type != "local" or hosted_scope() is not None:
-        return record_execution_backend("code", "remote", _execute_remote(
+        _remote = _execute_remote(
             code, task_id, enabled_tools, reset=bool(reset), session_id=session_id, turn_id=turn_id,
-            conversation_id=conversation_id))
+            conversation_id=conversation_id)
+        return record_execution_backend(
+            "code", "remote", _annotate_fence_stripped(_remote) if _fence_stripped else _remote)
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
     from tools.code_kernel import execute_in_session_kernel
     _cfg = _load_config()
     _mode = _get_execution_mode()
-    return record_execution_backend("code", "local", execute_in_session_kernel(
+    _local = execute_in_session_kernel(
         code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
         child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
         sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
@@ -806,7 +854,9 @@ def execute_code(
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
         session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
-    ))
+    )
+    return record_execution_backend(
+        "code", "local", _annotate_fence_stripped(_local) if _fence_stripped else _local)
 
 
 def _load_config() -> dict:
