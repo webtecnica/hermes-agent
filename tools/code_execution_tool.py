@@ -49,6 +49,69 @@ MAX_STDERR_BYTES = 10_000    # 10 KB
 # Hard ceiling on the spilled file (as web_tools' MAX_STORED_TEXT_CHARS): a runaway print loop must not fill the disk.
 MAX_SPILLED_STDOUT_BYTES = 5_000_000
 
+# ---- Edge fence normalization ----
+# Models wrap a whole code argument in a markdown/HTML block often enough that the closing
+# line alone reached `exec(compile(...))` and raised `SyntaxError: invalid syntax` (#157155).
+# One opening and one closing fence line are dropped; a fence in the middle of the code is
+# left alone (that is a real syntax error, not a wrapper).
+_EDGE_FENCE_TAGS = frozenset({"<code>", "</code>", "<pre>", "</pre>"})
+# ``` / ```python / ```` / ~~~ / ~~~bash — three or more markers plus an optional info string.
+_EDGE_FENCE_LINE_RE = re.compile(r"^(?:`{3,}|~{3,})[ \t]*[A-Za-z0-9_+.#-]*$")
+FENCE_STRIPPED_NOTICE = ("fence line stripped before compile: execute_code removes at most one "
+                         "markdown/HTML fence line from the start and one from the end of 'code'; "
+                         "pass raw Python next time.")
+
+
+def _is_edge_fence_line(line: str) -> bool:
+    """True for a line that is only a fence wrapper: ```… / ~~~…, <code>, </code>, <pre>, </pre>."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.lower() in _EDGE_FENCE_TAGS:
+        return True
+    return bool(_EDGE_FENCE_LINE_RE.match(stripped))
+
+
+def _strip_edge_fence(code: str) -> tuple[str, bool]:
+    """Drop at most one fence line at each end; ``(code, stripped)``. Code with no edge fence is
+    returned unchanged (same object), so the bytes sent to the backends are untouched."""
+    if not code:
+        return code, False
+    lines = code.split("\n")
+    first, last = 0, len(lines) - 1
+    while first <= last and not lines[first].strip():
+        first += 1
+    while last > first and not lines[last].strip():
+        last -= 1
+    drop: set[int] = set()
+    if first <= last and _is_edge_fence_line(lines[first]):
+        drop.add(first)
+    if last > first and last not in drop and _is_edge_fence_line(lines[last]):
+        drop.add(last)
+    if not drop:
+        return code, False
+    # Never strip the whole argument down to whitespace: a lone fence line is still a compile error.
+    kept = [line for index, line in enumerate(lines) if index not in drop]
+    if not "\n".join(kept).strip():
+        return code, False
+    return "\n".join(kept), True
+
+
+def _annotate_fence_strip(result: str, stripped: bool) -> str:
+    """Append ``FENCE_STRIPPED_NOTICE`` to a JSON result string so the caller learns the
+    convention; no-op when nothing was stripped or the payload is not a JSON object."""
+    if not stripped:
+        return result
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(payload, dict):
+        return result
+    existing = payload.get("warning")
+    payload["warning"] = f"{existing} {FENCE_STRIPPED_NOTICE}" if existing else FENCE_STRIPPED_NOTICE
+    return json.dumps(payload, ensure_ascii=False)
+
 
 def _truncate_stdout_text(stdout_text: str, env: Any = None) -> tuple[str, dict[str, Any]]:
     """Cap stdout by bytes (40% head / 60% tail) with explicit truncation metadata: byte counts
@@ -745,6 +808,11 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided. execute_code requires a non-empty 'code' "
                           "parameter containing Python source. To run shell commands, use terminal(command=...) instead.")
+    # Strip one wrapper fence line at each end before any dispatch: the local session kernel,
+    # the remote session kernel and the remote per-call script ship all receive this same
+    # argument, so normalizing here covers all three backends (and the guards below see the
+    # code that will actually run). See #157155.
+    code, _fence_stripped = _strip_edge_fence(code)
     # Gated on PID-file ownership, not the inherited env marker.
     # Hard-block gateway-lifecycle commands, mirroring the terminal_tool guard (#68289): without this,
     # execute_code is a straight bypass — the terminal() path refuses `launchctl bootout ai.hermes.gateway`,
@@ -789,16 +857,16 @@ def execute_code(
     from tools.environments.sandbox_scope import hosted_scope
     # A hosted agent's code runs only in its sandbox, never in a kernel on this host.
     if env_type != "local" or hosted_scope() is not None:
-        return record_execution_backend("code", "remote", _execute_remote(
+        return record_execution_backend("code", "remote", _annotate_fence_strip(_execute_remote(
             code, task_id, enabled_tools, reset=bool(reset), session_id=session_id, turn_id=turn_id,
-            conversation_id=conversation_id))
+            conversation_id=conversation_id), _fence_stripped))
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
     from tools.code_kernel import execute_in_session_kernel
     _cfg = _load_config()
     _mode = _get_execution_mode()
-    return record_execution_backend("code", "local", execute_in_session_kernel(
+    return record_execution_backend("code", "local", _annotate_fence_strip(execute_in_session_kernel(
         code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
         child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
         sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
@@ -806,7 +874,7 @@ def execute_code(
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
         session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
-    ))
+    ), _fence_stripped))
 
 
 def _load_config() -> dict:
