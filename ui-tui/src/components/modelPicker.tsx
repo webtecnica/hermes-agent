@@ -444,16 +444,13 @@ export function ModelPicker({
       return
     }
 
-    // List-stage Esc/q handling (overlay keys are disabled while on a list
-    // stage so 'q' can be typed into the filter).
+    // List-stage Esc handling (overlay keys are disabled while on a list
+    // stage so 'q' can be typed into the filter). There is no 'q' → cancel
+    // here either: on the provider/model stages a printable key — 'q'
+    // included — is the first character of a filter query, so `qwen*` stays
+    // reachable through type-to-filter (#157542). Esc is the way out.
     if (key.escape) {
       back()
-
-      return
-    }
-
-    if (ch === 'q' && !filter) {
-      onCancel()
 
       return
     }
