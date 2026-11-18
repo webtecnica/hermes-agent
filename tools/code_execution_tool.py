@@ -549,6 +549,64 @@ def _remote_failure(exc: BaseException, exec_start: float, tool_calls_made: int)
 
 _REMOTE_EXIT_STATUS = {124: "timeout", 130: "interrupted"}
 
+# ---- Boundary code-fence strip (#157155) ----
+# Models habitually wrap the `code` argument in the markdown/HTML fence they use in prose
+# ("```python ... ```", "<code> ... </code>"). The runner compiles the argument verbatim, so the
+# fence line reaches `compile()` and the whole cell dies with SyntaxError before a statement runs.
+# Strip AT MOST ONE fence line at each edge and never in the middle: interior fences are not a
+# wrapping artifact, and a line consisting only of fence characters is never valid Python anyway.
+_FENCE_OPEN_RE = re.compile(r"^\s*(?:```+|~~~+)[ \t]*[\w.+-]*[ \t]*$")
+_FENCE_CLOSE_RE = re.compile(r"^\s*(?:```+|~~~+)[ \t]*$")
+_FENCE_TAG_RE = re.compile(r"^\s*</?(?:code|pre)>[ \t]*$", re.IGNORECASE)
+
+FENCE_STRIP_NOTICE = (
+    "fence line stripped before compile: the first and/or last line of 'code' was a "
+    "markdown/HTML fence and was dropped. Send raw Python, without the surrounding fence."
+)
+
+
+def _strip_code_fence(code: str) -> tuple[str, bool]:
+    """``(code, stripped)`` — drop at most one fence line at each edge of *code*.
+
+    A leading line may be ```/~~~ with an optional info string (```` ```python ````) or a
+    ``<code>``/``<pre>`` tag; a trailing line may be a bare ```/~~~ or a tag. Blank lines around
+    the edges are ignored while locating the fence. Code with no edge fence is returned
+    byte-identical, so nothing about today's clean-input behaviour changes."""
+    if not code:
+        return code, False
+    lines = code.split("\n")
+    lo, hi = 0, len(lines) - 1
+    while lo <= hi and not lines[lo].strip():
+        lo += 1
+    while hi >= lo and not lines[hi].strip():
+        hi -= 1
+    if lo > hi:
+        return code, False
+    stripped = False
+    if _FENCE_OPEN_RE.match(lines[lo]) or _FENCE_TAG_RE.match(lines[lo]):
+        lo += 1
+        stripped = True
+    if lo <= hi and (_FENCE_CLOSE_RE.match(lines[hi]) or _FENCE_TAG_RE.match(lines[hi])):
+        hi -= 1
+        stripped = True
+    if not stripped:
+        return code, False
+    return "\n".join(lines[lo:hi + 1]), True
+
+
+def _annotate_fence_strip(result_json: str) -> str:
+    """Attach the fence-strip notice to a JSON tool result (once, even if both edges went)."""
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(payload, dict):
+        return result_json
+    existing = payload.get("warning")
+    payload["warning"] = f"{existing} {FENCE_STRIP_NOTICE}" if existing else FENCE_STRIP_NOTICE
+    payload["fence_stripped"] = True
+    return json.dumps(payload, ensure_ascii=False)
+
 
 def _remote_result(status: str, raw_stdout: str, exec_start: float, fields: dict[str, Any],
                    kernel: Optional[dict[str, Any]] = None, *, env: Any = None) -> dict[str, Any]:
@@ -745,6 +803,10 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided. execute_code requires a non-empty 'code' "
                           "parameter containing Python source. To run shell commands, use terminal(command=...) instead.")
+    # A single fence line at either edge (markdown or HTML) is a wrapping artifact, not code:
+    # strip it HERE, at the one host-side entry point, so the local session kernel, the remote
+    # session kernel and the remote per-call script all inherit the same normalisation.
+    code, fence_stripped = _strip_code_fence(code)
     # Gated on PID-file ownership, not the inherited env marker.
     # Hard-block gateway-lifecycle commands, mirroring the terminal_tool guard (#68289): without this,
     # execute_code is a straight bypass — the terminal() path refuses `launchctl bootout ai.hermes.gateway`,
@@ -789,24 +851,27 @@ def execute_code(
     from tools.environments.sandbox_scope import hosted_scope
     # A hosted agent's code runs only in its sandbox, never in a kernel on this host.
     if env_type != "local" or hosted_scope() is not None:
-        return record_execution_backend("code", "remote", _execute_remote(
+        result = record_execution_backend("code", "remote", _execute_remote(
             code, task_id, enabled_tools, reset=bool(reset), session_id=session_id, turn_id=turn_id,
             conversation_id=conversation_id))
-    from tools.interrupt import is_interrupted as _is_interrupted
-    # Session kernels are always on locally (one interpreter per conversation); the guards above
-    # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
-    from tools.code_kernel import execute_in_session_kernel
-    _cfg = _load_config()
-    _mode = _get_execution_mode()
-    return record_execution_backend("code", "local", execute_in_session_kernel(
-        code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
-        child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
-        sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
-        timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
-        max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
-        reset=bool(reset), is_interrupted=_is_interrupted,
-        session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
-    ))
+    else:
+        from tools.interrupt import is_interrupted as _is_interrupted
+        # Session kernels are always on locally (one interpreter per conversation); the guards above
+        # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
+        from tools.code_kernel import execute_in_session_kernel
+        _cfg = _load_config()
+        _mode = _get_execution_mode()
+        result = record_execution_backend("code", "local", execute_in_session_kernel(
+            code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
+            child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
+            sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
+            timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
+            max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
+            reset=bool(reset), is_interrupted=_is_interrupted,
+            session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
+        ))
+    # Tell the caller its fence was dropped, so the next call sends raw Python.
+    return _annotate_fence_strip(result) if fence_stripped else result
 
 
 def _load_config() -> dict:
