@@ -137,6 +137,20 @@ describe('ModelPicker type-to-filter on q (#157542)', () => {
     }
   })
 
+  it('still backs out with Esc on the provider stage, where q no longer closes', async () => {
+    const picker = mount([OPENROUTER, QWEN])
+
+    try {
+      expect(await picker.press('')).toContain('OpenRouter')
+
+      // `q` is a filter character now, so Esc is the way out of the list stages.
+      await picker.press('\u001b')
+      await vi.waitFor(() => expect(picker.onCancel).toHaveBeenCalledTimes(1))
+    } finally {
+      picker.cleanup()
+    }
+  })
+
   it('still closes on q from the effort stage, which has no filter', async () => {
     const picker = mount([OPENROUTER, QWEN])
 
