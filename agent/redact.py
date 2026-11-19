@@ -378,6 +378,25 @@ _YAML_ASSIGN_RE = re.compile(
 
 _YAML_CFG_WORD_RE = re.compile(_YAML_CFG_NAMES, re.IGNORECASE)
 
+# Labelled typed field dumps: a serializer's struct dump puts a short label in front of the
+# field name and spells the declared type between the name and the value —
+# ``field password: CONCEALED = "…"``, ``db field token: STRING = "…"``. Both anchored passes
+# need the key at line start (``_YAML_ASSIGN_RE``, optionally behind a gutter) or right after
+# ``export`` (``_CFG_ANCHORED_RE``), so a mid-line labelled dump reached every surface verbatim
+# (#157615). The gate is the TYPED assignment (``: TYPE =``) plus a word-bounded
+# ``_YAML_CFG_NAMES`` key — never "anything before the key", which is what mangles prose:
+# ``Secretary: J.Smith``, ``tokenizer: cl100k_base`` and ``token: discussão`` carry no
+# ``: TYPE =`` and stay as written. Label, key and type are kept; only the value is masked.
+_LABEL_PREFIXED_DUMP_RE = re.compile(
+    r"(?P<head>(?P<label>(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_ ]{0,40}?)[ \t]+"
+    rf"(?P<key>[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)"
+    r"(?P<sep>:[ \t]*+)"
+    r"(?P<type>[A-Za-z_][A-Za-z0-9_\[\]]*+)"
+    r"(?P<assign>[ \t]*+=[ \t]*+))"
+    r"(?P<value>\"(?:\\[^\r\n]|[^\"\\\r\n])*\"|'(?:''|[^'\r\n])*'|['\"][^\r\n]*|[^\s&]++)",
+    re.IGNORECASE,
+)
+
 # Word-boundary validation for the key patterns above: their classes allow
 # arbitrary affixes (``client_secret``, ``s3.secret-key``), which also matched
 # prose CONTAINING a keyword (``Secretary:``, ``tokenizer:``). A keyword counts
@@ -1358,6 +1377,41 @@ def _redact_json_affixed_key_escaped(m: "re.Match[str]", mask) -> str:
     return f'{m.group(1)}: {m.group(2)}"{mask(m.group(4))}{m.group(2)}"'
 
 
+def _should_redact_typed_dump_field(key: str, value: str) -> bool:
+    """Gate for a labelled typed field dump (``field token: STRING = "…"``, #157615).
+
+    The shared assignment gate decides the cases it already covers (path/var references,
+    programmatic env lookups, an earlier mask, placeholders). What it cannot decide is a
+    short literal under a plain ``token``/``secret`` key: that carve-out exists so config
+    prose (``token: local``) stays readable, but a DECLARED TYPE in front of the assignment
+    is a serializer's struct dump — ``type: token = "synthtok123"`` is a field value, not a
+    model limit — so a word-bounded keyword masks at any length here. Non-credential scalars
+    (``true``, ``null``, ``default``, ``<your key>``) still stay as written, the same call
+    ``_CONFIG_PLACEHOLDER_VALUE_RE`` makes for qualified keys."""
+    if _should_redact_assignment(key, value, check_keyword=True):
+        return True
+    if value == "***" or value.startswith("«redacted"):  # an earlier pass already masked it
+        return False
+    if not _has_word_bounded_keyword(key, _KEY_KEYWORD_RE):
+        return False
+    return _CONFIG_PLACEHOLDER_VALUE_RE.fullmatch(value) is None
+
+
+def _redact_label_prefixed_dump(m: "re.Match[str]", mask) -> str:
+    """Mask only the value of a labelled typed field dump, keeping label, key and type."""
+    value = m.group("value")
+    quote = value[0] if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0] else ""
+    inner = value[1:-1] if quote else value
+    # Same non-credential scalars as _redact_yaml: empty, docs/environment placeholder,
+    # Helm/Jinja template. Masking those hides what the config expects.
+    if quote and (not inner or _DSN_PW_PLACEHOLDER_RE.fullmatch(inner)
+                  or (inner.startswith("{{") and inner.endswith("}}"))):
+        return m.group(0)
+    if not _should_redact_typed_dump_field(m.group("key"), inner):
+        return m.group(0)
+    return f"{m.group('head')}{quote}{mask(inner)}{quote}"
+
+
 def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     """ENV / config / JSON / YAML assignment passes (skipped for code files). Passes
     that would match ``token=``/``key=`` URL params skip ``://`` text (web-URL query
@@ -1427,6 +1481,12 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
                 return m.group(0)
             return f"{key}{sep}{quote}{mask(inner)}{quote}"
         text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
+        # Labelled typed field dumps put the key mid-line, behind a label (#157615): the
+        # anchored passes above cannot see them. Gated on the keyword pre-scan so the regex
+        # only runs on text that can match.
+        if "=" in text and _YAML_CFG_WORD_RE.search(text):
+            text = _LABEL_PREFIXED_DUMP_RE.sub(lambda m: _redact_label_prefixed_dump(m, mask), text)
+
     return text
 
 
