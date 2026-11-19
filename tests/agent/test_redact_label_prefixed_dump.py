@@ -48,6 +48,8 @@ class TestLabelPrefixedDumpMasked:
         ('5|      field password: CONCEALED = "synthpass.d\'X9"', PW),
         # Declared container / array types are the same dump shape.
         ('field token: Optional[str] = "synthtok123"', TOK),
+        # A single-word angle value is not a docs placeholder, so it is still a value.
+        ("field token: STRING = <Zq8x>", "Zq8x"),
     ])
     def test_value_masked(self, text, secret):
         _assert_masked(text, secret)
@@ -109,6 +111,11 @@ class TestNonCredentialsKept:
         'field password: CONCEALED = "{{ .Values.dbPassword }}"',
         'field token: STRING = "true"',
         'field token: STRING = "<your token>"',
+        # Unquoted docs/env placeholders are left whole; masking only the first word would
+        # leave a mangled ``*** token>`` behind.
+        "field token: STRING = <your token>",
+        "field password: CONCEALED = ${API_KEY}",
+        'field password: CONCEALED = "$DB_PASSWORD"',
     ])
     def test_unchanged(self, text):
         _assert_unchanged(text)

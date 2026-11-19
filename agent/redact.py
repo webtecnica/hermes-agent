@@ -393,7 +393,7 @@ _LABEL_PREFIXED_DUMP_RE = re.compile(
     r"(?P<sep>:[ \t]*+)"
     r"(?P<type>[A-Za-z_][A-Za-z0-9_\[\]]*+)"
     r"(?P<assign>[ \t]*+=[ \t]*+))"
-    r"(?P<value>\"(?:\\[^\r\n]|[^\"\\\r\n])*\"|'(?:''|[^'\r\n])*'|['\"][^\r\n]*|[^\s&]++)",
+    r"(?P<value>\"(?:\\[^\r\n]|[^\"\\\r\n])*\"|'(?:''|[^'\r\n])*'|['\"][^\r\n]*|<[^<>\r\n]+>|[^\s&]++)",
     re.IGNORECASE,
 )
 
@@ -1403,9 +1403,11 @@ def _redact_label_prefixed_dump(m: "re.Match[str]", mask) -> str:
     quote = value[0] if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0] else ""
     inner = value[1:-1] if quote else value
     # Same non-credential scalars as _redact_yaml: empty, docs/environment placeholder,
-    # Helm/Jinja template. Masking those hides what the config expects.
-    if quote and (not inner or _DSN_PW_PLACEHOLDER_RE.fullmatch(inner)
-                  or (inner.startswith("{{") and inner.endswith("}}"))):
+    # Helm/Jinja template. Masking those hides what the config expects. Unquoted placeholders
+    # (``= <your token>`` / ``= ${API_KEY}``) need the same answer: the bare branch stops at
+    # the space, so masking only ``<your`` would leave a mangled ``*** token>`` behind.
+    if not inner or _DSN_PW_PLACEHOLDER_RE.fullmatch(inner) \
+            or (inner.startswith("{{") and inner.endswith("}}")):
         return m.group(0)
     if not _should_redact_typed_dump_field(m.group("key"), inner):
         return m.group(0)
