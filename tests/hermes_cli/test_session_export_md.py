@@ -124,18 +124,27 @@ def test_verify_accepts_bodies_that_quote_digest_markup(tmp_path, content):
     assert entry["sha256"] == file_sha256(path)
 
 
-def test_verify_rejects_tampered_self_referential_body(tmp_path):
-    session = _self_referential_session(_PRIOR_EXPORT_FOOTER)
+@pytest.mark.parametrize(
+    ("original", "tampered"),
+    [
+        (_PRIOR_EXPORT_FOOTER, _SHA_FOOTER_PREFIX + "b" * 64 + "`"),
+        ("Hello world", "Hello worle"),
+    ],
+    ids=["quoted-footer-byte", "message-byte"],
+)
+def test_verify_rejects_tampered_self_referential_body(tmp_path, original, tampered):
+    session = _self_referential_session(f"{original}\nclosing note")
     path = write_session_markdown(session, tmp_path / "exports")
     assert verify_export_file(path, session) == (True, "ok")
 
-    # One byte changed inside the quoted footer the body carries — outside the real
-    # footer — must still be caught. A fix that simply ignores every digest-looking
-    # line in the body would pass verification here and must not.
+    # One byte changed in the body — either in ordinary message text or inside the
+    # digest-looking footer the body quotes, both outside the generated footer — must
+    # still be caught. A fix that simply skips every digest-looking line in the body
+    # would pass verification here and must not.
     text = path.read_text(encoding="utf-8")
-    tampered = text.replace(_PRIOR_EXPORT_FOOTER, _SHA_FOOTER_PREFIX + "b" * 64 + "`", 1)
-    assert tampered != text
-    path.write_text(tampered, encoding="utf-8")
+    tampered_text = text.replace(original, tampered, 1)
+    assert tampered_text != text
+    path.write_text(tampered_text, encoding="utf-8")
 
     ok, reason = verify_export_file(path, session)
     assert ok is False
