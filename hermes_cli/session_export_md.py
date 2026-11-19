@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import time
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -18,8 +19,19 @@ from hermes_cli.timefmt import coerce_epoch
 
 EXPORTER_VERSION = "hermes sessions export (md/qmd) v1"
 _SHA_LINE_RE = re.compile(r"- SHA256 of exported body: `([0-9a-f]{64})`")
-_SHA_PLACEHOLDER = "__SHA256_PLACEHOLDER__"
+_SHA_PENDING = "pending"
 _VERIFICATION_HEADING = "## Export verification"
+
+
+def _new_sha_marker() -> str:
+    """Return a per-export marker for the digest slot in the footer.
+
+    A fixed sentinel is unsafe: a session may quote it (or a whole previous export
+    footer) in its messages, and a whole-body replace would then stamp the digest over
+    user text (#157707). A random marker cannot occur in content authored before it is
+    drawn.
+    """
+    return f"__SHA256_{secrets.token_hex(16)}__"
 
 
 def _iso_timestamp(value: Any) -> str:
@@ -83,7 +95,9 @@ def _render_messages(session: dict[str, Any]) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
-def _export_body_without_hash(session: dict[str, Any], *, fmt: str, exported_at: float) -> str:
+def _export_body_without_hash(
+    session: dict[str, Any], *, fmt: str, exported_at: float, sha_marker: str
+) -> str:
     session_id = _session_id(session)
     exported_iso = _iso_timestamp(exported_at)
     message_count = _message_count(session)
@@ -114,7 +128,7 @@ def _export_body_without_hash(session: dict[str, Any], *, fmt: str, exported_at:
         f"- Exported messages: `{message_count}`",
         f"- Source DB message count at export: `{session.get('message_count', message_count)}`",
         f"- Exported at: `{exported_iso}`",
-        f"- SHA256 of exported body: `{_SHA_PLACEHOLDER}`",
+        f"- SHA256 of exported body: `{sha_marker}`",
     ]
     return "\n".join(parts).rstrip() + "\n"
 
@@ -129,12 +143,21 @@ def render_session_markdown(
 ) -> str:
     """Render a SessionDB export dictionary as Markdown/QMD text."""
     _check_fmt(fmt)
-    body = _export_body_without_hash(session, fmt=fmt, exported_at=time.time())
+    sha_marker = _new_sha_marker()
+    body = _export_body_without_hash(
+        session, fmt=fmt, exported_at=time.time(), sha_marker=sha_marker
+    )
     if not include_verification:
         return body.split(f"\n{_VERIFICATION_HEADING}\n", 1)[0].rstrip() + "\n"
-    # The digest covers the body with the SHA line set to `pending`, which is what verify recomputes.
-    digest_body = body.replace(f"`{_SHA_PLACEHOLDER}`", "`pending`")
-    return body.replace(_SHA_PLACEHOLDER, hashlib.sha256(digest_body.encode("utf-8")).hexdigest())
+    # The digest covers the body with the SHA line set to `pending`, which is what verify
+    # recomputes. Only the footer slot is swapped: the marker is unique to this export, so
+    # message text that quotes the old fixed placeholder (or a previous footer) is intact.
+    head, marker, tail = body.rpartition(f"`{sha_marker}`")
+    if not marker:
+        raise RuntimeError("export body lost its SHA marker")
+    digest_body = f"{head}`{_SHA_PENDING}`{tail}"
+    digest = hashlib.sha256(digest_body.encode("utf-8")).hexdigest()
+    return f"{head}`{digest}`{tail}"
 
 
 def safe_session_filename(session: dict[str, Any], *, fmt: str = "md") -> str:
@@ -153,10 +176,20 @@ def verify_export_file(path: Path | str, session: dict[str, Any]) -> tuple[bool,
     if not Path(path).exists():
         return False, "file missing"
     text = Path(path).read_text(encoding="utf-8-sig")
-    match = _SHA_LINE_RE.search(text)
+    # The exporter always writes the verification block last, so the digest line belongs to
+    # the trailing block. Searching from the top would pick a session body that quotes an
+    # older export's footer and compare its digest against that stale line (#157707).
+    block_at = text.rfind(f"\n{_VERIFICATION_HEADING}\n")
+    if block_at == -1:
+        return False, "sha256 marker missing"
+    match = _SHA_LINE_RE.search(text, block_at + 1)
     if not match:
         return False, "sha256 marker missing"
-    digest_body = _SHA_LINE_RE.sub("- SHA256 of exported body: `pending`", text)
+    digest_body = (
+        text[: match.start()]
+        + f"- SHA256 of exported body: `{_SHA_PENDING}`"
+        + text[match.end() :]
+    )
     if hashlib.sha256(digest_body.encode("utf-8")).hexdigest() != match.group(1):
         return False, "sha256 mismatch"
     if f"- Exported messages: `{_message_count(session)}`" not in text:
