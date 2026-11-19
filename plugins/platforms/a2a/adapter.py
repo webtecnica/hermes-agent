@@ -562,9 +562,10 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _end_task(self, rec: dict, state: str, text: str, stored_reply: str = "") -> tuple[dict, None]:
         """Complete a task immediately (rejected / not ready) and build its terminal Task."""
-        self.tasks.complete(rec["task_id"], state, stored_reply)
+        stored = self.tasks.complete(rec["task_id"], state, stored_reply) or rec
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
-        return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
+        return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"],
+                                   **protocol.stored_identity(stored)), None
 
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
@@ -611,7 +612,8 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 reply, state = self._forward_to_profile(agent, peer, context_id, framed, input_id=input_id or task_id)
                 self._record_outcome(task_id, context_id, peer, state, reply)
-                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"],
+                                           **protocol.stored_identity(self.tasks.get(task_id) or rec)), None
             finally:
                 self._pop_pending(task_id)
         if self._loop is None or self._message_handler is None:
@@ -710,7 +712,8 @@ class A2AAdapter(BasePlatformAdapter):
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
             state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"],
+                                       **protocol.stored_identity(self.tasks.get(pending["task_id"]) or {}))
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod

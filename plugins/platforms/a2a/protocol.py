@@ -139,9 +139,9 @@ def text_part(text: str) -> dict:
     return {"text": text, "mediaType": "text/plain"}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
-    """A2A v1.0 Message with a single text Part."""
-    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
+def text_message(role: str, text: str, context_id: str = "", *, message_id: str = "") -> dict:
+    """A2A v1.0 Message with a single text Part; ``message_id`` pins an identity already minted."""
+    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": message_id or uuid.uuid4().hex}
     if context_id:
         msg["contextId"] = context_id
     return msg
@@ -195,15 +195,33 @@ def extract_context_id(params: dict) -> str:
     return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
-def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
+def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "",
+               state_iso: str = "", message_id: str = "", artifact_id: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
-    createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
-    task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
+    createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields.
+
+    ``state_iso``, ``message_id`` and ``artifact_id`` pin the fields whose identity belongs to the
+    transaction that produced them: a stored task re-rendered by GetTask/ListTasks must not mint
+    new ones on every read. Omitted (a response rendered before the record holds them), they are
+    minted fresh as before.
+    """
+    task: dict[str, Any] = {"id": task_id, "contextId": context_id,
+                            "status": {"state": state, "timestamp": state_iso or now_iso()}}
     if agent_text:
-        task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
+        task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id, message_id=message_id)
         if state == STATE_COMPLETED:
-            task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
+            task["artifacts"] = [{"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
     return task
+
+
+def stored_identity(rec: dict) -> dict:
+    """Keyword arguments that pin a Task rendering to the identity its record already holds.
+
+    Empty values mean the record predates the identity (or the task has not transitioned yet), and
+    ``build_task`` mints fresh ones.
+    """
+    return {"state_iso": rec.get("state_iso", ""), "message_id": rec.get("message_id", ""),
+            "artifact_id": rec.get("artifact_id", "")}
 
 
 def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
@@ -339,6 +357,7 @@ class TaskStore:
         """``input_id``: the owner admission a forwarded task was sent as (empty for local tasks)."""
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
                "input_id": input_id, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+        rec["state_iso"] = rec["created_iso"]  # instant of the last state transition (SUBMITTED here)
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
@@ -346,7 +365,7 @@ class TaskStore:
     def set_state(self, task_id: str, state: str) -> None:
         with self._lock:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
-                rec["state"] = state
+                rec["state"], rec["state_iso"] = state, now_iso()
 
     def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
@@ -383,12 +402,19 @@ class TaskStore:
             return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
+        """Transition a task to a terminal state. Idempotent.
+
+        The identity of the final rendering (status timestamp, status message id, artifact id) is
+        minted exactly once, here, so every later GetTask/ListTasks read returns the same values.
+        """
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
                 return None
-            rec.update(state=state, reply=reply, completed_at=time.time())
+            rec.update(state=state, reply=reply, completed_at=time.time(), state_iso=now_iso(),
+                       message_id=uuid.uuid4().hex)
+            if reply:
+                rec["artifact_id"] = uuid.uuid4().hex
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
             out = dict(rec)
@@ -437,9 +463,9 @@ class TaskStore:
 
     @staticmethod
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:
-        """Render a stored record as an A2A v1.0 Task."""
+        """Render a stored record as an A2A v1.0 Task, reusing the identity the record already holds."""
         task = build_task(rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", ""),
-                          created_at=rec.get("created_iso", ""))
+                          created_at=rec.get("created_iso", ""), **stored_identity(rec))
         if not include_artifacts:
             task.pop("artifacts", None)
         return task
