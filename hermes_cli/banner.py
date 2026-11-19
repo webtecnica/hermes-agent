@@ -184,7 +184,10 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
         # Live-git lookup failed (e.g. shallow clone without origin/main).
         return _baked_banner_state()
     ahead = source_check._git_count(["rev-list", "--count", "origin/main..HEAD"], cwd=repo_dir) or 0
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    # How many commits origin/main has that HEAD does not: with a checkout behind
+    # upstream, ``ahead`` alone cannot say the running commit is not the tip.
+    behind = source_check._git_count(["rev-list", "--count", "HEAD..origin/main"], cwd=repo_dir) or 0
+    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0), "behind": max(behind, 0)}
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -236,9 +239,13 @@ def format_banner_version_label() -> str:
         return base
     upstream, local = state["upstream"], state["local"]
     ahead = int(state.get("ahead") or 0)
-    if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
+    behind = int(state.get("behind") or 0)
+    if ahead > 0:
+        return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
+    if behind > 0:
+        # Checkout behind origin/main: name the running commit, not just the tip.
+        return f"{base} · upstream {upstream} · behind {behind} · local {local}"
+    return f"{base} · upstream {upstream}"
 
 
 # === Non-blocking update check ===
