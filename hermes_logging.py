@@ -400,8 +400,8 @@ def setup_logging(
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
     level_name = (log_level or cfg_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    max_bytes = (max_size_mb or cfg_max_size or _DEFAULT_LOG_MAX_SIZE_MB) * 1024 * 1024
-    backups = backup_count or cfg_backup or _DEFAULT_LOG_BACKUP_COUNT
+    max_bytes = (max_size_mb or _positive_int(cfg_max_size, _DEFAULT_LOG_MAX_SIZE_MB)) * 1024 * 1024
+    backups = backup_count or _positive_int(cfg_backup, _DEFAULT_LOG_BACKUP_COUNT)
 
     from agent.redact import RedactingFormatter  # lazy: circular at module load
 
@@ -660,8 +660,18 @@ class _ProfileRoutingFileHandler(logging.Handler):
     or dashboard event loop. Per-home handlers keep rotation, redaction and managed perms.
     """
 
-    def __init__(self, existing: RotatingFileHandler, profile_homes: Sequence[Path]) -> None:
-        """Take over *existing*'s path, level, rotation, formatter and filters."""
+    def __init__(
+        self,
+        existing: RotatingFileHandler,
+        profile_homes: Sequence[Path],
+        rotation_by_home: Optional[dict[Path, tuple[int, int]]] = None,
+    ) -> None:
+        """Take over *existing*'s path, level, rotation, formatter and filters.
+
+        *rotation_by_home* carries each routed home's own ``(max_bytes, backup_count)``,
+        resolved by :func:`_resolve_routed_rotation` on the caller's thread before the router is
+        built; a home missing from it falls back to the launch limits it replaced (#157547).
+        """
         super().__init__(level=existing.level)
         resolved = Path(existing.baseFilename).resolve()
         self.baseFilename = str(resolved)
@@ -671,6 +681,11 @@ class _ProfileRoutingFileHandler(logging.Handler):
         self._filename = resolved.name
         self._max_bytes = getattr(existing, "maxBytes", 0)
         self._backup_count = getattr(existing, "backupCount", 0)
+        self._rotation_by_home: dict[Path, tuple[int, int]] = dict(rotation_by_home or {})
+        if rotation_by_home is None and self._filename == _AGENT_LOG_FILENAME:
+            self._rotation_by_home = {
+                home: _resolve_routed_rotation(home) for home in self._profile_homes
+            }
         self._profile_handlers: dict[Path, _ManagedRotatingFileHandler] = {}
         self._profile_handlers_lock = threading.RLock()
         self._router_closed = False  # under _profile_handlers_lock; close() is final
@@ -712,24 +727,35 @@ class _ProfileRoutingFileHandler(logging.Handler):
         self.release_profile(home)
         return True
 
+    def extend_profile_homes(self, homes: Sequence[Path]) -> None:
+        """Add *homes* to the routing set, resolving each new home's rotation limits first."""
+        with self._profile_handlers_lock:
+            new_homes = [home for home in homes if home not in self._profile_homes]
+        rotation = (
+            {home: _resolve_routed_rotation(home) for home in new_homes}
+            if self._filename == _AGENT_LOG_FILENAME
+            else {}
+        )
+        with self._profile_handlers_lock:
+            self._profile_homes = self._profile_homes.union(new_homes)
+            self._rotation_by_home.update(rotation)
+
     def _rotation_for_home(self, home: Path) -> tuple[int, int]:
         """``(max_bytes, backup_count)`` for *home*'s copy of this router's file.
 
         The launch limits were resolved once by ``setup_logging`` and describe the launch
         profile only: reusing them for every routed home silently ignored a served profile's own
-        ``logging.max_size_mb`` / ``logging.backup_count`` (#157547). Each routed home therefore
-        resolves its own ``config.yaml``, exactly as a standalone run of that profile does, and a
-        home that declares nothing gets the standalone defaults rather than the launch profile's
-        values. Only ``agent.log`` follows ``logging.*``; the component logs keep the limits of
-        the handler whose file they share.
+        ``logging.max_size_mb`` / ``logging.backup_count`` (#157547). Every routed home carries
+        its own, resolved when it joined the router, so nothing is read here on the
+        QueueListener thread. Only ``agent.log`` follows ``logging.*``; the component logs keep
+        the limits of the handler whose file they share.
         """
-        if home == self._default_home or self._filename != _AGENT_LOG_FILENAME:
-            return self._max_bytes, self._backup_count
-        _, max_size_mb, backup_count = _read_logging_config(home / "config.yaml")
-        return (
-            _positive_int(max_size_mb, _DEFAULT_LOG_MAX_SIZE_MB) * 1024 * 1024,
-            _positive_int(backup_count, _DEFAULT_LOG_BACKUP_COUNT),
-        )
+        if home != self._default_home and self._filename == _AGENT_LOG_FILENAME:
+            with self._profile_handlers_lock:
+                limits = self._rotation_by_home.get(home)
+            if limits is not None:
+                return limits
+        return self._max_bytes, self._backup_count
 
     def _handler_for_home(self, home: Path) -> Optional[_ManagedRotatingFileHandler]:
         """The open handler for *home*; ``None`` once the router or that home is retired."""
@@ -977,13 +1003,26 @@ def enable_profile_log_routing(profile_homes: Sequence[str | Path]) -> bool:
         resolve_profile_policy(home)
 
     with _queue_state_lock:
+        routers = [h for h in _queued_file_handlers if isinstance(h, _ProfileRoutingFileHandler)]
+    if routers:
+        for handler in routers:
+            handler.extend_profile_homes(homes)
+        return True
+
+    # Each routed profile's agent.log rotation, read now, on this thread and inside that
+    # profile's own scope. Reading it lazily from ``_handler_for_home`` instead would run on the
+    # QueueListener thread, where no profile scope is bound: the served config's ``${VAR}`` refs
+    # would expand against the launch profile's environment, and ``_CONFIG_LOCK`` would sit in
+    # every profile's logging path during a concurrent ``save_config()`` (#157547).
+    rotation_by_home = {home: _resolve_routed_rotation(home) for home in homes}
+
+    with _queue_state_lock:
         if not _queued_file_handlers:
             return False
         routers = [h for h in _queued_file_handlers if isinstance(h, _ProfileRoutingFileHandler)]
-        if routers:
+        if routers:  # another caller wrapped the handlers while we resolved the limits
             for handler in routers:
-                with handler._profile_handlers_lock:
-                    handler._profile_homes = handler._profile_homes.union(homes)
+                handler.extend_profile_homes(homes)
             return True
         listener = _queue_listener
         if listener is not None:
@@ -992,7 +1031,9 @@ def enable_profile_log_routing(profile_homes: Sequence[str | Path]) -> bool:
         replacement = []
         for existing in _queued_file_handlers:
             if isinstance(existing, RotatingFileHandler):
-                replacement.append(_ProfileRoutingFileHandler(existing, homes))
+                replacement.append(
+                    _ProfileRoutingFileHandler(existing, homes, rotation_by_home)
+                )
                 _quietly(existing.close)
             else:
                 replacement.append(existing)
@@ -1050,10 +1091,13 @@ def _add_rotating_handler(
     routers = [h for h in _queued_file_handlers if isinstance(h, _ProfileRoutingFileHandler)]
     if routers:
         homes: set[Path] = set()
+        rotation: dict[Path, tuple[int, int]] = {}
         for router in routers:
             homes.add(router._default_home)
             homes.update(router._profile_homes)
-        routed = _ProfileRoutingFileHandler(handler, sorted(homes))
+            with router._profile_handlers_lock:
+                rotation.update(router._rotation_by_home)
+        routed = _ProfileRoutingFileHandler(handler, sorted(homes), rotation)
         _quietly(handler.close)
         handler = routed
     # Queue, not ``addHandler``: the rotation-lock wait never runs on the caller's thread.
@@ -1061,27 +1105,32 @@ def _add_rotating_handler(
 
 
 def _positive_int(value, default: int) -> int:
-    """*value* as a positive int, else *default* (a hand-edited config must not break writing)."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
+    """*value* as a positive int, else *default*.
 
-
-def _read_logging_config(config_path: Optional[Path] = None):
-    """Best-effort read of ``logging.*`` from the config.yaml at *config_path*.
-
-    *config_path* defaults to the launch home's ``config.yaml``. A routed profile passes its own
-    path: the effective-config cache is keyed by config path, so each home gets its own file
-    (managed overlay included) instead of the launch profile's (#157547).
+    Only a positive ``int`` (or a string of one) is usable as ``maxBytes``/``backupCount``: a
+    hand-edited ``max_size_mb: "20"`` would otherwise reach the handler as a ``str``, whose
+    rollover check raises ``TypeError`` (swallowed), so the file silently never rotates; a bool
+    or a non-positive value disables rollover the same way.
     """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            return default
+    if isinstance(value, int) and value > 0:
+        return value
+    return default
+
+
+def _read_logging_config():
+    """Best-effort read of ``logging.*`` from config.yaml for the effective Hermes home."""
     try:
         # Prefer the shared effective-config cache (managed overlay included, so an administrator
         # can pin logging.*) so this reuses hermes_cli.main's early parse (one config.yaml parse
         # per process); fall back to a direct parse for bare hermes_logging consumers.
-        if config_path is None:
-            config_path = get_config_path()
+        config_path = get_config_path()
         try:
             from hermes_cli.config_effective import load_user_config_effective
             cfg = load_user_config_effective(config_path)
@@ -1096,3 +1145,27 @@ def _read_logging_config(config_path: Optional[Path] = None):
     except Exception:
         pass
     return (None, None, None)
+
+
+def _resolve_routed_rotation(home: Path) -> tuple[int, int]:
+    """``(max_bytes, backup_count)`` for *home*'s agent.log, as a standalone run gets them.
+
+    Resolved when the home joins a router, never per record: the QueueListener thread binds no
+    profile scope, so reading config there would expand the served profile's ``${VAR}`` refs
+    against the launch profile's environment (#84079) and put ``_CONFIG_LOCK`` in every
+    profile's logging path. Inside ``bind_profile_scope`` the cache is keyed per config path and
+    re-validated against that profile's env refs, so one home never reads another's file.
+    An unreadable config falls back to the standalone defaults, like ``setup_logging`` does.
+    """
+    from agent.runtime_scope import bind_profile_scope
+
+    max_size_mb = backup_count = None
+    try:
+        with bind_profile_scope(home, hydrate_secrets=False):
+            _, max_size_mb, backup_count = _read_logging_config()
+    except (Exception, SystemExit) as exc:  # health: allow BLE001 -- unreadable: use the defaults
+        logging.getLogger(__name__).debug("rotation limits for %s not read: %s", home, exc)
+    return (
+        _positive_int(max_size_mb, _DEFAULT_LOG_MAX_SIZE_MB) * 1024 * 1024,
+        _positive_int(backup_count, _DEFAULT_LOG_BACKUP_COUNT),
+    )
