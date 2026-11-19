@@ -801,6 +801,21 @@ def test_create_task_accepts_a_skill_the_assignee_can_load(kanban_home):
         conn.close()
 
 
+def test_create_task_accepts_the_identifiers_a_worker_resolves(kanban_home):
+    """The worker reaches a skill by any ``skill_view`` alias — declared name, directory name,
+    path relative to the skills root — so the create check must accept them too, else a nested
+    ``--skill mlops/axolotl`` is refused although the preload loads it."""
+    _install_skill(kanban_home, "mlops/axolotl", declared="axolotl")
+    _install_skill(kanban_home, "folder-name", declared="declared-name")
+    conn = kbc.connect()
+    try:
+        for skill in ("axolotl", "mlops/axolotl", "folder-name", "declared-name"):
+            tid = kb.create_task(conn, title=f"alias {skill}", assignee="default", skills=[skill])
+            assert kb.get_task(conn, tid).skills == [skill]
+    finally:
+        conn.close()
+
+
 def test_create_task_does_not_judge_skills_for_an_unresolvable_assignee(kanban_home):
     """A profile this host cannot resolve is not grounds for a refusal: the board is shared,
     so the dispatcher may run the card on a host where that profile exists. The worker's own

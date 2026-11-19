@@ -1159,12 +1159,12 @@ def _unloadable_assignee_skills(assignee: str, skills: list[str]) -> list[tuple[
 
     Reasons: ``absent`` (no such skill in that profile), ``disabled`` (installed but switched
     off in its config) and ``ambiguous`` (the literal name resolves to no loadable copy: a
-    same-tier collision or a shadowed duplicate). The catalog is the one the worker's preload
-    reads (``tools.skills_tool``), scanned against the profile's own home through the
-    context-local home override — never ``os.environ``. Three deliberate non-judgements: an
-    assignee this host cannot resolve proves nothing about the host that will run the card
-    (boards are shared), ``ns:skill`` identifiers resolve through the plugin registry (not the
-    file catalog), and any scan failure also leaves the names unjudged — the worker's own
+    same-tier collision, where the worker's own ``skill_view`` refuses to guess). The catalog is
+    the one the worker's preload reads (``tools.skills_tool``), scanned against the profile's
+    own home through the context-local home override — never ``os.environ``. Three deliberate
+    non-judgements: an assignee this host cannot resolve proves nothing about the host that will
+    run the card (boards are shared), ``ns:skill`` identifiers resolve through the plugin registry
+    (not the file catalog), and any scan failure also leaves the names unjudged — the worker's own
     preload refusal stays the last line.
     """
     wanted = [name for name in skills if ":" not in name]
@@ -1191,19 +1191,34 @@ def _unloadable_assignee_skills(assignee: str, skills: list[str]) -> list[tuple[
         return []
     finally:
         reset_hermes_home_override(token)
-    # ``skip_disabled=True`` keeps the switched-off rows so the reason can say *disabled*;
-    # the loadable set is what a worker on that profile can actually preload.
-    loadable = {e["load_name"] for e in entries
-                if e.get("load_name") and not is_disabled_entry(e, disabled)}
+    # ``skip_disabled=True`` keeps the switched-off rows so the reason can say *disabled*. A
+    # preload identifier reaches the copy through ``skill_view``'s aliases, so the loadable map
+    # is alias -> precedence winner among the enabled rows: declared name, directory name and
+    # root-relative path. Accepting only ``load_name`` would refuse `mlops/axolotl` or a skill
+    # whose directory differs from its declared name, both of which the worker does load.
+    from agent.skill_utils import pick_skill_candidate, skill_candidate_rank
+    enabled = [e for e in entries if not is_disabled_entry(e, disabled)]
+
+    def _aliases(entry: dict) -> set[str]:
+        return {str(entry["name"]), Path(entry["path"]).parent.name, entry["relative_path"]}
+
+    owners: dict[str, list[dict]] = {}
+    for entry in enabled:
+        for alias in _aliases(entry):
+            owners.setdefault(alias, []).append(entry)
     problems: list[tuple[str, str]] = []
     for name in wanted:
-        if name in loadable:
+        won = None
+        if candidates := owners.get(name):
+            won, _ = pick_skill_candidate([
+                (e["tier"], str(e["root"]), skill_candidate_rank(e["path"], e["root"]), e["path"])
+                for e in candidates])
+        if won is not None:  # some enabled copy answers this exact identifier
             continue
-        matches = [e for e in entries
-                   if name in (e.get("name"), e.get("load_name"), e.get("relative_path"))]
-        if any(is_disabled_entry(e, disabled) for e in matches):
+        matches = [e for e in entries if name in _aliases(e)]
+        if matches and all(is_disabled_entry(e, disabled) for e in matches):
             problems.append((name, "disabled"))
-        elif any(e.get("status") in {"ambiguous", "shadowed"} for e in matches):
+        elif matches:
             problems.append((name, "ambiguous"))
         else:
             problems.append((name, "absent"))
