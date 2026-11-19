@@ -640,6 +640,13 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     import hermes_cli.profiles as profmod
 
     monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    # The card's skill must be loadable by the reviewer profile (#157714): pin the profile to
+    # this test's home and install the skill there, so the create never depends on the host.
+    monkeypatch.setattr(profmod, "resolve_profile_env", lambda name: str(kanban_home))
+    skill = kanban_home / "skills" / "domain-specific-review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: domain-specific-review\ndescription: Review fixture\n---\n", encoding="utf-8")
     monkeypatch.setattr(
         cfgmod,
         "load_config",

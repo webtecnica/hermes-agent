@@ -22,6 +22,9 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
     (workspace / 'pyproject.toml').write_text('[project]\nname = "task"\n')  # a code worktree
+    skill = tmp_path / 'skills' / 'owned-skill'  # the card's assignee profile must load it
+    skill.mkdir(parents=True)
+    (skill / 'SKILL.md').write_text('---\nname: owned-skill\ndescription: Owned fixture\n---\n', encoding='utf-8')
     from contextlib import closing
     kb.create_board('owned')  # explicit creation; connect() never creates a board (#43243)
     with closing(connect(board='owned')) as conn:

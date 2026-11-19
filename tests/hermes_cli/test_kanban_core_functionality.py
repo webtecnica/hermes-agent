@@ -723,7 +723,95 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 # Per-task force-loaded skills
 # ---------------------------------------------------------------------------
 
+def _install_skill(home: Path, dir_name: str, declared: str | None = None) -> None:
+    """Write a minimal SKILL.md into the test profile's skills dir."""
+    skill_dir = home / "skills" / dir_name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {declared or dir_name}\ndescription: Kanban skill fixture\n---\nFixture body.\n",
+        encoding="utf-8",
+    )
 
+
+def _task_count(conn) -> int:
+    return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+
+
+def test_create_task_refuses_a_skill_the_assignee_cannot_load(kanban_home):
+    """A per-task skill the assignee profile cannot load is refused at create, before any
+    INSERT: the worker only refuses it later (``kanban_skills_unavailable``), which leaves a
+    stored row that crash-loops the card (#157714)."""
+    conn = kbc.connect()
+    try:
+        before = _task_count(conn)
+        with pytest.raises(ValueError) as refusal:
+            kb.create_task(conn, title="unloadable skill", assignee="default",
+                           skills=["no-such-skill"])
+        assert _task_count(conn) == before, "a refused create must not insert a task row"
+    finally:
+        conn.close()
+    assert str(refusal.value) == (
+        "skill 'no-such-skill' is not loadable by assignee 'default' (absent)")
+
+
+def test_create_task_names_why_a_skill_is_not_loadable(kanban_home):
+    """The refusal says *why* each name fails: ``disabled`` (switched off in the profile's
+    config) or ``ambiguous`` (the literal name resolves to no loadable copy)."""
+    _install_skill(kanban_home, "switched-off")
+    (kanban_home / "config.yaml").write_text(
+        "skills:\n  disabled:\n    - switched-off\n", encoding="utf-8")
+    _install_skill(kanban_home, "dup-a", declared="one")
+    _install_skill(kanban_home, "dup-b", declared="one")
+    conn = kbc.connect()
+    try:
+        before = _task_count(conn)
+        with pytest.raises(ValueError) as refusal:
+            kb.create_task(conn, title="reasons", assignee="default",
+                           skills=["switched-off", "one"])
+        assert _task_count(conn) == before
+    finally:
+        conn.close()
+    message = str(refusal.value)
+    assert "skill 'switched-off' is not loadable by assignee 'default' (disabled)" in message, message
+    assert "skill 'one' is not loadable by assignee 'default' (ambiguous)" in message, message
+
+
+def test_create_task_without_skills_is_unchanged(kanban_home):
+    """``skills`` omitted and ``skills=[]`` keep their meaning: no forced skills, no profile
+    lookup, one row each."""
+    conn = kbc.connect()
+    try:
+        omitted = kb.create_task(conn, title="no skills", assignee="default")
+        empty = kb.create_task(conn, title="empty skills", assignee="default", skills=[])
+        assert kb.get_task(conn, omitted).skills is None
+        assert kb.get_task(conn, empty).skills == []
+    finally:
+        conn.close()
+
+
+def test_create_task_accepts_a_skill_the_assignee_can_load(kanban_home):
+    """A skill installed in the assignee profile is stored (deduped) as before."""
+    _install_skill(kanban_home, "installed-skill")
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="loadable", assignee="default",
+                             skills=["installed-skill", "installed-skill"])
+        assert kb.get_task(conn, tid).skills == ["installed-skill"]
+    finally:
+        conn.close()
+
+
+def test_create_task_does_not_judge_skills_for_an_unresolvable_assignee(kanban_home):
+    """A profile this host cannot resolve is not grounds for a refusal: the board is shared,
+    so the dispatcher may run the card on a host where that profile exists. The worker's own
+    preload check stays the last line."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="elsewhere", assignee="not-on-this-host",
+                             skills=["no-such-skill"])
+        assert kb.get_task(conn, tid).skills == ["no-such-skill"]
+    finally:
+        conn.close()
 
 
 

@@ -1154,6 +1154,77 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _unloadable_assignee_skills(assignee: str, skills: list[str]) -> list[tuple[str, str]]:
+    """``(skill, reason)`` for every name the *assignee* profile could not load.
+
+    Reasons: ``absent`` (no such skill in that profile), ``disabled`` (installed but switched
+    off in its config) and ``ambiguous`` (the literal name resolves to no loadable copy: a
+    same-tier collision or a shadowed duplicate). The catalog is the one the worker's preload
+    reads (``tools.skills_tool``), scanned against the profile's own home through the
+    context-local home override — never ``os.environ``. Three deliberate non-judgements: an
+    assignee this host cannot resolve proves nothing about the host that will run the card
+    (boards are shared), ``ns:skill`` identifiers resolve through the plugin registry (not the
+    file catalog), and any scan failure also leaves the names unjudged — the worker's own
+    preload refusal stays the last line.
+    """
+    wanted = [name for name in skills if ":" not in name]
+    if not wanted:
+        return []
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        home = resolve_profile_env(assignee)
+    except Exception:
+        return []
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    try:
+        token = set_hermes_home_override(home)
+    except Exception:
+        return []
+    try:
+        from agent.skill_utils import get_disabled_skill_names, is_disabled_entry
+        from tools.skills_tool import _skill_catalog
+        disabled = get_disabled_skill_names()
+        entries = _skill_catalog(skip_disabled=True)
+    except Exception:
+        _log.debug("kanban: catalog of profile %r unavailable; not judging skills %s",
+                   assignee, wanted, exc_info=True)
+        return []
+    finally:
+        reset_hermes_home_override(token)
+    # ``skip_disabled=True`` keeps the switched-off rows so the reason can say *disabled*;
+    # the loadable set is what a worker on that profile can actually preload.
+    loadable = {e["load_name"] for e in entries
+                if e.get("load_name") and not is_disabled_entry(e, disabled)}
+    problems: list[tuple[str, str]] = []
+    for name in wanted:
+        if name in loadable:
+            continue
+        matches = [e for e in entries
+                   if name in (e.get("name"), e.get("load_name"), e.get("relative_path"))]
+        if any(is_disabled_entry(e, disabled) for e in matches):
+            problems.append((name, "disabled"))
+        elif any(e.get("status") in {"ambiguous", "shadowed"} for e in matches):
+            problems.append((name, "ambiguous"))
+        else:
+            problems.append((name, "absent"))
+    return problems
+
+
+def _refuse_unloadable_skills(assignee: Optional[str], skills: Optional[list[str]]) -> None:
+    """Refuse a create whose per-task skills the assignee profile cannot load (#157714).
+
+    The worker enforces this contract too late (``kanban_skills_unavailable`` after a stored
+    row exists), which crash-loops the card; checking here keeps the bad input out of the board.
+    """
+    if not assignee or not skills:
+        return
+    problems = _unloadable_assignee_skills(assignee, skills)
+    if problems:
+        raise ValueError("; ".join(
+            f"skill {name!r} is not loadable by assignee {assignee!r} ({reason})"
+            for name, reason in problems))
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1179,6 +1250,8 @@ def create_task(
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
+    ``skills``: force-loaded worker skills; each must be loadable by the assignee profile —
+    create refuses (``ValueError``) the ones it cannot, before the row exists (#157714).
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
@@ -1221,6 +1294,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    _refuse_unloadable_skills(assignee, skills_list)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
