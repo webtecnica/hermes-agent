@@ -9,19 +9,69 @@ import logging
 import os
 from contextlib import suppress
 from functools import partial
+from pathlib import Path
 
 from gateway.config import Platform
 
 logger = logging.getLogger(__name__)
 
 
-async def expand_references(text, *, cwd, context_length, plugins=True):
+def _confined_reference_root(cwd):
+    """The root a path reference of THIS task may resolve under: ``cwd``, or the served profile's home
+    when the task is confined to its own profile.
+
+    A multiplexed gateway serves several profiles from one process, and a secondary profile's turn may
+    read only its own store (``_cross_profile_reads_confined``, #154617). The same confinement holds
+    for ``@file:``/``@folder:``: their root would otherwise be the daemon's ``TERMINAL_CWD`` (or
+    ``~``), which reaches a sibling profile's memories, persona, config and session DB with a single
+    reference (#157590). The profile root is the task's active home — ``get_hermes_home()`` follows
+    the per-turn override — never ``os.environ``, which still names the launch profile.
+    """
+    from tools.session_search_tool import _cross_profile_reads_confined
+    if not _cross_profile_reads_confined():
+        return cwd
+    from hermes_constants import get_hermes_home
+    return get_hermes_home()
+
+
+def _refuse_outside_root(text, cwd, allowed_root, *, plugins=True):
+    """The refusal for a reference resolving outside a NARROWED ``allowed_root``, else None.
+
+    Only a narrowed root refuses the turn (#157590's profile confinement): with the default root a
+    ``@file:`` outside the workspace keeps today's warning-and-continue. The check runs through the
+    expansion's own guard (``_resolve_path``), so its refusal cannot drift from the one expansion
+    records, and it runs before any content is attached.
+    """
+    root = Path(allowed_root).expanduser().resolve()
+    start = Path(cwd).expanduser().resolve()
+    if root == start:
+        return None
+    from agent.context_references import _resolve_path, parse_context_references
+    refusals = []
+    for ref in parse_context_references(text, plugins=plugins):
+        if ref.kind not in ("file", "folder"):
+            continue
+        try:
+            _resolve_path(start, ref.target, allowed_root=root)
+        except ValueError as exc:
+            refusals.append(f"{ref.raw}: {exc}")
+    return "\n".join(refusals) or None
+
+
+async def expand_references(text, *, cwd, context_length, plugins=True, allowed_root=None):
     """``(text, refusal)``: the expanded text, or the refusal when the injection was refused. A failed
-    expansion leaves the text as typed."""
+    expansion leaves the text as typed. ``allowed_root`` narrows where a path reference may resolve:
+    the caller that knows the turn's own workspace passes it, and the default is ``cwd`` — narrowed
+    to the served profile's home when the turn is confined to its own profile. A reference outside a
+    narrowed root refuses the turn; outside the default root it stays a warning."""
     from agent.i18n import t
     try:
         from agent.context_references import preprocess_context_references_async
-        expand = partial(preprocess_context_references_async, cwd=cwd, context_length=context_length, allowed_root=cwd)
+        root = _confined_reference_root(cwd) if allowed_root is None else allowed_root
+        if (refusal := _refuse_outside_root(text, cwd, root, plugins=plugins)) is not None:
+            return text, refusal
+        expand = partial(preprocess_context_references_async, cwd=cwd, context_length=context_length,
+                         allowed_root=root)
         result = await (expand(text) if plugins else expand(text, plugins=False))
     except Exception as exc:
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
@@ -44,15 +94,31 @@ def _inbound_cwd(runner, source):
     return terminal_env("TERMINAL_CWD", os.path.expanduser("~"))
 
 
+def _inbound_allowed_root(runner, source, cwd):
+    """The root an inbound reference may resolve under: a local session's own workspace, else the
+    served profile's home when the turn is confined to it, else ``cwd`` (the daemon's terminal cwd).
+
+    A local session's workspace is both its cwd and its root, so it is decided BEFORE the profile
+    confinement: this runs before the turn binds the policy scope, where the profile signals alone
+    cannot tell a local session from a messaging turn.
+    """
+    from gateway.session_policy import policy_for_source
+    if policy_for_source(runner, source) is not None:
+        return cwd
+    return _confined_reference_root(cwd)
+
+
 async def inbound_references(runner, source, session_key, text):
-    """``expand_references`` for an inbound turn: a local session's policy cwd, else the terminal cwd."""
+    """``expand_references`` for an inbound turn: a local session's policy cwd, else the terminal cwd;
+    under profile confinement the reference root is the served profile's home."""
     try:
         cwd = _inbound_cwd(runner, source)
+        allowed_root = _inbound_allowed_root(runner, source, cwd)
         context_length = await runner._inbound_model_context_length(source, session_key)
     except Exception as exc:
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
         return text, None
-    return await expand_references(text, cwd=cwd, context_length=context_length)
+    return await expand_references(text, cwd=cwd, context_length=context_length, allowed_root=allowed_root)
 
 
 async def turn_references(runner, event, source, session_key, text):
@@ -104,7 +170,11 @@ async def managed_turn_text(authority, row, policy):
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
         return text, None
     return await expand_references(text, cwd=policy.cwd, context_length=context_length,
-                                   plugins=not policy.ignore_user_config)
+                                   plugins=not policy.ignore_user_config,
+                                   # The admitted session's own workspace is this worker's root: the
+                                   # #157590 confinement guards inbound messaging turns whose root would
+                                   # otherwise be the daemon's home, not a frozen workspace.
+                                   allowed_root=policy.cwd)
 
 
 def refused_turn_result(row, refusal):
