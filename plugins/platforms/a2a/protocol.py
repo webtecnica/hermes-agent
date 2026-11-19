@@ -195,14 +195,23 @@ def extract_context_id(params: dict) -> str:
     return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
-def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
+def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "",
+               state_iso: str = "", message_id: str = "", artifact_id: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
-    createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
-    task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
+    createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields.
+
+    ``state_iso``/``message_id``/``artifact_id`` pin the identity a task record minted at its
+    state transition; readers pass them so repeated tasks/get and tasks/list calls return the
+    same ids and the transition timestamp instead of fresh ones on every render. Omitted (a
+    task rendered before its record is terminal), the values are minted here as before."""
+    task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": state_iso or now_iso()}}
     if agent_text:
-        task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
+        message = text_message(ROLE_AGENT, agent_text, context_id)
+        if message_id:
+            message["messageId"] = message_id
+        task["status"]["message"] = message
         if state == STATE_COMPLETED:
-            task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
+            task["artifacts"] = [{"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
     return task
 
 
@@ -214,9 +223,10 @@ def status_update(task_id: str, context_id: str, state: str, text: str = "") -> 
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 
-def artifact_update(task_id: str, context_id: str, text: str) -> dict:
-    """v1.0 StreamResponse with an artifactUpdate member."""
-    artifact = {"artifactId": uuid.uuid4().hex, "parts": [text_part(text)]}
+def artifact_update(task_id: str, context_id: str, text: str, *, artifact_id: str = "") -> dict:
+    """v1.0 StreamResponse with an artifactUpdate member. ``artifact_id`` reuses the id the task
+    record minted, so a streamed artifact and the one in a later tasks/get are the same."""
+    artifact = {"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(text)]}
     return {"artifactUpdate": {"taskId": task_id, "contextId": context_id, "artifact": artifact}}
 
 
@@ -337,16 +347,21 @@ class TaskStore:
     def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "",
                input_id: str = "") -> dict:
         """``input_id``: the owner admission a forwarded task was sent as (empty for local tasks)."""
+        created_iso = now_iso()
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "input_id": input_id, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "input_id": input_id, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(),
+               "created_iso": created_iso, "state_iso": created_iso, "message_id": "", "artifact_id": "",
+               "push_url": "", "push_config_id": ""}
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
+        """Move a non-terminal task; ``state_iso`` records when the current state began, so a
+        read reports the transition instant rather than the time of the read."""
         with self._lock:
-            if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
-                rec["state"] = state
+            if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES and rec["state"] != state:
+                rec["state"], rec["state_iso"] = state, now_iso()
 
     def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
@@ -383,12 +398,14 @@ class TaskStore:
             return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
+        """Transition a task to a terminal state and mint its identity once (``state_iso``,
+        ``message_id``, ``artifact_id``). Idempotent: a second call returns None and keeps the ids."""
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
                 return None
-            rec.update(state=state, reply=reply, completed_at=time.time())
+            rec.update(state=state, reply=reply, completed_at=time.time(), state_iso=now_iso(),
+                       message_id=uuid.uuid4().hex, artifact_id=uuid.uuid4().hex if reply else "")
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
             out = dict(rec)
@@ -439,7 +456,8 @@ class TaskStore:
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:
         """Render a stored record as an A2A v1.0 Task."""
         task = build_task(rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", ""),
-                          created_at=rec.get("created_iso", ""))
+                          created_at=rec.get("created_iso", ""), state_iso=rec.get("state_iso", ""),
+                          message_id=rec.get("message_id", ""), artifact_id=rec.get("artifact_id", ""))
         if not include_artifacts:
             task.pop("artifacts", None)
         return task
