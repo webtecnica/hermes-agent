@@ -6,11 +6,17 @@ The label must carry ``behind N`` and the local HEAD, and the ahead/current
 cases must keep their existing shape.
 """
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import banner
+
+
+def git(root, *args):
+    return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True,
+                          text=True, stdin=subprocess.DEVNULL).stdout.strip()
 
 
 @pytest.fixture
@@ -58,3 +64,23 @@ def test_missing_state_falls_back_to_base_label(label_for, state):
     label = label_for(state)
     assert label.startswith("Hermes Agent v0.0.0")
     assert "upstream" not in label
+
+
+def test_compute_state_counts_commits_behind_upstream(tmp_path):
+    """The state itself must measure ``behind``; the label only renders it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Banner Fixture")
+    git(repo, "config", "user.email", "fixture@example.invalid")
+    git(repo, "config", "commit.gpgsign", "false")
+    for label in ("installed", "published", "unpublished"):
+        (repo / "content.txt").write_text(label)
+        git(repo, "add", "content.txt")
+        git(repo, "commit", "-m", label)
+    tip = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", "refs/remotes/origin/main", tip)
+    git(repo, "reset", "--hard", "HEAD~2")
+    state = banner._compute_git_banner_state(repo)
+    assert state == {"upstream": tip[:8], "local": git(repo, "rev-parse", "--short=8", "HEAD"),
+                     "ahead": 0, "behind": 2}
