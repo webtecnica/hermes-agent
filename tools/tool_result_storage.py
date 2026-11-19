@@ -99,7 +99,7 @@ def referenced_archive_refs(home) -> set | None:
     """``cache/<dir>/<name>`` archive references held by any message in *home*'s ``state.db``.
 
     ``set()`` when no database exists (no sessions → nothing references anything), ``None``
-    when the reference set is UNKNOWN (unreadable / truncated query) so callers fail closed
+    when the reference set is UNKNOWN (unreadable database/query) so callers fail closed
     and keep the files; a read-only handle is enough, the write path owns the locks."""
     from persistence.core.errors import STORE_FAILURES
     from persistence_assembly import open_persistence_reader
@@ -108,15 +108,12 @@ def referenced_archive_refs(home) -> set | None:
     if not db_path.exists():
         return set()
     try:
+        refs: set = set()
         with open_persistence_reader(db_path) as store:
-            rows = store.messages.spillover_reference_rows()
+            for content, api_content in store.messages.spillover_reference_rows():
+                refs.update(archive_refs_in_text(content, api_content))
     except (OSError, *STORE_FAILURES):
         return None
-    if len(rows) > 20000:  # truncated reference set: treat as unknown, never guess
-        return None
-    refs: set = set()
-    for content, api_content in rows:
-        refs |= archive_refs_in_text(content, api_content)
     return refs
 
 
@@ -200,17 +197,24 @@ def _write_to_spillover(content: str, filename: str, subdir: str = SPILLOVER_SUB
     bounded inline truncation instead of referencing an archive that silently lost bytes.
     """
     data = content.encode("utf-8", errors="replace")
+    created = False
     try:
         from hermes_constants import get_hermes_home
         spill_dir = get_hermes_home() / subdir
         spill_dir.mkdir(parents=True, exist_ok=True)
         path = spill_dir / filename
         with open(path, "xb" if exclusive else "wb") as fh:  # exclusive: never overwrite another original
+            created = True
             fh.write(data)
         persisted_size = os.stat(path).st_size
         # Size first (cheap), then the bytes: the content is already in memory.
         exact = persisted_size == len(data) and path.read_bytes() == data
     except OSError as exc:
+        if exclusive and created:
+            try:
+                path.unlink()
+            except OSError as cleanup_error:
+                logger.warning("Partial archive cleanup failed for %s: %s", path, cleanup_error)
         logger.warning("Archive write to %s failed for %s: %s", subdir, filename, exc)
         return None
     if not exact:
@@ -335,6 +339,7 @@ def write_pruned_original(content: str, session_id: str, tool_name: str, tool_ca
 
 ARCHIVE_POINTER_SEP = " — full result: "
 _ARCHIVE_POINTER_RE = re.compile(r" — full result: \S*cache/pruned/[A-Za-z0-9_.-]+")
+_ARCHIVE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")  # the names the writer makes and the sweeper finds
 
 
 def has_archive_pointer(content: str) -> bool:
@@ -354,6 +359,53 @@ def _with_pointer(content: Any, display_path: str) -> Any:
     return f"{head}{pointer}{sep}{rule}"
 
 
+def _readback_archive_path(tool_name: str, tool_args: str) -> str | None:
+    """The stub path of the archive a ``read_file`` call read back, or None.
+
+    Only when the call's ``path`` is absolute (after ``~``) and names an existing file directly inside
+    this home's ``cache/pruned``, on a backend that reads host files: that result's original is already
+    archived, so the prune points at it again instead of writing a copy of the rendering. Anything else
+    (a look-alike elsewhere, a missing file, a relative path, a sandboxed backend) takes the usual path."""
+    if tool_name != "read_file":
+        return None
+    from pathlib import Path, PurePath
+
+    from agent.context_compressor import _json_dict
+    from hermes_constants import display_hermes_home, get_hermes_home
+
+    path = _json_dict(tool_args).get("path")
+    if not isinstance(path, str) or not path or not _backend_reads_host_files():
+        return None
+    try:
+        candidate = Path(os.path.expanduser(path))
+        if not candidate.is_absolute():
+            return None
+        candidate = candidate.resolve()
+        if (candidate.parent != (get_hermes_home() / PRUNED_SUBDIR).resolve() or not candidate.is_file()
+                or not _ARCHIVE_NAME_RE.fullmatch(candidate.name)):
+            return None
+    except (OSError, ValueError, RuntimeError):  # unreadable path, embedded NUL, symlink loop
+        return None
+    return f"{PurePath(display_hermes_home()).as_posix()}/{PRUNED_SUBDIR}/{candidate.name}"
+
+
+def _calls_for_rows(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """``(tool_name, raw_arguments)`` of the call each row answers, by row index: the nearest PRECEDING assistant
+    call with that id. A resumed history can repeat an id, and a whole-transcript map would hand an older result a
+    later call's arguments (a later archive read-back would then skip saving that result's own original)."""
+    from agent.context_compressor import _tc_get
+
+    seen: dict[str, tuple[str, str]] = {}
+    out: list[tuple[str, str]] = []
+    for msg in messages:
+        out.append(seen.get(str(msg.get("tool_call_id") or ""), ("unknown", "")) if isinstance(msg, dict) else ("unknown", ""))
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                fn = _tc_get(tc, "function", {})
+                seen[_tc_get(tc, "id") or ""] = (_tc_get(fn, "name", "unknown"), _tc_get(fn, "arguments"))
+    return out
+
+
 def archive_pruned_originals(
     messages: list[dict[str, Any]], pruned: list[dict[str, Any]], session_id: str,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
@@ -363,9 +415,7 @@ def archive_pruned_originals(
     so the caller re-checks its reclaim gate and never commits a stub without a file behind it. A row
     that already names its archive is left as the prune made it: its original is on disk.
     """
-    from agent.context_compressor import _tool_calls_by_id
-
-    call_id_to_tool = _tool_calls_by_id(messages)
+    call_at = _calls_for_rows(messages)
     rows, written, reverted = list(pruned), [], 0
     for i, (original, replacement) in enumerate(zip(messages, pruned)):
         if (not isinstance(original, dict) or original.get("role") != "tool"
@@ -376,7 +426,10 @@ def archive_pruned_originals(
             continue
         text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
         call_id = str(original.get("tool_call_id") or "")
-        tool_name = call_id_to_tool.get(call_id, ("unknown", ""))[0]
+        tool_name, tool_args = call_at[i]
+        if (read_back := _readback_archive_path(tool_name, tool_args)) is not None:
+            rows[i] = {**replacement, "content": _with_pointer(replacement.get("content"), read_back)}
+            continue
         archived = write_pruned_original(text, session_id or "session", tool_name, call_id)
         if archived is None:
             rows[i], reverted = dict(original), reverted + 1
