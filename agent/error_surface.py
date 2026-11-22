@@ -126,9 +126,46 @@ def _provider_label(provider: str) -> str:
         return provider
 
 
-def auth_kind(provider: Optional[str]) -> str:
-    """``"oauth"`` for providers whose credential is an OAuth/subscription grant
-    (desktop Accounts tab), ``"api_key"`` for everything else."""
+def active_credential(provider: Optional[str], pool: Any = None) -> Optional[tuple[str, str]]:
+    """``(source, auth_type)`` of the credential in use for ``provider``, or ``None``.
+
+    ``pool`` is the agent's live ``CredentialPool``; without one the persisted pool is
+    read (highest priority row first) so UI surfaces that only hold a provider slug
+    still describe the credential that actually failed. Advisory, like everything
+    here: any read failure means "unknown", never an exception on the error path.
+    """
+    slug = (provider or "").strip().lower()
+    if not slug:
+        return None
+    try:
+        if pool is not None:
+            entry = pool.current()
+        else:
+            from agent.credential_pool import PooledCredential
+            from hermes_cli.auth import read_credential_pool
+
+            rows = [row for row in read_credential_pool(slug) if isinstance(row, dict)]
+            entries = [PooledCredential.from_dict(slug, row) for row in rows]
+            entry = min(entries, key=lambda candidate: candidate.priority) if entries else None
+        if entry is None:
+            return None
+        return (str(getattr(entry, "source", "") or ""), str(getattr(entry, "auth_type", "") or ""))
+    except Exception:  # health: allow BLE001 -- advisory probe for the failure copy; a failed lookup must not break the error path it decorates
+        return None
+
+
+def auth_kind(provider: Optional[str], pool: Any = None) -> str:
+    """``"oauth"`` when the credential in use is an OAuth/subscription grant, else
+    ``"api_key"``.
+
+    The active credential wins: a Claude Code login adopted into the Anthropic pool
+    is a sign-in, even though the provider is not on the desktop Accounts tab. A
+    plain API-key row never downgrades a provider the catalog says is OAuth, so the
+    catalog rule is the fallback.
+    """
+    credential = active_credential(provider, pool)
+    if credential is not None and credential[1] == "oauth":
+        return "oauth"
     try:
         from hermes_cli.provider_catalog import provider_catalog_by_slug
 

@@ -876,7 +876,10 @@ class GatewayTurnPersistenceMixin:
             from agent.turn_failure_copy import relogin_command_hint
 
             _turn_agent = getattr(self._session_state(session_key).turn, "agent", None)
-            status_hint = t(_hint_key, relogin=relogin_command_hint(getattr(_turn_agent, "provider", None)))
+            status_hint = t(_hint_key, relogin=relogin_command_hint(
+                getattr(_turn_agent, "provider", None),
+                getattr(_turn_agent, "_credential_pool", None),
+            ))
         elif status_code == 429:
             # Plan usage limit (resets on a schedule) vs a transient rate limit
             _err_json = {}

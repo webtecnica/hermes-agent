@@ -32,7 +32,7 @@ from agent.thinking_timeout_guidance import build_thinking_timeout_guidance, is_
 from agent.vision_message_prep import _provider_model_key
 from agent.turn_failure_copy import (
     CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy,
-    provider_label_for, site_copy, stamp_failure,
+    oauth_relogin_command, provider_label_for, site_copy, stamp_failure,
 )
 from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
@@ -898,8 +898,6 @@ def _print_nonretryable_auth_guidance(
         return
     if provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
         if provider == "openai-codex":
-            from agent.turn_failure_copy import oauth_relogin_command
-
             _vlines(
                 agent,
                 "   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been",
@@ -933,8 +931,12 @@ def _print_nonretryable_auth_guidance(
     from hermes_cli.auth_plugin_providers import plugin_refresh_hook
     if status_code == 401 and plugin_refresh_hook(str(provider or "")) is not None:
         # A plugin OAuth grant the pool could not refresh: the fix is a fresh sign-in, not a key.
-        from agent.turn_failure_copy import oauth_relogin_command
         _vlines(agent, f"   💡 {provider} sign-in was rejected (HTTP 401). Sign in again: `{oauth_relogin_command(provider)}`")
+        return
+    from agent.error_surface import auth_kind
+    _pool = getattr(agent, "_credential_pool", None)
+    if getattr(classified, "is_auth", False) and auth_kind(str(provider or ""), _pool) == "oauth":
+        _vlines(agent, f"   💡 {provider} sign-in was rejected. Sign in again: `{oauth_relogin_command(provider, _pool)}`")
         return
     _vlines(
         agent,
@@ -1175,6 +1177,7 @@ def nonretryable_client_error_result(
         _final_response = nonretryable_copy(
             classified, provider=provider, model=model, summary=_nonretryable_summary,
             prefix_suggestion=_prefix_suggestion,
+            pool=getattr(agent, "_credential_pool", None),
         )
     # Same verdict fields as the max-retries path: without them the UI descriptor
     # (agent/error_surface.py) reads a rejected OAuth token as a retryable
