@@ -20,8 +20,9 @@ from agent.turn_failure_copy import nonretryable_copy, oauth_relogin_command, re
 class _Pool:
     """The slice of ``CredentialPool`` the copy path reads: the row in use."""
 
-    def __init__(self, entry=None):
+    def __init__(self, entry=None, provider=None):
         self._entry = entry
+        self.provider = provider
 
     def current(self):
         return self._entry
@@ -137,6 +138,14 @@ def test_api_key_row_never_downgrades_a_catalog_oauth_provider():
         _auth_classified(), provider="nous", model="Hermes-4-405B",
         summary="401", pool=API_KEY_POOL,
     ).count("rejected your sign-in") == 1
+
+
+def test_pool_for_another_provider_is_ignored():
+    """After a fallback switch the agent's live pool can belong to a different provider."""
+    other = _Pool(_entry(), provider="openrouter")
+    assert active_credential("anthropic", other) is None
+    assert auth_kind("anthropic", other) == "api_key"
+    assert active_credential("anthropic", _Pool(_entry(), provider="anthropic")) == ("claude_code", "oauth")
 
 
 def test_other_sources_keep_the_profile_scoped_hermes_command():

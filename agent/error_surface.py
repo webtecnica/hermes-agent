@@ -139,6 +139,11 @@ def active_credential(provider: Optional[str], pool: Any = None) -> Optional[tup
         return None
     try:
         if pool is not None:
+            # After a fallback switch the live pool can belong to another provider; only a
+            # pool that speaks for ``slug`` describes the credential that just failed.
+            pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
+            if pool_provider and pool_provider != slug:
+                return None
             entry = pool.current()
         else:
             from agent.credential_pool import PooledCredential
