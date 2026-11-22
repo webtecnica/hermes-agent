@@ -146,7 +146,7 @@ def test_other_sources_keep_the_profile_scoped_hermes_command():
     assert oauth_relogin_command("nous", CLAUDE_CODE_POOL) == "hermes -p demo portal"
 
 
-def _guidance_lines(pool):
+def _guidance_lines(pool, provider="anthropic"):
     from agent.turn_recovery import _print_nonretryable_auth_guidance
 
     lines: list[str] = []
@@ -156,7 +156,7 @@ def _guidance_lines(pool):
     )
     _print_nonretryable_auth_guidance(
         agent, SimpleNamespace(is_auth=bool(1), reason=None, error_context={}, billing_unverified=False),
-        status_code=401, provider="anthropic", base_url="https://api.anthropic.com",
+        status_code=401, provider=provider, base_url="https://api.anthropic.com",
         model="claude-sonnet-4-5",
     )
     return lines
@@ -172,3 +172,12 @@ def test_cli_auth_guidance_keeps_the_api_key_lines_for_a_key():
     lines = _guidance_lines(API_KEY_POOL)
     assert any("Your API key was rejected" in line for line in lines)
     assert any("hermes setup" in line for line in lines)
+
+
+def test_catalog_oauth_provider_with_a_key_row_keeps_the_api_key_guidance():
+    """Only a borrowed external login changes the CLI lines; a key row never does."""
+    from agent.turn_failure_copy import external_source_login
+
+    assert external_source_login("anthropic", API_KEY_POOL) is None
+    lines = _guidance_lines(API_KEY_POOL, provider="minimax-oauth")
+    assert any("Your API key was rejected" in line for line in lines)

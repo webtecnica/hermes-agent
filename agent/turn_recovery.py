@@ -933,10 +933,11 @@ def _print_nonretryable_auth_guidance(
         # A plugin OAuth grant the pool could not refresh: the fix is a fresh sign-in, not a key.
         _vlines(agent, f"   💡 {provider} sign-in was rejected (HTTP 401). Sign in again: `{oauth_relogin_command(provider)}`")
         return
-    from agent.error_surface import auth_kind
+    from agent.turn_failure_copy import external_source_login
     _pool = getattr(agent, "_credential_pool", None)
-    if getattr(classified, "is_auth", False) and auth_kind(str(provider or ""), _pool) == "oauth":
-        _vlines(agent, f"   💡 {provider} sign-in was rejected. Sign in again: `{oauth_relogin_command(provider, _pool)}`")
+    if getattr(classified, "is_auth", False) and (source_login := external_source_login(provider, _pool)):
+        # The token belongs to an OS-level CLI (e.g. a Claude Code login): its login is the fix.
+        _vlines(agent, f"   💡 {provider} sign-in was rejected. Sign in again: `{source_login}`")
         return
     _vlines(
         agent,

@@ -468,6 +468,20 @@ _EXTERNAL_SOURCE_RELOGIN: dict[str, str] = {
 }
 
 
+def external_source_login(provider: Any, pool: Any = None) -> Optional[str]:
+    """The login of the OS-level CLI that owns the credential in use, or ``None``.
+
+    Empty for every credential Hermes itself can re-sign; surfaces use it to pick the
+    owner's login instead of a Hermes command (#158828).
+    """
+    from agent.error_surface import active_credential
+
+    credential = active_credential(str(provider or "").strip().lower(), pool)
+    if credential is None:
+        return None
+    return _EXTERNAL_SOURCE_RELOGIN.get(credential[0])
+
+
 def oauth_relogin_command(provider: Any, pool: Any = None) -> str:
     """The exact re-login command for a rejected OAuth grant, naming the provider slug and the active
     named profile: a profile's credentials are its own (93889b770da), so a bare ``hermes auth`` from
@@ -482,10 +496,7 @@ def oauth_relogin_command(provider: Any, pool: Any = None) -> str:
     slug = str(provider or "").strip().lower()
     if slug == "nous":
         return f"hermes {profile_cli_selector()}portal"
-    from agent.error_surface import active_credential
-
-    credential = active_credential(slug, pool)
-    if credential is not None and (source_login := _EXTERNAL_SOURCE_RELOGIN.get(credential[0])):
+    if source_login := external_source_login(slug, pool):
         return source_login
     if _login_owned_by_external_cli(slug):
         # `auth add` refuses a plugin with no auth_handler. The plugin's own CLI login comes first:
