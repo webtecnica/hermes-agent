@@ -208,6 +208,22 @@ class TestSkillDelete:
         assert not worker_dir.exists()
         assert default_dir.is_dir()  # the dashboard's own profile is untouched
 
+    def test_delete_refuses_skill_outside_profile_home(
+        self, client, isolated_profiles, tmp_path
+    ):
+        """A skill mounted through skills.external_dirs is not this home's to delete."""
+        external = tmp_path / "external-skills"
+        _write_skill(external, "mounted-skill")
+        (isolated_profiles["default"] / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n", encoding="utf-8"
+        )
+
+        resp = client.delete("/api/skills", params={"name": "mounted-skill"})
+
+        assert resp.status_code == 400
+        assert "outside this profile" in resp.json()["detail"].lower()
+        assert (external / "mounted-skill" / "SKILL.md").exists()
+
 
 class TestEditorEndpointsAuth:
     @pytest.mark.parametrize(
