@@ -165,6 +165,50 @@ class TestSkillUpdate:
         assert resp.status_code == 400
 
 
+class TestSkillDelete:
+    def test_delete_removes_local_skill(self, client, isolated_profiles):
+        skill_dir = isolated_profiles["default"] / "skills" / "dashboard-skill"
+        assert skill_dir.is_dir()
+
+        resp = client.delete("/api/skills", params={"name": "dashboard-skill"})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["success"] is True
+        assert not skill_dir.exists()
+
+    def test_delete_unknown_skill_404(self, client, isolated_profiles):
+        resp = client.delete("/api/skills", params={"name": "no-such-skill"})
+
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()
+
+    def test_delete_refuses_essential_skill(self, client, isolated_profiles):
+        """The route reuses the agent's delete path, so the pinned/essential guard holds."""
+        skills_dir = isolated_profiles["default"] / "skills"
+        _write_skill(skills_dir, "hermes-agent")
+
+        resp = client.delete("/api/skills", params={"name": "hermes-agent"})
+
+        assert resp.status_code == 400
+        assert "cannot be deleted" in resp.json()["detail"].lower()
+        assert (skills_dir / "hermes-agent" / "SKILL.md").exists()
+
+    def test_delete_scopes_to_profile(self, client, isolated_profiles):
+        for home in isolated_profiles.values():
+            _write_skill(home / "skills", "shared-skill")
+        worker_dir = isolated_profiles["worker_alpha"] / "skills" / "shared-skill"
+        default_dir = isolated_profiles["default"] / "skills" / "shared-skill"
+
+        resp = client.delete(
+            "/api/skills", params={"name": "shared-skill", "profile": "worker_alpha"}
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["success"] is True
+        assert not worker_dir.exists()
+        assert default_dir.is_dir()  # the dashboard's own profile is untouched
+
+
 class TestEditorEndpointsAuth:
     @pytest.mark.parametrize(
         "method,path,kwargs",
@@ -172,6 +216,7 @@ class TestEditorEndpointsAuth:
             ("get", "/api/skills/content?name=dashboard-skill", {}),
             ("post", "/api/skills", {"json": {"name": "x", "content": "y"}}),
             ("put", "/api/skills/content", {"json": {"name": "x", "content": "y"}}),
+            ("delete", "/api/skills?name=dashboard-skill", {}),
         ],
     )
     def test_endpoints_401_without_token(

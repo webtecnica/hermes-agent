@@ -18,8 +18,8 @@ from hermes_cli.web_models import (
     SkillContentUpdate, SkillCreate, SkillInstallRequest, SkillLock, SkillToggle,
     SkillUninstallRequest, SkillsUpdateRequest)
 from hermes_cli.web_routers._common import (
-    _profile_scope, config_write_scope, http_failure, log as _log, require, scoped_to_thread,
-    spawn_profile_action)
+    _profile_scope, config_write_scope, destructive_profile, http_failure, log as _log, require,
+    scoped_to_thread, spawn_profile_action)
 
 hub_router = APIRouter()
 router = APIRouter()
@@ -494,6 +494,29 @@ async def update_skill_content(body: SkillContentUpdate, profile: Optional[str] 
     result = await scoped_to_thread(body.profile or profile, lambda: _edit_skill(body.name, body.content))
     if not result.get("success"):
         err = result.get("error", "Failed to update skill.")
+        status = 404 if "not found" in str(err).lower() else 400
+        raise HTTPException(status_code=status, detail=err)
+    _clear_skills_prompt_cache()
+    return result
+
+
+@router.delete("/api/skills")
+async def delete_skill(name: str, profile: Optional[str] = None):
+    """Delete a local (non-hub) skill through the agent's ``skill_manage`` delete path.
+
+    Same guards as the tool: unknown skill -> 404, pinned/essential skill refused
+    with 400 and left on disk, and the delete never leaves the scoped profile's
+    skills root. ``absorbed_into`` is deliberately NOT exposed here: that is
+    curator-consolidation semantics (archive instead of hard-delete, restorable
+    with ``hermes curator restore``), not part of the dashboard's delete.
+    Profile from ``?profile=``, like the rest of ``/api/skills``.
+    """
+    from tools.skill_manager_tool import _delete_skill
+
+    target = destructive_profile(profile, "DELETE /api/skills")
+    result = await scoped_to_thread(target, lambda: _delete_skill(name))
+    if not result.get("success"):
+        err = result.get("error", "Failed to delete skill.")
         status = 404 if "not found" in str(err).lower() else 400
         raise HTTPException(status_code=status, detail=err)
     _clear_skills_prompt_cache()

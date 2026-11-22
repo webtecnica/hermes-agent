@@ -861,6 +861,10 @@ Returns all skills with their name, description, category, and enabled status.
 
 Enables or disables a skill. Body: `{"name": "skill-name", "enabled": true}`.
 
+### DELETE /api/skills
+
+Deletes a local (non-hub) skill through the same guarded write path as the agent's `skill_manage` tool. Query parameters: `name` (required) and `profile` (target profile). Returns `404` when the skill does not exist and `400` when the delete is refused (pinned or essential skill), in which case the directory is left on disk.
+
 ### GET /api/tools/toolsets
 
 Returns all toolsets with their label, description, tools list, and active/configured status.
