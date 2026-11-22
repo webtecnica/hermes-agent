@@ -1246,7 +1246,7 @@ class _ExecPlan:
 
 _PROMOTED_NOTE = (
     "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
-    "tracked background process with notify_on_complete=true instead of being refused. Do NOT re-run it. "
+    "tracked background process with notify=true instead of being refused. Do NOT re-run it. "
     "Its completion (exit code + output tail) arrives as a notification; poll with "
     "process_manage(action=\"poll\", session_id=...) if you need it sooner."
 )

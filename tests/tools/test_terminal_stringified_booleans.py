@@ -11,9 +11,9 @@ string turns into a silent boolean. Real booleans, the notify pattern list and `
 behaviour are unchanged.
 
 The handler is exercised directly (`_handle_terminal`), the same entry point the registry
-calls, because the global schema-guided coercion in `tools.arg_coercion` never sees `notify`
-(its schema is an `anyOf` with no top-level `type`) and a plugin/inline caller can reach the
-handler without that layer.
+calls, because `registry.dispatch` hands the args to the handler untouched: the
+schema-guided layer in `tools.arg_coercion` only runs on some client paths and cannot
+repair `notify` (an `anyOf` with no top-level `type`).
 """
 
 import json
@@ -247,3 +247,25 @@ def test_timeout_hint_names_the_advertised_notify_parameter():
     hint = TERMINAL_SCHEMA["parameters"]["properties"]["timeout"]["description"]
     assert "notify=true" in hint
     assert "notify_on_complete" not in hint
+
+
+def test_promoted_timeout_note_names_the_advertised_notify_parameter():
+    """The over-cap result note is model-facing too; it used to advertise the internal kwarg."""
+    from tools.terminal_tool import _PROMOTED_NOTE
+
+    assert "notify=true" in _PROMOTED_NOTE
+    assert "notify_on_complete" not in _PROMOTED_NOTE
+
+
+# ---------------------------------------------------------------------------
+# The registry route, where `registry.dispatch` hands the args to the handler as-is.
+# ---------------------------------------------------------------------------
+def test_registry_dispatch_coerces_string_booleans(monkeypatch):
+    from tools.registry import registry
+
+    captured = _capture_terminal_tool(monkeypatch)
+    result = json.loads(registry.dispatch("terminal", {"command": "pwd", "background": "False", "notify": "False"}))
+
+    assert not result.get("error"), result
+    assert captured["background"] is False
+    assert captured["notify_on_complete"] is False
