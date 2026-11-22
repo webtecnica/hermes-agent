@@ -73,7 +73,9 @@ def test_one_line_reasoning_is_shown_once(monkeypatch, reasoning):
     cli._flush_stream()
 
     rows = "\n".join(emitted).split("\n")
-    assert sum(row.count(reasoning) for row in rows) == 1, emitted
+    # #158905: the live flush now breaks long blocks at word boundaries, so one block can
+    # span rows; what matters is that the text appears exactly once, not that it fits a row.
+    assert "".join(rows).count(reasoning) == 1, emitted
     thought = [row for row in rows if row.startswith("∴")]
     assert len(thought) == 1 and "·" not in thought[0], thought
 

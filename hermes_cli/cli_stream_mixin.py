@@ -50,6 +50,14 @@ def _terminal_columns(default: int = 80) -> int:
         return default
 
 
+# Soft threshold for the live reasoning flush: once an unterminated partial line grows past
+# this, it is emitted up to its last space so reasoning stays visible in real time.
+_REASONING_WRAP_CHARS = 80
+# Safety ceiling for a buffer with no space at all (one giant token): a mid-token break at
+# this point beats buffering without bound, whatever the reported terminal width.
+_REASONING_WRAP_MAX = 4096
+
+
 class CLIStreamMixin:
     """Streaming output, reasoning preview, tool progress callbacks, and busy-command spinner for the interactive CLI"""
 
@@ -256,6 +264,31 @@ class CLIStreamMixin:
             from hermes_cli.cli_modern_layout import closing_separator
             _cprint(closing_separator(True))
 
+    def _reasoning_flush_chunk(self) -> str | None:
+        """Pop the next word-boundary-aligned chunk of the live reasoning buffer.
+
+        A partial line (no newline yet) is flushed while it streams so reasoning stays
+        visible in real time, but the flush must not cut a word: once the buffer outgrows
+        the soft threshold, emit up to and including its last space and keep the tail
+        buffered. A buffer with no space at all waits for the terminal width (or the safe
+        ceiling) — there is no word boundary to break at, so breaking early cannot help.
+        """
+        buf = getattr(self, "_reasoning_buf", "")
+        if not buf:
+            return None
+        cut = buf.rfind(" ")
+        if cut > 0:
+            if len(buf) <= _REASONING_WRAP_CHARS:
+                return None
+            self._reasoning_buf = buf[cut + 1:]
+            return buf[: cut + 1]
+        width = _terminal_columns()
+        threshold = min(width, _REASONING_WRAP_MAX) if width > 0 else _REASONING_WRAP_MAX
+        if len(buf) >= threshold:
+            self._reasoning_buf = buf[threshold:]
+            return buf[:threshold]
+        return None
+
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning tokens into a dim box above the response.
 
@@ -276,13 +309,13 @@ class CLIStreamMixin:
                 self._reasoning_buf = ""
                 _cprint("\n" + separator(False))
             self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
-            # Live, as classic: complete lines now, long partial lines force-flushed.
+            # Live, as classic: complete lines now, long partial lines flushed at a word
+            # boundary so the stream stays visible without hard-wrapping mid-word.
             while "\n" in self._reasoning_buf:
                 line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
                 _cprint(reasoning_text_line(line))
-            if len(self._reasoning_buf) > 80:
-                _cprint(reasoning_text_line(self._reasoning_buf))
-                self._reasoning_buf = ""
+            while (chunk := self._reasoning_flush_chunk()) is not None:
+                _cprint(reasoning_text_line(chunk))
             return
         if not getattr(self, "_reasoning_box_opened", False):
             self._reasoning_box_opened = True
@@ -292,14 +325,13 @@ class CLIStreamMixin:
             _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
-        # Emit complete lines; force-flush long partial lines so reasoning is visible in
-        # real-time even without newlines.
+        # Emit complete lines; flush long partial lines at a word boundary so reasoning is
+        # visible in real-time even without newlines, without wrapping mid-word.
         while "\n" in self._reasoning_buf:
             line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
             _cprint(f"{_DIM}{line}{_RST}")
-        if len(self._reasoning_buf) > 80:
-            _cprint(f"{_DIM}{self._reasoning_buf}{_RST}")
-            self._reasoning_buf = ""
+        while (chunk := self._reasoning_flush_chunk()) is not None:
+            _cprint(f"{_DIM}{chunk}{_RST}")
 
     def _agent_status_print(self, *args, **kwargs) -> None:
         """``agent._print_fn`` for the interactive CLI: agent status lines (subagent completion ``✓ [set n · i/N]``,
