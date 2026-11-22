@@ -42,7 +42,7 @@
         "type": "boolean"
       },
       "timeout": {
-        "description": "Max seconds (default 180, foreground max 600). Finishing early returns at once, so set it generously. Above 600s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+        "description": "Max seconds (default 180, foreground max 600). Finishing early returns at once, so set it generously. Above 600s the command runs as a tracked background process with notify=true (the result says so; do not re-run it).",
         "minimum": 1,
         "type": "integer"
       },
