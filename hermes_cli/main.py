@@ -1542,6 +1542,18 @@ def cmd_chat(args):
         offer_consent_before_chat(args)
     _confirm_startup_expensive_model_override(args)
 
+    # --query-file must be read BEFORE the passthrough snapshot and the TUI launch: the TUI branch
+    # below hands control to the Ink subprocess and never comes back (_launch_tui ends in
+    # sys.exit), so the read used to sit on dead code for `--tui` and the session opened with no
+    # seed (#158875). Reading here also keeps the read ahead of `passthrough["query"]`, so the file
+    # content travels the exact same route as `-q` (HERMES_TUI_QUERY for the TUI, args.query for
+    # the classic CLI). An unreadable or empty file still exits 2 with the same message, before any
+    # TUI is started; the mutually-exclusive guard with -q is unchanged. The classic path is
+    # unaffected: passthrough is a pure getattr snapshot, so moving the read above it changes no
+    # argv and only runs earlier within the same pre-CLI stretch.
+    from hermes_cli.main_query_file import _read_query_file
+    _read_query_file(args)
+
     passthrough = {k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH}
     if use_tui:
         _launch_tui(
@@ -1552,9 +1564,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
             **passthrough,
         )
-
-    from hermes_cli.main_query_file import _read_query_file
-    _read_query_file(args)
 
     safe_mode = getattr(args, "safe_mode", False)
     kwargs = {
