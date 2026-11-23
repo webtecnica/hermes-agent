@@ -14,6 +14,14 @@ import tempfile
 import pytest
 
 
+def _is_hermes_module(name):
+    return (
+        name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    )
+
+
 @pytest.fixture()
 def isolated_kanban_home_with_profiles(monkeypatch):
     """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles."""
@@ -23,15 +31,24 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
             fh.write("{}\n")  # identity marker: a bare dir is not a profile
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    from hermes_cli import kanban_db_dispatch
-    # The module purge above discards the conftest's memory-sample neutralizer;
-    # re-apply it so the host's live memory pressure cannot cap this tick.
-    monkeypatch.setattr(kanban_db_dispatch, "_system_memory_sample", dict)
-    yield kanban_db
+    # Snapshot the modules before purging them and put them back on teardown:
+    # monkeypatch restores HERMES_HOME but not sys.modules, and a re-imported
+    # copy left behind binds to the real home for every later test (#159065).
+    saved = {name: mod for name, mod in sys.modules.items() if _is_hermes_module(name)}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        from hermes_cli import kanban_db
+        from hermes_cli import kanban_db_dispatch
+        # The module purge above discards the conftest's memory-sample
+        # neutralizer; re-apply it so the host's live memory pressure cannot
+        # cap this tick.
+        monkeypatch.setattr(kanban_db_dispatch, "_system_memory_sample", dict)
+        yield kanban_db
+    finally:
+        for name in [name for name in sys.modules if _is_hermes_module(name)]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):
