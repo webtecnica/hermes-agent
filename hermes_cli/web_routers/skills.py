@@ -18,8 +18,8 @@ from hermes_cli.web_models import (
     SkillContentUpdate, SkillCreate, SkillInstallRequest, SkillLock, SkillToggle,
     SkillUninstallRequest, SkillsUpdateRequest)
 from hermes_cli.web_routers._common import (
-    _profile_scope, config_write_scope, destructive_profile, http_failure, log as _log, require,
-    scoped_to_thread, spawn_profile_action)
+    _profile_scope, config_write_scope, http_failure, log as _log, require, scoped_to_thread,
+    spawn_profile_action)
 
 hub_router = APIRouter()
 router = APIRouter()
@@ -506,12 +506,12 @@ async def delete_skill(name: str, profile: Optional[str] = None):
 
     Same guards as the tool: unknown skill -> 404, pinned/essential skill refused
     with 400 and left on disk, and the delete never leaves the scoped profile's
-    skills root. Skills discovered OUTSIDE that home (``skills.external_dirs``,
-    ``skills.create_dir``) are read-only mounts to this route and are refused
-    instead of removed at their source. ``absorbed_into`` is deliberately NOT
-    exposed here: that is curator-consolidation semantics (archive instead of
-    hard-delete, restorable with ``hermes curator restore``), not part of the
-    dashboard's delete. Profile from ``?profile=``, like the rest of ``/api/skills``.
+    skills root. Skills discovered OUTSIDE that home (``skills.external_dirs``
+    mounts, ``skills.create_dir`` redirects) are refused instead of removed at
+    their source. ``absorbed_into`` is deliberately NOT exposed here: that is
+    curator-consolidation semantics (archive instead of hard-delete, restorable
+    with ``hermes curator restore``), not part of the dashboard's delete. Profile
+    from ``?profile=``, like the rest of ``/api/skills``.
     """
     from tools.skill_manager_tool import _delete_skill, _find_skill
     from tools.skills_tool import _skills_dir
@@ -527,12 +527,11 @@ async def delete_skill(name: str, profile: Optional[str] = None):
         if not in_profile:
             return {"success": False,
                     "error": f"Skill '{name}' lives outside this profile's skills directory "
-                             f"(mounted skills such as skills.external_dirs are read-only here); "
-                             f"refusing to delete it."}
+                             f"(skills.external_dirs mounts are read-only here); refusing to "
+                             f"delete it."}
         return _delete_skill(name)
 
-    target = destructive_profile(profile, "DELETE /api/skills")
-    result = await scoped_to_thread(target, _run)
+    result = await scoped_to_thread(profile, _run)
     if not result.get("success"):
         err = result.get("error", "Failed to delete skill.")
         status = 404 if "not found" in str(err).lower() else 400
