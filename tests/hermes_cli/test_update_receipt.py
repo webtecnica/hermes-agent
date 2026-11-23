@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_cli.update_receipt as ur
-from hermes_cli import update_cmd, update_cmd_maint
+from hermes_cli import update_cmd, update_cmd_maint, update_owning_install
 
 
 @pytest.fixture()
@@ -193,10 +193,21 @@ class TestCommandBoundaryFinalization:
         from hermes_cli import main as hermes_main
 
         def _fake_impl(args, gateway_mode):
+            impl_calls.append(gateway_mode)
             ur.begin_update_receipt()
             ur.record_step("windows_preflight", False, "hermes.exe holds venv")
             sys.exit(2)
 
+        impl_calls = []
+        # cmd_update retargets to the install that owns this interpreter *before*
+        # it reaches _cmd_update_impl (main.py ``retarget_to_owning_install``).
+        # On a shared dev venv that install is another checkout, whose CLI re-exec
+        # receives pytest's argv, answers "is not a hermes command" and exits 2 —
+        # the fake impl never runs. Pin the seam exactly as the sibling update
+        # tests do; the retarget path is covered by its own tests.
+        monkeypatch.setattr(
+            update_owning_install, "retarget_to_owning_install", lambda root: None
+        )
         monkeypatch.setattr(update_cmd, "_cmd_update_impl", _fake_impl)
         monkeypatch.setattr(
             hermes_main, "detect_install_method", lambda *a, **k: "git", raising=False
@@ -242,6 +253,11 @@ class TestCommandBoundaryFinalization:
         assert latest["stop_reason"] == "sys.exit(2)"
         assert latest["steps"][0]["name"] == "windows_preflight"
         assert ur.current_correlation_id() is None
+        # The receipt can only exist if the fake impl ran: the boundary finalizes
+        # it around the SystemExit. Together with the impl intercept, this makes
+        # the exit code discriminating — a re-exec'd owner CLI rejects the pytest
+        # argv with the same code 2 but leaves no receipt behind.
+        assert impl_calls == [False]
         # exactly-once: exactly one receipt file
         directory = receipt_home / "logs" / "update_receipts"
         assert len(list(directory.glob("update_*.json"))) == 1
