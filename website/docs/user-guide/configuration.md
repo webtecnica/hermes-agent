@@ -988,8 +988,8 @@ context_files_allow_external_symlinks: false  # default — a link resolving out
 ```
 
 Set it to `true` to load such a link, or set `HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1` for a container or a
-one-off run (the environment wins when set). With the default, the skip is logged, announced at session start,
-and listed as `skipped` by `/context`. Subdirectory hints are unaffected by this setting. See
+one-off run (the environment wins when set). With the default, the skip is logged, reported on the session status
+rail, and listed as `skipped` by `/context`. Subdirectory hints are unaffected by this setting. See
 [Context files — Symlinked context files](./features/context-files.md#symlinked-context-files).
 
 ## File Read Safety
