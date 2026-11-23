@@ -113,6 +113,33 @@ def test_hermes_update_names_catalog_pins_it_moved_and_rearms_the_check(home, mo
     assert not marker.exists()
 
 
+def test_hermes_update_parses_the_catalog_once_for_every_profile(home, tmp_path, monkeypatch, capsys):
+    """One ``load_catalog()`` per notice, not one per catalog install per profile: 2 profiles x 3
+    catalog installs used to parse the whole catalog 6 times (264 parses, ~10 min, on a 19-profile
+    box)."""
+    from hermes_cli import plugin_catalog
+    from hermes_cli.plugins_auto_update import report_catalog_updates_after_hermes_update
+
+    sibling = tmp_path / "sibling-home"
+    (sibling / "plugins").mkdir(parents=True)
+    entries = [plugin_catalog.PluginCatalogEntry(name=f"cat-{i}", repo="https://example.invalid/r",
+                                                 sha="c" * 40, description="d", maintainer="m")
+               for i in range(3)]
+    parses = []
+    monkeypatch.setattr(plugin_catalog, "load_catalog",
+                        lambda catalog_dir=None: parses.append(catalog_dir) or entries)
+    for profile_home in (home, sibling):
+        (profile_home / "plugins" / ".install-metadata.json").write_text(json.dumps({
+            f"cat-{i}": {"catalog": {"name": f"cat-{i}", "sha": "a" * 40, "pin": "a" * 40}}
+            for i in range(3)}), encoding="utf-8")
+
+    report_catalog_updates_after_hermes_update(home, [("other profile", sibling)])
+    out = capsys.readouterr().out
+    assert len(parses) == 1
+    for label in ("this profile", "other profile"):
+        assert f"3 plugin update(s) from the new catalog in {label}: cat-0, cat-1, cat-2" in out
+
+
 def _held_install_metadata(home):
     """`hermes plugins install cat-plug --ref <older sha>`: pinned, off the catalog pin (empty `pin`), next
     to a catalog install that is simply behind its pin."""
