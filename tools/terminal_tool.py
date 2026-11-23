@@ -1246,7 +1246,7 @@ class _ExecPlan:
 
 _PROMOTED_NOTE = (
     "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
-    "tracked background process with notify_on_complete=true instead of being refused. Do NOT re-run it. "
+    "tracked background process with notify=true instead of being refused. Do NOT re-run it. "
     "Its completion (exit code + output tail) arrives as a notification; poll with "
     "process_manage(action=\"poll\", session_id=...) if you need it sooner."
 )
@@ -1733,7 +1733,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds (default 180, foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Above {FOREGROUND_MAX_TIMEOUT}s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+                "description": f"Max seconds (default 180, foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Above {FOREGROUND_MAX_TIMEOUT}s the command runs as a tracked background process with notify=true (the result says so; do not re-run it).",
                 "minimum": 1
             },
             "workdir": {
@@ -1772,6 +1772,47 @@ TERMINAL_SCHEMA = {
 }
 
 
+_TRUE_FALSE_SPELLINGS = {"true": True, "false": False}
+
+_NOTIFY_SHAPE_ERROR = (
+    "notify must be true/false (JSON boolean: notify on exit) or a list of "
+    "strings (notify on output pattern match)."
+)
+
+
+class _InvalidBoolArgument(ValueError):
+    """A boolean argument arrived with a string that is not ``true``/``false``."""
+
+    def __init__(self, name: str, value: object) -> None:
+        super().__init__(f"{name} must be a JSON boolean: true or false (got {value!r}).")
+        self.name = name
+        self.value = value
+
+
+def _coerce_tool_bool(value, default: bool = False, *, name: str) -> bool:
+    """Boolean meaning of a model-supplied argument, refusing unknown string spellings.
+
+    The schema advertises JSON booleans, but models emit the Python repr
+    ``"True"``/``"False"`` or JSON text as a string (issue #157759). A non-empty
+    string is truthy, so reading one with ``args.get`` turned a string
+    ``background="false"`` into a background process. Only ``true``/``false`` (any case,
+    surrounding whitespace allowed) are accepted; any other string raises
+    :class:`_InvalidBoolArgument` so the caller refuses the call instead of
+    silently picking a value. Non-string, non-boolean values keep the historical
+    truthiness (a model that wrote ``1``/``0`` as a number).
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        spelling = _TRUE_FALSE_SPELLINGS.get(value.strip().lower())
+        if spelling is not None:
+            return spelling
+        raise _InvalidBoolArgument(name, value)
+    return bool(value)
+
+
 def _handle_terminal(args, **kw):
     from agent.terminal_approval_batch import validate_prepared_terminal
     validate_prepared_terminal(args)
@@ -1793,13 +1834,25 @@ def _handle_terminal(args, **kw):
     # identical-call retry loops (46 subagent sessions, 4 refusals each, 38 of
     # which never ran a single command), so it is normalized away instead.
     notify = args.get("notify")
-    notify_on_complete = args.get("notify_on_complete", False)
     watch_patterns = args.get("watch_patterns")
     heartbeat = args.get("heartbeat") or 0
-    persist_on_release = bool(args.get("persist_on_release", False))
+    # Coerce before any guard reads them: a string "false" is truthy, and it used
+    # to start a background process (or look like notification intent).
+    try:
+        background = _coerce_tool_bool(args.get("background"), name="background")
+        pty = _coerce_tool_bool(args.get("pty"), name="pty")
+        persist_on_release = _coerce_tool_bool(args.get("persist_on_release"), name="persist_on_release")
+        notify_on_complete = _coerce_tool_bool(args.get("notify_on_complete"), name="notify_on_complete")
+    except _InvalidBoolArgument as exc:
+        return tool_error(str(exc))
+    if isinstance(notify, str):
+        try:
+            notify = _coerce_tool_bool(notify, name="notify")
+        except _InvalidBoolArgument:
+            return tool_error(_NOTIFY_SHAPE_ERROR)
     if not isinstance(heartbeat, int) or isinstance(heartbeat, bool) or heartbeat < 0:
         return tool_error("heartbeat must be a whole number of seconds (0 disables; positive values are clamped to min 60).")
-    if not args.get("background", False):
+    if not background:
         if notify or watch_patterns or notify_on_complete:
             return tool_error(
                 "notify only applies to background commands (foreground "
@@ -1807,7 +1860,7 @@ def _handle_terminal(args, **kw):
                 "terminal(command=..., background=true, notify=...)."
             )
         heartbeat = 0
-        if args.get("pty", False):
+        if pty:
             return tool_error(
                 "pty requires background=true (a PTY session is interacted "
                 "with via process_manage(action='write'/'submit'), which needs a "
@@ -1828,20 +1881,17 @@ def _handle_terminal(args, **kw):
             watch_patterns = notify
             notify_on_complete = False
         else:
-            return tool_error(
-                "notify must be true/false (notify on exit) or a list of "
-                "strings (notify on output pattern match)."
-            )
+            return tool_error(_NOTIFY_SHAPE_ERROR)
     if heartbeat:
         notify_on_complete = True  # the heartbeat rides the completion delivery path
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=background,
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
-        pty=args.get("pty", False),
+        pty=pty,
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
         heartbeat=heartbeat,
@@ -1858,7 +1908,11 @@ def _terminal_deadline_floor(args: dict) -> float | None:
     call blocks for ``timeout or TERMINAL_TIMEOUT`` — which the schema tells the model to
     set high, promising "Returns INSTANTLY when command finishes".
     """
-    if args.get("background"):
+    try:
+        background = _coerce_tool_bool(args.get("background"), name="background")
+    except _InvalidBoolArgument:
+        background = False  # the handler refuses the call and names the spelling
+    if background:
         return None
     requested = args.get("timeout")
     try:
