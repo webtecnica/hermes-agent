@@ -125,9 +125,9 @@ def serialize_frame(obj: dict, peer: str, log: logging.Logger) -> str:
         rid = obj.get("id") if isinstance(obj, dict) else None
         log.error("frame serialization failed peer=%s id=%s error_type=%s error=%s",
                   peer, rid, type(exc).__name__, exc)
-        fallback = {"jsonrpc": "2.0", "id": rid,
+        fallback = {"jsonrpc": "2.0", "id": sanitize_nonfinite(rid),
                     "error": {"code": -32603, "message": f"response serialization error: {exc}"}}
-        return json.dumps(fallback, ensure_ascii=False)
+        return json.dumps(fallback, ensure_ascii=False, allow_nan=False)
 
 
 class StdioTransport:
