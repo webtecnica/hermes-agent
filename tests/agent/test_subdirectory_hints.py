@@ -393,6 +393,22 @@ class TestSymlinkedHintTargets:
         assert SubdirectoryHintTracker(working_dir=str(workspace)).check_tool_call(
             "terminal", {"command": f"cd {sub}"}) is None
 
+    @pytest.mark.require_symlinks
+    def test_opt_in_does_not_widen_subdirectory_hints(self, tmp_path, monkeypatch):
+        """#159222's opt-in is for startup context files only: a hint found while navigating lands in a tool
+        result, so a checked-in link to an out-of-tree file stays refused even with the variable set."""
+        monkeypatch.setenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", "1")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text("OUTSIDE-MARKER-9f3a", encoding="utf-8")
+        workspace = tmp_path / "workspace"
+        sub = workspace / "sub"
+        sub.mkdir(parents=True)
+        (sub / "AGENTS.md").symlink_to(outside / "secret.md")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(workspace))
+        assert tracker.check_tool_call("read_file", {"path": str(sub / "f.py")}) is None
+
     def test_in_tree_hint_files_still_load(self, tmp_path):
         """A plain hint file and a symlink whose target stays inside the tree keep working."""
         workspace = tmp_path / "workspace"

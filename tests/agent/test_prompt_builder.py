@@ -586,6 +586,131 @@ class TestBuildContextFilesPrompt:
             assert "OWN-HOME-AGENTS" in load()
 
 
+class TestExternalSymlinkOptIn:
+    """#159222: a context file that only links *outside* the project is the operator's call — refused by
+    default, loadable with HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1 — while the read deny-list is not a call
+    anyone can make. Either way the skip stops being silent: one log line names the knob, and the same notice
+    reaches the chat status rail.
+    """
+
+    @staticmethod
+    def _project(tmp_path) -> Path:
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "CLAUDE.md").write_text("RULES-MARKER-4c1f", encoding="utf-8")
+        project = tmp_path / "proj"
+        (project / ".git").mkdir(parents=True)
+        (project / "AGENTS.md").symlink_to(shared / "CLAUDE.md")
+        return project
+
+    @pytest.mark.require_symlinks
+    def test_refused_by_default_with_the_opt_in_named_everywhere(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.delenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", raising=False)
+        drain_truncation_warnings()
+        project = self._project(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
+            prompt = build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+        assert "RULES-MARKER-4c1f" not in prompt
+        assert any("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1" in rec.getMessage() for rec in caplog.records)
+        # Not a read failure: /context still reports a containment refusal.
+        from agent.context_file_sources import list_context_file_sources
+        sources = list_context_file_sources(cwd=str(project), skip_soul=True)
+        assert [(s["label"], s["status"], s["loaded"]) for s in sources] == [("AGENTS.md", "skipped", False)]
+        # And the human hears it: the prompt build queues the line the status rail drains (#159222 item 3).
+        notices = drain_truncation_warnings()
+        assert any("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1" in n for n in notices)
+
+    @pytest.mark.require_symlinks
+    def test_opt_in_loads_the_external_target(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", "1")
+        drain_truncation_warnings()
+        project = self._project(tmp_path)
+
+        prompt = build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+        assert "RULES-MARKER-4c1f" in prompt
+        from agent.context_file_sources import list_context_file_sources
+        sources = list_context_file_sources(cwd=str(project), skip_soul=True)
+        assert [(s["label"], s["status"], s["loaded"]) for s in sources] == [("AGENTS.md", "loaded", True)]
+        assert not [n for n in drain_truncation_warnings() if "skipped" in n]
+
+    @pytest.mark.require_symlinks
+    def test_config_key_loads_the_external_target(self, tmp_path, monkeypatch):
+        """config.yaml is the per-profile spelling of the same switch (no HERMES_* env var needed)."""
+        monkeypatch.delenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", raising=False)
+        monkeypatch.setattr("agent.prompt_builder._config_readonly",
+                            lambda *_a: {"context_files_allow_external_symlinks": True})
+        project = self._project(tmp_path)
+
+        assert "RULES-MARKER-4c1f" in build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+    @pytest.mark.require_symlinks
+    def test_env_var_overrides_the_config_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", "1")
+        monkeypatch.setattr("agent.prompt_builder._config_readonly",
+                            lambda *_a: {"context_files_allow_external_symlinks": False})
+        project = self._project(tmp_path)
+
+        assert "RULES-MARKER-4c1f" in build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+    @pytest.mark.require_symlinks
+    @pytest.mark.parametrize("outside", [False, True], ids=["in-tree-env", "outside-env"])
+    def test_opt_in_never_waives_the_read_deny_list(self, tmp_path, monkeypatch, caplog, outside):
+        monkeypatch.setenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", "1")
+        project = tmp_path / "proj"
+        (project / ".git").mkdir(parents=True)
+        if outside:
+            shared = tmp_path / "shared"
+            shared.mkdir()
+            secret = shared / ".env"
+        else:
+            secret = project / ".env"
+        secret.write_text("API_KEY=SECRET-VALUE-7b2d", encoding="utf-8")
+        (project / "AGENTS.md").symlink_to(secret)
+
+        with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
+            prompt = build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+        assert "SECRET-VALUE-7b2d" not in prompt
+        assert any("protected file" in rec.getMessage() for rec in caplog.records)
+        assert not any("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1" in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.require_symlinks
+    @pytest.mark.parametrize("opt_in", [None, "1"])
+    def test_in_tree_link_is_unaffected(self, tmp_path, monkeypatch, opt_in):
+        if opt_in is None:
+            monkeypatch.delenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK", opt_in)
+        project = tmp_path / "proj"
+        (project / ".git").mkdir(parents=True)
+        (project / "docs").mkdir()
+        (project / "docs" / "shared.md").write_text("INSIDE-MARKER", encoding="utf-8")
+        (project / "AGENTS.md").symlink_to(project / "docs" / "shared.md")
+
+        assert "INSIDE-MARKER" in build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+    @pytest.mark.require_symlinks
+    def test_refusal_is_not_a_read_failure(self, tmp_path):
+        """``None`` (refused) and ``""`` (unreadable) stay distinct: /context and the compression rebuild
+        depend on the difference, so the skip path must not collapse into an empty read."""
+        from agent.prompt_builder import _read_context_file
+
+        project = tmp_path / "proj"
+        (project / ".git").mkdir(parents=True)
+        unreadable = project / "AGENTS.md"
+        unreadable.mkdir()  # exists, but reading a directory raises
+        assert _read_context_file(unreadable, project) == ""
+
+        outside = tmp_path / "outside.md"
+        outside.write_text("OUTSIDE-MARKER", encoding="utf-8")
+        link = project / "CLAUDE.md"
+        link.symlink_to(outside)
+        assert _read_context_file(link, project) is None
+
+
 
 
 

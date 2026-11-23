@@ -1076,6 +1076,23 @@ def drain_truncation_warnings() -> list:
     return drained
 
 
+# A context file refused by containment is a silently missing instruction file, the same class of loss as a
+# truncation — so it rides the same drain to the chat status rail (#159222). Only the prompt build enables the
+# queue: ``/context`` runs the identical discovery read-only and must not push anything into the next prompt.
+_context_skip_notices: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "context_file_skip_notices", default=False
+)
+
+
+def _queue_context_skip_notice(message: str) -> None:
+    """Queue a refused-context-file notice for the chat status rail, on the prompt-build path only."""
+    if not _context_skip_notices.get():
+        return
+    if (warnings := _truncation_warnings.get()) is None:
+        _truncation_warnings.set(warnings := [])
+    warnings.append(message)
+
+
 # Skills index (two-layer cache: in-process LRU, then disk snapshot).
 # One entry per profile × platform (key carries skills_dir); a multiplexing gateway needs more than a handful.
 # Sized for multi-profile processes: since #86313 the cache key carries a per-profile skills_dir (one entry
@@ -1577,14 +1594,32 @@ def _read_context_file(path: Path, root: Optional[Path] = None) -> Optional[str]
 
     With *root* (the resolved project root the file was discovered under), a file whose resolved target
     leaves *root* or hits the read deny-list is skipped: the policy subdirectory hints apply. That refusal
-    returns None, so ``/context`` can tell it apart from a read failure."""
+    returns None, so ``/context`` can tell it apart from a read failure.
+
+    The two refusals are not the same policy (#159222): a deny-list target stays refused always, while a
+    link that only leaves *root* is what an operator can waive with ``HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK``
+    — so the warning names that knob instead of hiding both behind one sentence, and the skip is queued for
+    the chat status rail (``drain_truncation_warnings``) when this runs on the prompt-build path."""
     if not path.exists():
         return ""
     if root is not None:
-        from agent.subdirectory_hints import _resolved_hint_target  # late import: that module imports this one
-        target = _resolved_hint_target(path, root)
+        # late import: subdirectory_hints imports this module
+        from agent.subdirectory_hints import (
+            EXTERNAL_SYMLINK_CONFIG, EXTERNAL_SYMLINK_ENV, _REFUSAL_OUTSIDE, _REFUSAL_PROTECTED,
+            _hint_target_or_refusal, external_symlink_opt_in,
+        )
+        target, refusal = _hint_target_or_refusal(path, root, allow_external=external_symlink_opt_in())
         if target is None:
-            logger.warning("Skipping context file %s: it resolves outside %s or to a protected file", path, root)
+            if refusal == _REFUSAL_OUTSIDE:
+                notice = (f"⚠️  Context file {path} skipped: it links to a file outside the project root "
+                          f"{root} — set {EXTERNAL_SYMLINK_CONFIG}: true (or {EXTERNAL_SYMLINK_ENV}=1) to load it")
+            elif refusal == _REFUSAL_PROTECTED:
+                notice = (f"⚠️  Context file {path} skipped: it resolves to a protected file (credentials, "
+                          f".env, keys) — no setting overrides that")
+            else:
+                notice = f"⚠️  Context file {path} skipped: it could not be resolved or vetted"
+            logger.warning(notice)
+            _queue_context_skip_notice(notice)
             return None
         path = target  # read the vetted target, not the link, so a swap between check and read is harmless
     try:
@@ -1792,8 +1827,12 @@ def build_context_files_prompt(
         )
         sections = []
     else:
-        sections = [_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
-                    or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length)]
+        token = _context_skip_notices.set(True)
+        try:
+            sections = [_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
+                        or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length)]
+        finally:
+            _context_skip_notices.reset(token)
     if not skip_soul:
         sections.append(load_soul_md(context_length, home_override=home_override))
     sections = [s for s in sections if s]

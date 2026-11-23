@@ -976,6 +976,22 @@ Each context file read is also bounded by `context_file_read_timeout` (seconds, 
 context_file_read_timeout: 5.0
 ```
 
+## Symlinked Context Files
+
+A context file that is a symlink is followed only when its resolved target stays inside the project and off
+the file read deny-list. The deny-list half is absolute (credential stores, `.env`, device files never load);
+the containment half can be allowed per profile when you keep shared instructions outside the project, e.g.
+`proj/AGENTS.md -> ../shared/CLAUDE.md`:
+
+```yaml
+context_files_allow_external_symlinks: false  # default — a link resolving outside the project is skipped
+```
+
+Set it to `true` to load such a link, or set `HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1` for a container or a
+one-off run (the environment wins when set). With the default, the skip is logged, announced at session start,
+and listed as `skipped` by `/context`. Subdirectory hints are unaffected by this setting. See
+[Context files — Symlinked context files](./features/context-files.md#symlinked-context-files).
+
 ## File Read Safety
 
 Controls how much content a single `read_file` call can return. Reads that exceed the limit are rejected with an error telling the agent to use `offset` and `limit` for a smaller range. This prevents a single read of a minified JS bundle or large data file from flooding the context window.

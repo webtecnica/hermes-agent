@@ -126,7 +126,7 @@ This means your existing Cursor conventions automatically apply when using Herme
 Context files are loaded by `build_context_files_prompt()` in `agent/prompt_builder.py`:
 
 1. **Scan working directory** — checks for `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules` (first match wins)
-2. **Content is read** — each file is read as UTF-8 text. A file (or symlink) whose resolved target lies outside the project (the git root, else the working directory) or is on the file read deny-list is skipped. When that root is your home directory or above (a dotfiles repo at `$HOME`, or a session started in `$HOME`), the target must instead stay inside the file's own directory. Subdirectory context files follow the same rule, with the session's working directory as the root
+2. **Content is read** — each file is read as UTF-8 text. A file (or symlink) whose resolved target lies outside the project (the git root, else the working directory) or is on the file read deny-list is skipped. When that root is your home directory or above (a dotfiles repo at `$HOME`, or a session started in `$HOME`), the target must instead stay inside the file's own directory. Subdirectory context files follow the same rule, with the session's working directory as the root. A skip is logged, announced at session start, and listed as `skipped` by `/context` — see [Symlinked context files](#symlinked-context-files) for the one half an operator can allow
 3. **Security scan** — content is checked for prompt injection patterns
 4. **Truncation** — files exceeding the character cap are head/tail truncated (70% head, 20% tail, with a marker in the middle). The cap is an explicit `context_file_max_chars` from config.yaml when set; otherwise it scales dynamically with the model's context window (floor 20,000 chars, ceiling 500,000)
 5. **Assembly** — all sections are combined under a `# Project Context` header
@@ -162,6 +162,35 @@ The following project context files have been loaded and should be followed:
 ```
 
 Notice that SOUL content is inserted directly, without extra wrapper text.
+
+## Symlinked context files
+
+Keeping one instruction file and linking it wherever each tool looks is a normal setup:
+
+```
+~/work/shared/CLAUDE.md          # the one file you edit
+~/work/proj/AGENTS.md  ->  ../shared/CLAUDE.md
+```
+
+The link is not followed blindly. Resolved against the project root, a context file must land on a file the
+read deny-list allows, and inside the project — otherwise a cloned repository could ship
+`AGENTS.md -> ~/.aws/credentials` (refused: credential stores, `.env`, device files) or
+`AGENTS.md -> ~/notes/private.md` (refused: outside the project), and a session would start with someone
+else's text as its instructions. A refused file never loads; the skip is written to the log, shown at session
+start, and listed as `skipped` by `/context`, so a missing instruction file is no longer silent.
+
+The outside-the-project half is the operator's call, because the link is under the operator's own control in
+the shared-file setup. Allow it per profile in `config.yaml`:
+
+```yaml
+context_files_allow_external_symlinks: true
+```
+
+or, for a container or a one-off run, with `HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1` (the environment wins when
+set). With the setting on, a link that resolves to an ordinary file outside the project loads; a link that
+resolves to a deny-listed file still does not — that half has no switch. Progressive subdirectory hints never
+honor the setting: they land in a tool result mid-session, where the checked-in link is the repository's to
+choose, not yours.
 
 ## Security: Prompt Injection Protection
 

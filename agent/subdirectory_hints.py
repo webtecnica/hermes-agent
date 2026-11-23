@@ -49,35 +49,81 @@ def _containment_root(anchor: Path, directory: Path) -> Path:
     return directory if wide else anchor
 
 
-def _resolved_hint_target(hint_path: Path, working_dir: Path) -> Optional[Path]:
-    """Resolved hint-file target, or None when the file must not be loaded.
+# Operator opt-in for the ONE refusal the startup context loader may waive: a project context file whose
+# resolved target leaves the project root (#159222). Default is refused ("an operator must trust the link
+# target explicitly"), the read deny-list is never waivable, and subdirectory hints ignore this knob on
+# purpose — they inject into tool results mid-session, where a checked-in link is the attacker's to choose.
+# config.yaml is the per-profile spelling; the env var is the override for container/one-off runs.
+EXTERNAL_SYMLINK_CONFIG = "context_files_allow_external_symlinks"
+EXTERNAL_SYMLINK_ENV = "HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK"
+
+# Why ``_hint_target_or_refusal`` said no. The startup loader and ``/context`` report these apart so a
+# skipped instruction file is actionable instead of a silent hole.
+_REFUSAL_OUTSIDE = "outside"        # resolved target leaves the containment root; waivable by EXTERNAL_SYMLINK_ENV
+_REFUSAL_PROTECTED = "protected"    # canonical read deny-list (.env, credential stores, device files) — never waived
+_REFUSAL_UNVETTED = "unvetted"      # resolve or deny-list lookup failed — fail closed
+
+
+def external_symlink_opt_in() -> bool:
+    """True when the operator allows a project context file whose resolved target leaves the project root.
+
+    Two spellings, same switch: ``context_files_allow_external_symlinks`` in ``config.yaml`` (per profile, so
+    an install can trust this and not that one) and ``HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK`` in the
+    environment, which wins when set — the container/one-off path, the same precedence
+    ``display.file_mutation_verifier`` uses. Default off, so a cloned repository's checked-in link stays inert.
+    Read on the startup loader path only: subdirectory hints never consult it.
+    """
+    from utils import is_truthy_value
+
+    raw = (os.environ.get(EXTERNAL_SYMLINK_ENV) or "").strip()
+    if raw:
+        return is_truthy_value(raw)
+    from agent.prompt_builder import _config_readonly  # late import: that module imports this one
+
+    return is_truthy_value(_config_readonly(EXTERNAL_SYMLINK_CONFIG).get(EXTERNAL_SYMLINK_CONFIG))
+
+
+def _hint_target_or_refusal(
+    hint_path: Path, working_dir: Path, allow_external: bool = False
+) -> tuple[Optional[Path], Optional[str]]:
+    """``(resolved target, None)``, or ``(None, reason)`` when the file must not be loaded.
 
     ``is_file()`` and ``read_text`` follow symlinks, so a checked-in
     ``sub/AGENTS.md -> ~/.aws/credentials`` would inject an out-of-tree file
-    into the tool result. The resolved target must stay inside the resolved
-    working dir (same containment ``_within_working_dir`` applies to the
-    directory itself) and pass the canonical read deny-list
-    (``context_references`` applies it to explicit @-references), which also
-    catches in-tree targets like a symlink to the project ``.env``.
+    into the tool result. The resolved target must pass the canonical read
+    deny-list (``context_references`` applies it to explicit @-references),
+    which also catches in-tree targets like a symlink to the project ``.env``,
+    and stay inside ``working_dir`` — same containment ``_within_working_dir``
+    applies to the directory itself — unless *allow_external* (an operator's
+    explicit opt-in, startup context files only) waives containment. The
+    deny-list is checked first and never waived, so a link aimed at a
+    credential reads as ``protected`` rather than inviting the opt-in.
     """
     try:
         resolved = hint_path.resolve()
     except (OSError, RuntimeError):
-        return None
-    try:
-        inside = resolved.is_relative_to(working_dir)
-    except (OSError, ValueError, RuntimeError):
-        inside = False
-    if not inside:
-        return None
+        return None, _REFUSAL_UNVETTED
     try:
         from agent.file_safety import get_read_block_error
         blocked = get_read_block_error(str(resolved)) is not None
     except Exception:
         # Mirror context_references: a deny-list lookup that fails re-opens the
         # exact hole the check closes, so fail closed.
-        return None
-    return None if blocked else resolved
+        return None, _REFUSAL_UNVETTED
+    if blocked:
+        return None, _REFUSAL_PROTECTED
+    try:
+        inside = resolved.is_relative_to(working_dir)
+    except (OSError, ValueError, RuntimeError):
+        inside = False
+    if not inside and not allow_external:
+        return None, _REFUSAL_OUTSIDE
+    return resolved, None
+
+
+def _resolved_hint_target(hint_path: Path, working_dir: Path) -> Optional[Path]:
+    """Strict containment (the hint path and ``hermes init``): resolved target or None."""
+    return _hint_target_or_refusal(hint_path, working_dir)[0]
 
 
 def _first_hint_file(directory: Path):

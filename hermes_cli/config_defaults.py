@@ -510,6 +510,13 @@ DEFAULT_CONFIG = {
     # Seconds to wait for a single context file read before skipping it with a warning. Guards startup
     # against network-backed filesystems (iCloud Drive, OneDrive, NFS) that can block a cold read.
     "context_file_read_timeout": 5.0,
+    # Load a project context file (AGENTS.md / CLAUDE.md / .hermes.md / .cursorrules) whose symlink resolves
+    # outside the project root, e.g. proj/AGENTS.md -> ../shared/CLAUDE.md or a HERMES_HOME repo linking a
+    # project's instructions. false (default) keeps a cloned repository's checked-in link from injecting an
+    # out-of-tree file; the skip is logged, reported at session start and listed by /context. The read
+    # deny-list (credential stores, .env, device files) is refused either way. Env override, wins when set:
+    # HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1.
+    "context_files_allow_external_symlinks": False,
     # Max chars per read_file call; larger reads are rejected with offset+limit guidance. 100K chars
     # ≈ 25–35K tokens.
     "file_read_max_chars": 100_000,

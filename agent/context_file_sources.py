@@ -30,7 +30,11 @@ _STATUS_DISPLAY = {
     "flagged": ("⚠", "loaded — matched prompt-injection pattern(s); review the file"),
     "empty": ("○", "not loaded — empty file"),
     "unreadable": ("✗", "not loaded — could not be read"),
-    "skipped": ("✗", "not loaded — resolves outside the project or to a protected file"),
+    # Containment can be waived by the operator (``context_files_allow_external_symlinks``, or
+    # HERMES_CONTEXT_ALLOW_EXTERNAL_SYMLINK=1); the deny-list half never is. The manifest sees only "refused"
+    # (content None), so one note names both, with the setting that lifts the containment half.
+    "skipped": ("✗", "not loaded — outside the project (context_files_allow_external_symlinks) "
+                       "or a protected file"),
     "suppressed": ("○", "not loaded — cwd fell back to the Hermes install tree"),
 }
 
