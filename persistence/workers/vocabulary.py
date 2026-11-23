@@ -29,8 +29,12 @@ _PERSISTENCE_ONLY_FIELDS = frozenset({
 })
 
 #: The keys a transcript row on the worker wire may carry; the owner refuses any other key.
+#: ``name`` is the tool row's wire name the live list already carries (the alternation repair's stub,
+#: ``agent/agent_runtime_helpers.py``) and a compaction copy keeps (``_fresh_compaction_message_copy``
+#: drops only the persistence marker). The durable column is ``tool_name``: no writer reads ``name``,
+#: and the in-process session never validated it either, so a worker write must not refuse it (#159238).
 WORKER_MESSAGE_FIELDS = frozenset({
-    "role", "content", "tool_name", "tool_calls", "tool_call_id", "token_count",
+    "role", "content", "tool_name", "name", "tool_calls", "tool_call_id", "token_count",
     "finish_reason", "reasoning", "reasoning_content", "reasoning_details",
     "codex_reasoning_items", "codex_message_items", "platform_message_id", "message_id",
     "observed", "effect_disposition", "_compressed_summary", "timestamp", "api_content",

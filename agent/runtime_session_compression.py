@@ -5,9 +5,11 @@ def _handoff_rows(messages):
     """Project live compaction dicts onto the owner's closed handoff fields.
 
     Micro-compaction and proactive prune hand over the live list, whose dicts carry worker-local
-    bookkeeping (``_db_persisted``, ``_micro_compact_marker``, a tool row's wire ``name``, risk tags)
-    that SessionDB's insert simply never reads. The owner's boundary stays closed; sending those keys
-    would fail the receipt and leave the journal stuck pending, refusing every later write.
+    bookkeeping (``_db_persisted``, ``_micro_compact_marker``, risk tags) that SessionDB's insert
+    simply never reads. The owner's boundary stays closed; sending those keys would fail the receipt
+    and leave the journal stuck pending, refusing every later write. A tool row's wire ``name`` is a
+    handoff field, not worker-local bookkeeping: the owner accepts it and its writer reads
+    ``tool_name`` (#159238).
     """
     from persistence.workers.vocabulary import HANDOFF_MESSAGE_FIELDS
     return [{k: v for k, v in m.items() if k in HANDOFF_MESSAGE_FIELDS} if isinstance(m, dict) else m
