@@ -254,8 +254,12 @@ def _profile_ui_meta_fields(row: dict, profile_dir) -> None:
                   _try(lambda: _clean_revisions(revisions), {}) if isinstance(revisions, dict) else {}}
         if isinstance(ui_meta, dict) and ui_meta:
             # YAML promotes unquoted timestamps to datetime/date; the handler's contract is JSON, so
-            # coerce YAML-only scalars to their ISO string at the boundary (#92506).
-            fields["ui_meta"] = json.loads(json.dumps(ui_meta, default=_yaml_scalar_to_json))
+            # coerce YAML-only scalars to their ISO string at the boundary (#92506). Non-finite floats
+            # have no JSON spelling — an unquoted YAML 1.1 mantissa such as ``20260819_045052_92e993``
+            # overflows to ``inf`` on load — so they become ``null``, the declared value (#159335).
+            from tui_gateway.transport import sanitize_nonfinite
+            fields["ui_meta"] = json.loads(json.dumps(sanitize_nonfinite(ui_meta),
+                                                      default=_yaml_scalar_to_json, allow_nan=False))
         return fields
 
     # Second parse of this profile.yaml in the same request (``read_profile_meta`` already read it

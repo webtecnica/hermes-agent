@@ -16,6 +16,7 @@ import contextvars
 import errno
 import json
 import logging
+import math
 import os
 import threading
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
@@ -80,12 +81,46 @@ def _raise_unless_peer_gone(exc: Exception, what: str) -> None:
     logger.debug("StdioTransport %s peer gone: %s", what, exc)
 
 
+def _has_nonfinite(value: Any) -> bool:
+    """True when *value* holds a non-finite float (``inf``/``-inf``/``nan``) anywhere."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_has_nonfinite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nonfinite(item) for item in value)
+    return False
+
+
+def sanitize_nonfinite(value: Any) -> Any:
+    """Return *value* with every non-finite float replaced by ``None``, recursively.
+
+    ``json.dumps`` writes ``inf``/``-inf``/``nan`` as bare ``Infinity``/``-Infinity``/``NaN``
+    tokens, which are NOT valid JSON: strict clients (iOS ``JSONDecoder``, Java, Swift) reject the
+    whole frame, close the socket and reconnect forever. A YAML 1.1 mantissa like
+    ``20260819_045052_92e993`` in a user's ``profile.yaml`` overflows to ``inf`` on load (#159335),
+    and any handler result can carry a float a client sent us. JSON's own spelling for
+    "there is no number here" is ``null``, so that is what the wire carries.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: sanitize_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_nonfinite(item) for item in value]
+    return value
+
+
 def serialize_frame(obj: dict, peer: str, log: logging.Logger) -> str:
     """``json.dumps`` the frame; an unserializable payload becomes a JSON-RPC error frame carrying
     the original id. Shared by every transport: without it the TypeError escaped from a pool
-    worker (the executor swallows it), so the client waited forever with no log line (#92506)."""
+    worker (the executor swallows it), so the client waited forever with no log line (#92506).
+
+    Non-finite floats are scrubbed to ``null`` first, and ``allow_nan=False`` keeps the strict-JSON
+    contract enforced at the ONE point every transport serializes through (#159335)."""
     try:
-        return json.dumps(obj, ensure_ascii=False)
+        return json.dumps(sanitize_nonfinite(obj) if _has_nonfinite(obj) else obj,
+                          ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         rid = obj.get("id") if isinstance(obj, dict) else None
         log.error("frame serialization failed peer=%s id=%s error_type=%s error=%s",
