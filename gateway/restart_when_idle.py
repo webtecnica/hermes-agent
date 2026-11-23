@@ -167,8 +167,58 @@ def request_restart(runner, *, detached: bool, via_service: bool) -> bool:
     from contextvars import Context
     # NOT in _background_tasks (``_stop_impl`` cancels those, #12875); strong ref on the runner.
     # Empty Context: a copied one would run the HOST restart as the requesting profile.
-    runner._restart_task = Context().run(lambda: asyncio.create_task(_run_restart()))
+    task = Context().run(lambda: asyncio.create_task(_run_restart()))
+    task.add_done_callback(_restart_failure_handler(runner))
+    runner._restart_task = task
     return True
+
+
+def _restart_failure_handler(runner):
+    """Done-callback for the restart task: report a failed restart and keep a hard exit armed.
+
+    Without it, nothing ever looked at the task's exception: a ``stop()`` failure inside
+    ``_run_restart`` was silent, the gateway stayed in ``draining`` and only the supervisor's own
+    SIGKILL ended it (#159067). The exception is logged with its traceback, and when ``stop()``
+    never got far enough to arm the shutdown watchdog, that watchdog is armed here so the process
+    still exits non-zero and the supervisor relaunches it.
+    """
+
+    def _on_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error(
+            "Gateway restart task failed; the gateway would otherwise stay in 'draining' and "
+            "never exit. The shutdown watchdog is left armed so the process hard-exits and the "
+            "supervisor can restart it.",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        # ``stop()`` arms the watchdog before its first phase: a failure past that point already
+        # has a hard exit counting down, and arming a second one would only double the dump.
+        armed = getattr(runner, "_shutdown_watchdog_done", None)
+        if armed is not None and not armed.is_set():
+            return
+        try:
+            from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+            from gateway.run_shutdown import _effective_watchdog_leash
+            from gateway.shutdown_watchdog import arm_shutdown_watchdog
+
+            arm_shutdown_watchdog(
+                _effective_watchdog_leash(runner),
+                snapshot_fn=lambda: {
+                    "restart_requested": True,
+                    "draining": bool(getattr(runner, "_draining", False)),
+                    "restart_task_failed": repr(exc),
+                },
+                exit_code=GATEWAY_SERVICE_RESTART_EXIT_CODE,
+            )
+        except Exception:  # health: allow BLE001 -- a done-callback must never raise
+            logger.error("Failed to arm the shutdown watchdog after a failed gateway restart",
+                         exc_info=True)
+
+    return _on_done
 
 
 def force_stop_budgets(runner) -> None:

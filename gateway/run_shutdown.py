@@ -2088,7 +2088,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         }
 
     async def _stop_impl(self) -> None:
-        """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
+        """Run every ``_stop_*`` phase under the thread-based shutdown watchdog.
+
+        The watchdog is disarmed only when every phase completed: if teardown raises, it stays
+        armed and hard-exits with a non-zero code so the supervisor revives the gateway (#159067).
+        """
         from gateway.run import GatewayRunner
         # Thread-based watchdog (asyncio timeouts cannot recover a frozen loop): dumps stacks and
         # os._exit past drain+grace so the service manager revives us. Skipped under pytest.
@@ -2124,8 +2128,19 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
-        finally:
-            _watchdog_done.set()
+        except BaseException:
+            # Do NOT disarm the watchdog on failure. ``finally`` used to do exactly that, so a
+            # ``stop()`` that raised left the gateway in ``draining`` with the watchdog gone and
+            # nothing ever hard-exiting: the supervisor only revived it after its own SIGKILL
+            # budget (#159067). Leaving the watchdog armed turns that wedge into a logged failure
+            # plus the hard exit it exists for.
+            logger.error(
+                "Gateway shutdown failed; leaving the shutdown watchdog armed so the process "
+                "hard-exits and the supervisor can restart it",
+                exc_info=True,
+            )
+            raise
+        _watchdog_done.set()
 
     async def stop(
         self, *, restart: bool = False, detached_restart: bool = False, service_restart: bool = False
