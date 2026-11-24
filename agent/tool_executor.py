@@ -181,8 +181,67 @@ class _BatchAbandoned(BaseException):
     so ``except Exception`` handlers in the middleware chain can't swallow it."""
 
 
-def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+def _is_null_arguments_literal(raw_arguments: Any) -> bool:
+    """True for the two spellings of a complete ``null`` argument payload: the Python
+    ``None`` an OpenAI-compatible gateway hands over for an empty-argument tool, and the
+    JSON text ``"null"``. A truncated string (``""``, ``"nul"``, ``'{"q":'``) is never a
+    complete null and keeps the rejection (#105189)."""
+    if raw_arguments is None:
+        return True
+    return isinstance(raw_arguments, str) and raw_arguments.strip() == "null"
+
+
+def _tool_accepts_no_arguments(agent, name: str) -> bool:
+    """Whether ``name`` resolves to a session-visible definition declaring no input: no
+    ``required`` entry and no ``properties``. Fail-closed — an unknown name, a definition
+    without a readable object schema, or any lookup error returns False so the caller
+    keeps the historical rejection instead of guessing (#159689)."""
+    try:
+        import model_tools
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True, skip_tool_search_assembly=True,
+        ) or []
+    except Exception:
+        return False
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
+        # OpenAI-shaped definitions nest the schema under ``function``; MCP-shaped ones
+        # carry ``inputSchema`` at the top level.
+        function = definition.get("function")
+        if not isinstance(function, dict):
+            function = definition
+        if function.get("name") != name:
+            continue
+        schema = function.get("parameters")
+        if not isinstance(schema, dict):
+            schema = function.get("inputSchema")
+        if not isinstance(schema, dict) or schema.get("type", "object") != "object":
+            return False
+        return not schema.get("required") and not schema.get("properties")
+    return False
+
+
+def _null_arguments_allowed(agent, name: str, raw_arguments: Any) -> bool:
+    """A complete ``null`` payload means "no arguments" only for a tool that declares no
+    input. The cheap literal test gates the (memoized) definition lookup so the schema
+    fetch runs only for the case that can change the verdict."""
+    return _is_null_arguments_literal(raw_arguments) and _tool_accepts_no_arguments(agent, name)
+
+
+def _parse_tool_arguments(raw_arguments: Any, *, allow_null: bool = False) -> tuple[dict, Optional[str]]:
+    """Parse model-emitted arguments without repairing or coercing them.
+
+    A complete ``null`` (Python ``None`` from an OpenAI-compatible gateway, or the JSON
+    text ``"null"``) is not a truncated string: it means "no arguments" and parses as
+    ``{}`` when ``allow_null`` says the tool declares no input. Everything else is still
+    rejected with the unchanged structured error — truncated/invalid JSON, non-object
+    values, and null for a tool whose schema declares required input.
+    """
+    if allow_null and _is_null_arguments_literal(raw_arguments):
+        return {}, None
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
@@ -458,7 +517,10 @@ class _ParsedCall:
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
     name = _canonical_tool_name(tool_call.function.name)
-    args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
+    raw_arguments = tool_call.function.arguments
+    args, parse_error = _parse_tool_arguments(
+        raw_arguments, allow_null=_null_arguments_allowed(agent, name, raw_arguments)
+    )
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
