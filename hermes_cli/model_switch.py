@@ -1802,6 +1802,18 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
         model_info=model_info, is_global=st.is_global, alias_endpoint_applied=st.alias_endpoint_applied)
 
 
+def _drop_context_length_memo(model: str, base_url: str) -> None:
+    """Drop the memoized window of one ``(model, base_url)`` pair, keeping its probe cooldown out of
+    the next resolution. A failure here is never a reason to fail the switch itself."""
+    if not str(model or "").strip():
+        return
+    try:
+        from agent.model_metadata import _invalidate_cached_context_length
+        _invalidate_cached_context_length(model, base_url or "")
+    except Exception:
+        logger.debug("context-length memo invalidation failed for %s", model, exc_info=True)
+
+
 def switch_model(
     raw_input: str, current_provider: str, current_model: str, current_base_url: str = "",
     current_api_key: str = "", is_global: bool = False, explicit_provider: str = "",
@@ -1822,7 +1834,15 @@ def switch_model(
         fail = step(st)
         if fail is not None:
             return fail
-    return _build_switch_result(st)
+    result = _build_switch_result(st)
+    # A committed switch invalidates the context-length memo of BOTH ends (#159799). The memo's
+    # TTLs (30 s local probe / 300 s endpoint metadata) otherwise serve the window probed before
+    # the operator restarted a local server, so a live 64K window was validated as the stale 32K
+    # and rejected as "below minimum" while the picker showed 64K. Shortening the TTLs only makes
+    # that expire sooner — the switch is the event that makes the old value wrong.
+    _drop_context_length_memo(current_model, current_base_url)
+    _drop_context_length_memo(result.new_model, result.base_url)
+    return result
 
 
 def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg: Any) -> dict[str, Any]:
