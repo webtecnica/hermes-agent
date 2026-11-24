@@ -3343,13 +3343,21 @@ def request_review(
                 *(() if reviewer is None else (reviewer,)), task_id,
                 *(() if expected_run_id is None else (int(expected_run_id),)),
             )
+            # last_failure_error is CLEARED: the handoff run reached review_requested,
+            # so it got past whatever quota/auth wall the stamp describes. Left in
+            # place, a requeued rate-limit stamp ("pid N exited rate-limited ...")
+            # keeps matching _RESPAWN_BLOCKER_RE and check_respawn_guard parks the
+            # review lane as blocker_auth forever, never spawning the reviewer
+            # (#159684). consecutive_failures stays — see the note in
+            # request_changes(): only complete_task() resets it.
             cur = conn.execute(
                 """
                 UPDATE tasks
                    SET status        = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL
+                       worker_pid    = NULL,
+                       last_failure_error = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
