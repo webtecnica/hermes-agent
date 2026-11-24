@@ -678,9 +678,20 @@ def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
     active boards via stale dashboard/gateway read paths (#43243). Creation
     is the job of :func:`kanban_db.create_board` (which writes the metadata
     first); read paths get an actionable error instead of a resurrected board.
+
+    A 0-byte ``kanban.db`` is not a database either: an accidental read-write
+    ``sqlite3`` open (a loop over ``boards/*/kanban.db``, or ``?immutable=1``,
+    which still opens with the create flag) leaves one beside every board dir
+    it visits, tombstones included (#159636). Such a stub falls through to the
+    same refusals, so an archived/deleted board cannot be resurrected through
+    it; a live board's own 0-byte file passes those checks and initializes
+    exactly as before.
     """
-    if path.exists():
-        return  # existing DB: a plain open, never a resurrection
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return  # existing DB: a plain open, never a resurrection
+    except OSError:
+        return  # unreadable stat: keep the pre-existing plain-open behaviour
     if board is None:
         # Default-DB and env-pinned paths never sit under a board dir, so a
         # board.json here means the current-board context resolved to that
