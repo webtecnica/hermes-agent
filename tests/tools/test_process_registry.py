@@ -3010,3 +3010,108 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+class TestWatchFallbackArmsCompletionWatcher:
+    """#159358: a promoted watch-only process must hand its own exit to a watcher.
+
+    ``spawn_background_process`` arms the completion watcher only when ``notify_on_complete`` was
+    requested at launch. A process started with ``watch_patterns`` alone therefore had none, and
+    the promotion queued a ``completion`` the messaging gateway discarded ("handled by the watcher
+    task") — no completion turn, despite the ``watch_disabled`` summary promising one.
+    """
+
+    @staticmethod
+    def _watch_only_session():
+        sess = _make_session(sid="proc_promote1", command="pytest -q")
+        sess.session_key = "agent:main:telegram:dm:123"
+        sess.watcher_platform = "telegram"
+        sess.watcher_chat_id = "123"
+        sess.watch_patterns = ["PASSED"]
+        return sess
+
+    @staticmethod
+    def _spy(monkeypatch):
+        """Record the arming the promotion performs, without scheduling on a real gateway loop."""
+        import tools.terminal_tool_background as ttb
+
+        armed = []
+
+        def _arm(registry, session, session_key):
+            armed.append((registry, session, session_key))
+            session.watcher_interval = 5  # what the real helper sets first
+
+        monkeypatch.setattr(ttb, "_register_completion_watcher", _arm)
+        return armed
+
+    def test_lifetime_cap_promotion_arms_the_completion_watcher(self, monkeypatch):
+        import tools.process_registry as pr
+
+        reg = pr.ProcessRegistry()
+        sess = self._watch_only_session()
+        reg._running[sess.id] = sess
+        armed = self._spy(monkeypatch)
+
+        for _ in range(pr.WATCH_LIFETIME_MAX_HITS):
+            sess._watch_cooldown_until = 0.0
+            reg._check_watch_patterns(sess, "PASSED test_x\n")
+
+        assert sess.notify_on_complete is True
+        assert armed == [(reg, sess, "agent:main:telegram:dm:123")]
+        assert sess.watcher_interval == 5
+
+    def test_strike_limit_promotion_arms_the_completion_watcher(self, monkeypatch):
+        import tools.process_registry as pr
+
+        reg = pr.ProcessRegistry()
+        sess = self._watch_only_session()
+        reg._running[sess.id] = sess
+        armed = self._spy(monkeypatch)
+
+        reg._check_watch_patterns(sess, "PASSED test_x\n")  # delivers, arms the cooldown
+        for _ in range(pr.WATCH_STRIKE_LIMIT):
+            sess._watch_cooldown_until = time.time() - 0.01
+            reg._check_watch_patterns(sess, "PASSED test_x\n")  # delivers, keeps the strikes
+            reg._check_watch_patterns(sess, "PASSED test_x\n")  # dropped: one strike window
+
+        assert sess._watch_disabled is True
+        assert sess.notify_on_complete is True
+        assert armed == [(reg, sess, "agent:main:telegram:dm:123")]
+
+    def test_promotion_with_no_watcher_platform_arms_nothing(self, monkeypatch, caplog):
+        """No chat to route to: say so instead of arming a watcher that could never deliver."""
+        import logging
+
+        import tools.process_registry as pr
+
+        reg = pr.ProcessRegistry()
+        sess = self._watch_only_session()
+        sess.watcher_platform = ""
+        reg._running[sess.id] = sess
+        armed = self._spy(monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            for _ in range(pr.WATCH_LIFETIME_MAX_HITS):
+                sess._watch_cooldown_until = 0.0
+                reg._check_watch_patterns(sess, "PASSED test_x\n")
+
+        assert sess.notify_on_complete is True
+        assert armed == []
+        assert sess.watcher_interval == 0
+        assert any("no watcher platform" in record.message for record in caplog.records)
+
+    def test_session_with_a_watcher_is_not_armed_twice(self, monkeypatch):
+        import tools.process_registry as pr
+
+        reg = pr.ProcessRegistry()
+        sess = self._watch_only_session()
+        sess.watcher_interval = 5  # the launch path or the wait/poll promotion already armed one
+        reg._running[sess.id] = sess
+        armed = self._spy(monkeypatch)
+
+        for _ in range(pr.WATCH_LIFETIME_MAX_HITS):
+            sess._watch_cooldown_until = 0.0
+            reg._check_watch_patterns(sess, "PASSED test_x\n")
+
+        assert sess.notify_on_complete is True
+        assert armed == []

@@ -917,6 +917,12 @@ while it stops, drained at startup and post-turn. Agent-notify watchers send no 
 receipt (the agent's next turn is the report) unless the launching turn is still running at exit
 — then the injection only queues a follow-up, so the concise receipt goes out immediately.
 
+A process started with only `watch_patterns` has no watcher until the breaker promotes it (strike
+limit or lifetime cap): the promotion arms the same watcher with the session's own `watcher_*`
+routing, so the exit still produces the one turn the `watch_disabled` summary promises. The
+completion event carries `watcher_armed`, and a completion no watcher claimed (a session with no
+`watcher_platform`) is delivered by the drain below rather than discarded — never twice.
+
 The idle completion watcher also drains `watch_match` / `watch_disabled`; no user follow-up is
 required. Notify-off drains these without waking. Transport failures are retried; unavailable
 durable completion owners/transports do not spend delivery attempts. Profile-namespaced process

@@ -2971,7 +2971,8 @@ def _format_concise_process_notification(
 
 
 def _format_gateway_process_notification(evt: dict) -> str | None:
-    """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
+    """Format a watch event — or a completion no watcher claimed (#159358) — into an
+    ``[IMPORTANT:]`` message."""
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
@@ -2997,12 +2998,26 @@ def _format_gateway_process_notification(evt: dict) -> str | None:
         from tools.process_registry_notifications import format_process_notification
         return format_process_notification(evt)
 
+    if evt_type == "completion":
+        # A completion no watcher claimed is delivered through this drain (#159358): it is the
+        # same text the watcher would have injected, rendered by the shared formatter.
+        from tools.process_registry_notifications import format_process_notification
+        return format_process_notification(evt)
+
     return None
 
 
 def _drain_gateway_watch_events(completion_queue) -> list[dict]:
-    """Drain gateway-owned watch events without spinning on requeued events.
-    Foreign events requeued inside ``while not queue.empty()`` never terminate: detach, then requeue."""
+    """Drain gateway-owned events without spinning on requeued events.
+    Foreign events requeued inside ``while not queue.empty()`` never terminate: detach, then requeue.
+
+    A ``completion`` event is gateway-owned only when no watcher was registered for its process
+    (``watcher_armed``, stamped on exit by ``_publish_finished``): the launch path arms that
+    watcher for ``notify_on_complete``, and the watch fallback arms one when it promotes a
+    ``watch_patterns`` process, so the watcher delivers the turn. Without a watcher nothing else
+    consumes the event, and dropping it here loses the completion the ``watch_disabled`` summary
+    promised (#159358) — so it goes down the same delivery path as a watch event.
+    """
     from tools.environments.sandbox_scope import event_visible
     watch_events: list[dict] = []
     requeue: list[dict] = []
@@ -3017,7 +3032,11 @@ def _drain_gateway_watch_events(completion_queue) -> list[dict]:
         elif evt_type in {"watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
                           "heartbeat"}:
             watch_events.append(evt)
-        # else: process completion events are handled by the watcher task
+        elif evt_type == "completion" and not evt.get("watcher_armed"):
+            logger.info("Delivering queued completion for process %s through the gateway drain: "
+                        "no watcher was armed for it", evt.get("session_id", "unknown"))
+            watch_events.append(evt)
+        # else: process completion events with a watcher are handled by the watcher task
     for evt in requeue:
         completion_queue.put(evt)
     return watch_events

@@ -832,6 +832,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 # Promote so the agent still gets exactly one notification on exit,
                 # plus exactly one summary so it sees why things went quiet.
                 session.notify_on_complete = True
+                self._arm_promoted_completion_watcher(session)
                 self._emit_watch_disabled(
                     session, session._watch_suppressed,
                     f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -867,9 +868,41 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             self.completion_queue.put(notification)
         # Even when the breaker drops the final match, still explain the silence.
         if lifetime_exhausted:
+            self._arm_promoted_completion_watcher(session)
             self._emit_watch_disabled(
                 session, 0, f"reached the lifetime cap of {WATCH_LIFETIME_MAX_HITS} delivered matches. ",
             )
+
+    def _arm_promoted_completion_watcher(self, session: ProcessSession) -> None:
+        """Give a promoted session the completion watcher the launch path would have armed.
+
+        ``spawn_background_process`` arms a watcher only when ``notify_on_complete`` was asked for
+        up front, so a process started with just ``watch_patterns`` has none (#159358). Promoting it
+        then queues a ``completion`` event the messaging gateway drops ("handled by the watcher
+        task") and the agent never gets the turn the ``watch_disabled`` summary promises. Routing
+        comes from the session's own ``watcher_*`` fields, exactly like the launch path and the
+        wait/poll promotion, and ``watcher_interval`` (set only by ``_register_completion_watcher``)
+        keeps a second arm off a session that already has one.
+
+        A session with no ``watcher_platform`` has no chat to route to: logging the loss is the
+        only honest option here, and the gateway drain delivers the completion event instead.
+        """
+        if not session.watcher_platform:
+            logger.info(
+                "process %s: watch fallback promoted it to notify_on_complete with no watcher "
+                "platform; the completion stays on the queue for the draining consumer", session.id,
+            )
+            return
+        if session.watcher_interval:
+            return
+        from tools.terminal_tool_background import _register_completion_watcher
+        try:
+            _register_completion_watcher(self, session, session.session_key)
+        except Exception:
+            # Never let a scheduling failure kill the reader thread: the exit still queues the
+            # completion event, and the gateway drain delivers whatever no watcher claimed.
+            logger.warning("process %s: arming the completion watcher after the watch fallback failed",
+                           session.id, exc_info=True)
 
     def _emit_watch_disabled(self, session: ProcessSession, suppressed: int, why: str) -> None:
         """Queue the one-shot watch_disabled summary (strike-limit or lifetime-cap path)."""
@@ -1587,6 +1620,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,
+                # Set only by ``_register_completion_watcher``: a watcher owns this completion and
+                # will inject the turn, so a queue-draining consumer must not deliver it twice
+                # (#159358). False means nobody claimed it.
+                "watcher_armed": bool(session.watcher_interval),
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)

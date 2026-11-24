@@ -9,8 +9,10 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 
 import asyncio
 import contextlib
+import logging
 import queue
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -879,3 +881,190 @@ async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
         assert "proc_deadbeef" not in text and "[Background process" not in text and "~" not in text
         assert "\x1b[" not in text
         assert "make -j8 all" in text
+
+
+# ---------------------------------------------------------------------------
+# #159358 — the watch fallback's completion must reach the agent
+# ---------------------------------------------------------------------------
+
+def _watch_only_session(sid: str, session_key: str = "agent:main:telegram:dm:123",
+                        platform: str = "telegram"):
+    """A process spawned with only ``watch_patterns``: no notify_on_complete, no watcher yet."""
+    from tools.process_registry import ProcessSession
+
+    return ProcessSession(
+        id=sid, command="pytest -q", task_id="t1", session_key=session_key,
+        started_at=time.time(), watch_patterns=["PASSED"],
+        watcher_platform=platform, watcher_chat_id="123", watcher_user_id="42",
+    )
+
+
+def _registry_with(monkeypatch, session):
+    """A real registry (promotion, exit publication and its queue) holding *session*."""
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    with registry._lock:
+        registry._running[session.id] = session
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    return registry
+
+
+def _arm_through_the_gateway(monkeypatch, runner):
+    """Record watcher descriptors the registry arms through the live gateway runner."""
+    import gateway.run as gateway_run
+
+    armed = []
+    monkeypatch.setattr(runner, "arm_process_watcher",
+                        lambda watcher: armed.append(watcher) or True)
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+    return armed
+
+
+def _promote_by_lifetime_cap(registry, session):
+    from tools.process_registry import WATCH_LIFETIME_MAX_HITS
+
+    for _ in range(WATCH_LIFETIME_MAX_HITS):
+        session._watch_cooldown_until = 0.0
+        registry._check_watch_patterns(session, "PASSED test_ready\n")
+
+
+def _promote_by_strike_limit(registry, session):
+    from tools.process_registry import WATCH_STRIKE_LIMIT
+
+    registry._check_watch_patterns(session, "PASSED test_ready\n")  # delivers, arms the cooldown
+    for _ in range(WATCH_STRIKE_LIMIT):
+        session._watch_cooldown_until = time.time() - 0.01
+        registry._check_watch_patterns(session, "PASSED test_ready\n")  # delivers, keeps the strikes
+        registry._check_watch_patterns(session, "PASSED test_ready\n")  # dropped: one strike
+
+
+@pytest.mark.asyncio
+async def test_lifetime_cap_promotion_delivers_exactly_one_completion_turn(monkeypatch, tmp_path):
+    """#159358: a watch-only process promoted at the lifetime cap gets a watcher, and its exit
+    produces one completion turn — not a queued ``completion`` the gateway drain discarded
+    because a watcher it never had was assumed to deliver it."""
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    session = _watch_only_session("proc_cap")
+    registry = _registry_with(monkeypatch, session)
+    armed = _arm_through_the_gateway(monkeypatch, runner)
+
+    _promote_by_lifetime_cap(registry, session)
+
+    assert session.notify_on_complete is True
+    assert session.watcher_interval == 5
+    assert len(armed) == 1
+    assert armed[0]["platform"] == "telegram" and armed[0]["chat_id"] == "123"
+
+    # The promotion's own message is delivered by the drain, not by the watcher.
+    turns = []
+
+    async def _record_turn(text, evt, **_kw):
+        turns.append(text)
+        return True
+
+    monkeypatch.setattr(runner, "_inject_watch_notification", _record_turn)
+    monkeypatch.setattr(runner, "_enqueue_process_completion_notification", _record_turn)
+    await runner._drain_watch_notifications(registry.completion_queue)
+    from tools.process_registry import WATCH_LIFETIME_MAX_HITS
+
+    # Every delivered match plus the one summary that promises the completion.
+    assert len(turns) == WATCH_LIFETIME_MAX_HITS + 1
+    assert len([text for text in turns if "Watch patterns disabled" in text]) == 1
+
+    # Exit. The watcher owns the completion, so exactly one turn arrives for it.
+    turns.clear()
+    session.exited = True
+    session.exit_code = 0
+    session.output_buffer = "PASSED test_ready\n"
+    registry._move_to_finished(session)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    await runner._run_process_watcher(armed[0])
+    await runner._drain_watch_notifications(registry.completion_queue)
+
+    assert len(turns) == 1
+    assert "exit code 0" in turns[0]
+
+
+@pytest.mark.asyncio
+async def test_strike_limit_promotion_delivers_exactly_one_completion_turn(monkeypatch, tmp_path):
+    """Same contract for the strike-limit promotion: one watcher, one completion turn."""
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    session = _watch_only_session("proc_strikes")
+    registry = _registry_with(monkeypatch, session)
+    armed = _arm_through_the_gateway(monkeypatch, runner)
+
+    _promote_by_strike_limit(registry, session)
+
+    assert session._watch_disabled is True
+    assert session.notify_on_complete is True
+    assert len(armed) == 1
+
+    turns = []
+
+    async def _record_turn(text, evt, **_kw):
+        turns.append(text)
+        return True
+
+    monkeypatch.setattr(runner, "_inject_watch_notification", _record_turn)
+    monkeypatch.setattr(runner, "_enqueue_process_completion_notification", _record_turn)
+    await runner._drain_watch_notifications(registry.completion_queue)
+    turns.clear()
+
+    session.exited = True
+    session.exit_code = 2
+    session.output_buffer = "PASSED test_ready\nFAILED test_late\n"
+    registry._move_to_finished(session)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    await runner._run_process_watcher(armed[0])
+    await runner._drain_watch_notifications(registry.completion_queue)
+
+    assert len(turns) == 1
+    assert "exit code 2" in turns[0]
+
+
+@pytest.mark.asyncio
+async def test_completion_without_a_watcher_is_delivered_not_discarded(monkeypatch, tmp_path, caplog):
+    """A session with no ``watcher_platform`` cannot have a watcher armed; its queued completion
+    must still be delivered by the gateway drain (and logged) instead of vanishing silently."""
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    session = _watch_only_session("proc_nowatcher", platform="")
+    registry = _registry_with(monkeypatch, session)
+    armed = _arm_through_the_gateway(monkeypatch, runner)
+
+    with caplog.at_level(logging.INFO):
+        _promote_by_lifetime_cap(registry, session)
+
+    assert session.notify_on_complete is True
+    assert armed == []
+    assert any("no watcher platform" in record.message for record in caplog.records)
+
+    turns = []
+
+    async def _record_turn(text, evt, **_kw):
+        turns.append(text)
+        return True
+
+    monkeypatch.setattr(runner, "_inject_watch_notification", _record_turn)
+    await runner._drain_watch_notifications(registry.completion_queue)
+    turns.clear()
+
+    session.exited = True
+    session.exit_code = 0
+    session.output_buffer = "PASSED test_ready\n"
+    registry._move_to_finished(session)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await runner._drain_watch_notifications(registry.completion_queue)
+
+    assert len(turns) == 1 and "exit code 0" in turns[0]
+    assert registry.completion_queue.empty()
+    assert any("through the gateway drain" in record.message for record in caplog.records)
