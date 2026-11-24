@@ -2110,7 +2110,17 @@ def _dispatch_lane_task(
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                # One row per unchanged guard condition, not one per tick: the
+                # card stays in this lane until something supersedes the
+                # condition, so a row every tick only buries the board's
+                # history (#159684). Same last-event kind+payload check as
+                # ``skipped_nonspawnable`` above.
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if (last is None or last["kind"] != "respawn_guarded"
+                        or last["payload"] != _kb._json_or_null({"reason": guard_reason})):
+                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:

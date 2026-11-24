@@ -3343,13 +3343,22 @@ def request_review(
                 *(() if reviewer is None else (reviewer,)), task_id,
                 *(() if expected_run_id is None else (int(expected_run_id),)),
             )
+            # A run that reaches review_requested has already cleared whatever
+            # quota/auth wall last_failure_error describes, so the stamp is
+            # superseded: left in place, a requeued rate-limit row ("pid N
+            # exited rate-limited ...") keeps matching _RESPAWN_BLOCKER_RE and
+            # check_respawn_guard answers "blocker_auth" for the review lane
+            # forever, never spawning the reviewer (#159684). The failure
+            # counter is unrelated accounting -- see request_changes(): only
+            # complete_task() resets it.
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'review',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL
+                   SET status             = 'review',
+                       claim_lock         = NULL,
+                       claim_expires      = NULL,
+                       worker_pid         = NULL,
+                       last_failure_error = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
