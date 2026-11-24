@@ -490,6 +490,23 @@ def take_unseen_reactions(holder: StoreHolder, session_id: str, *, author: str =
     if not session_id:
         return []
     lineage = _resume_lineage_ids(holder, session_id)
+    # Cheap, read-only pre-flight outside the writer: the per-turn collector runs on EVERY user turn,
+    # so without this an empty history scan takes the session DB's single write mutex for nothing and
+    # starves writes from other conversations (#159549). Same lineage, same visibility clause (active
+    # or compaction-archived) and same reaction-bearing filter, LIMIT 1: no candidate row -> nothing to
+    # claim, return before _execute_write. A pinned transcript snapshot could lag a sibling's commit,
+    # so it is skipped; a missing pooled reader falls back to the atomic claim below, never treated as
+    # "nothing pending". The author/seen check stays in Python inside the transaction.
+    if holder._pinned_read_conn() is None:
+        with holder._read_ctx(pooled_only=True) as reader:
+            if reader is not None:
+                candidate = reader.execute(
+                    "SELECT 1 FROM messages "
+                    f"WHERE session_id IN ({_placeholders(lineage)}){_DISPLAY_ACTIVE_CLAUSE} "
+                    f"AND {_sql_json_extract('display_metadata', '$.' + REACTIONS_METADATA_KEY)} IS NOT NULL "
+                    "LIMIT 1", tuple(lineage)).fetchone()
+                if candidate is None:
+                    return []
     def _do(conn):
         pending = []
         # Only reaction-bearing rows cross into Python: display_metadata also carries delivery /
