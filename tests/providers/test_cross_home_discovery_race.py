@@ -198,10 +198,9 @@ def test_two_homes_scanned_concurrently_both_reach_the_catalog(race, variant, op
     assert not errors, errors
     slugs = {entry.slug for entry in CANONICAL_PROVIDERS}
     missing = sorted({A, B} - slugs)
-    # ``_discovering`` has to read "not discovering" afterwards. The predicate is the mechanism the
-    # module itself consults now; the module attribute stays readable for out-of-tree callers, and is
-    # checked too (a sibling test rebinds it to a plain bool, hence the truth test).
-    stuck = bool(providers._discovering) or providers._discovery_in_progress()
+    # ``_discovering`` (the attribute the issue names) has to read "not discovering" afterwards.
+    # Truth test, not identity: a sibling fixture rebinds the module attribute to a plain bool.
+    stuck = bool(providers._discovering)
     assert not missing and not stuck, (
         f"{variant} with {opener} opening: missing={missing} _discovering_stuck={stuck}"
     )
