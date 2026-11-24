@@ -63,7 +63,39 @@ _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 # Bumped by every registration (process-wide or per-home layer): memos over the registry key on it.
 _REGISTRY_GENERATION = 0
 _discovered = False
-_discovering = False
+# "A plugin import is running in THIS context" — a depth, not one process-wide boolean. Every session
+# open scans its own profile home in its own thread, and two homes scanning at once used to save,
+# overwrite and restore each other's flag: the saved "prior" belonged to whichever thread ran last, so
+# a registration landing while another home scanned skipped the registry->catalog mirror, and the last
+# thread could restore True for the rest of the process (#159442). A per-context depth keeps the
+# nesting semantics the scans need (a plugin that reads ``list_providers()`` while it imports must not
+# re-enter its own scan) while one home's scan stays invisible to another home's thread.
+_DISCOVERY_DEPTH: ContextVar[int] = ContextVar("_provider_discovery_depth", default=0)
+
+
+def _discovery_in_progress() -> bool:
+    """Whether a provider discovery pass or a ``$HERMES_HOME`` scan is running in this context."""
+    return _DISCOVERY_DEPTH.get() > 0
+
+
+class _DiscoveringFlag:
+    """The old ``_discovering`` global, answered per context instead of per process.
+
+    ``hermes_cli.auth_plugin_providers`` and out-of-tree plugins read ``providers._discovering``
+    directly; only its truth value is part of that contract, so this stand-in keeps them working
+    without a shared mutable boolean.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return _discovery_in_progress()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<discovering={bool(self)}>"
+
+
+_discovering = _DiscoveringFlag()
 _PLUGIN_DIR_STAMP_TTL_SECONDS = 1.0
 # Widest directory mtime granularity in use (FAT rounds to 2 s, HFS+ to 1 s; a kernel without
 # fine-grained timestamps stamps every change within one ~4 ms clock tick alike).
@@ -171,7 +203,7 @@ def register_provider(profile: ProviderProfile) -> None:
         for alias in profile.aliases:
             _ALIASES[alias] = profile.name
         _PROVIDER_LIST_CACHE = None
-    if _discovered and not _discovering:  # post-discovery registration: mirror it immediately
+    if _discovered and not _discovery_in_progress():  # post-discovery registration: mirror it immediately
         _sync_auth_registry()
 
 
@@ -416,7 +448,7 @@ def bound_profile_resolver():
     periodic plugin-dir stamp check, skipped mid-scan so a plugin reading the mirror while it imports
     cannot re-enter its own scan.
     """
-    layer = _bound_home_layer()[0] if _discovering else _home_layer()
+    layer = _bound_home_layer()[0] if _discovery_in_progress() else _home_layer()
 
     def resolve(name: str) -> tuple[ProviderProfile | None, ProviderProfile | None]:
         shared = _ALIASES.get(name, name)
@@ -490,7 +522,7 @@ def _refresh_home_layer(layer: _HomeLayer, home: Path | None, key: str, *, force
         # unpublished stamp rescanned forever; an unpublished check time
         # re-stats the plugin dirs inside the TTL.
         layer.stamp_checked_at = now
-        if _discovered and not _discovering:
+        if _discovered and not _discovery_in_progress():
             _sync_auth_registry()
     layer.stamp_checked_at = now
     return True
@@ -593,9 +625,7 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
     ``kind: model-provider`` (PluginManager owns every other kind there). Per-home module names
     let two profiles carry the same plugin without aliasing each other's registrations.
     """
-    global _discovering
-    token, prior_discovering = _REGISTRATION_TARGET.set(layer), _discovering
-    _discovering = True
+    token, prior_depth = _REGISTRATION_TARGET.set(layer), _DISCOVERY_DEPTH.set(_DISCOVERY_DEPTH.get() + 1)
     try:
         user_dir = _user_plugins_dir()
         if user_dir is not None:
@@ -611,7 +641,7 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
                     _import_plugin_dir(child, "user", home_key=key)
     finally:
         _REGISTRATION_TARGET.reset(token)
-        _discovering = prior_discovering
+        _DISCOVERY_DEPTH.reset(prior_depth)
 
 
 def _plugin_disabled(plugin_dir: Path) -> bool:
@@ -948,15 +978,15 @@ def _discover_providers() -> None:
 
     if safe_worker_enabled():
         return
-    global _discovered, _discovering
+    global _discovered
     if _discovered:
         return
     _discovered = True
-    _discovering = True
+    prior_depth = _DISCOVERY_DEPTH.set(_DISCOVERY_DEPTH.get() + 1)
     try:
         _run_discovery_steps()
     finally:
-        _discovering = False
+        _DISCOVERY_DEPTH.reset(prior_depth)
         # hermes_cli.auth may have been imported by a plugin during discovery and snapshotted a
         # partial profile list — hand it the complete one (no-op unless auth is already loaded).
         _sync_auth_registry()
