@@ -119,6 +119,13 @@ def reconcile_profile_gateways(
     legacy_default_state = _maybe_migrate_legacy_gateway_run_state(
         hermes_home, container_argv=container_argv, dry_run=dry_run)
     default_prior_state = legacy_default_state or _read_desired_state(hermes_home)
+    # ONE bounded retry for a stranded legacy `starting` marker on the ROOT slot (#159527). Named
+    # slots keep their literal prior state: they are never booted from their own intent anyway
+    # (the fold below is their only path to a gateway), and rewriting them would touch multiplex
+    # semantics this lane must leave untouched.
+    if legacy_default_state is None:
+        default_prior_state = _resolve_stranded_starting(
+            hermes_home, default_prior_state, dry_run=dry_run)
     # The root slot INHERITS every named slot's autostart intent, because it is the one process
     # that serves them. Without this an image only ever driven as `hermes -p coder gateway start`
     # booted with ZERO gateways: it has no root state (or "stopped"), every named slot is now
@@ -313,6 +320,76 @@ def _read_desired_state(profile_dir: Path) -> str | None:
         return desired_state
     gateway_state = data.get("gateway_state")
     return "running" if gateway_state in _TRANSIENT_RUNNING_STATES else gateway_state
+
+
+#: Key stamped into ``gateway_state.json`` recording that the ONE bounded autostart retry for a
+#: stranded legacy ``starting`` marker was spent (#159527). New key — no migration, and the
+#: gateway's own runtime-status writer merges its fields over it, so co-writes are safe.
+_STRANDED_STARTING_RETRY_KEY = "stranded_starting_retry"
+
+
+def _rewrite_state_file(state_file: Path, data: dict) -> None:
+    """Best-effort atomic rewrite of ``gateway_state.json`` (same tmp+replace shape as
+    ``service_manager._write_gateway_desired_state``); a failed write must not block boot."""
+    try:
+        tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, separators=(",", ":")) + "\n", encoding="utf-8")
+        tmp.replace(state_file)
+    except OSError as exc:
+        log.warning("could not update %s: %s", state_file, exc)
+
+
+def _resolve_stranded_starting(profile_dir: Path, prior_state: str | None, *,
+                               dry_run: bool) -> str | None:
+    """Give a stranded legacy ``gateway_state=starting`` marker ONE bounded autostart retry.
+
+    ``starting`` deliberately stays out of ``_TRANSIENT_RUNNING_STATES`` (see the block above
+    ``_STALE_RUNTIME_FILES``): a gateway that repeatedly dies mid-boot must not be auto-restarted
+    forever. But a gateway SIGKILLed during its FIRST boot — after ``gateway/run_startup.py``
+    persisted ``starting`` and before any terminal state — strands that marker with no
+    ``desired_state`` forever: nothing ever rewrites the file, and registering the root slot DOWN
+    on every boot disables gateway autostart permanently after one interrupted boot (observed:
+    13+ boots at ``action=registered prior_exit=unclean``, #159527).
+
+    The bounded rule: when the file has no ``desired_state`` and ``gateway_state == "starting"``,
+    report ``running`` once so the root slot autostarts, and stamp a spent-retry record in the
+    same ``gateway_state.json``. A later boot that still finds the identical marker with the
+    record present registers DOWN — the crash-loop door stays closed. The record is cleared once
+    the marker moves on (the runtime reached a real state, or ``desired_state`` was written), so
+    every future interrupted boot gets its own one-time retry. ``dry_run`` never writes the file.
+    """
+    state_file = profile_dir / "gateway_state.json"
+    if not state_file.exists():
+        return prior_state
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return prior_state  # _read_desired_state already logged; a broken file must not bork boot
+    if not isinstance(data, dict):
+        return prior_state
+    stranded = (data.get("desired_state") is None
+                and data.get("gateway_state") == "starting")
+    if stranded:
+        if _STRANDED_STARTING_RETRY_KEY in data:
+            log.warning("reconcile: stranded gateway_state=starting without desired_state; "
+                        "retry already spent — registering gateway-default DOWN (bounded per "
+                        "#159527; run `hermes gateway start` to bring it back)")
+            return prior_state
+        if not dry_run:
+            data[_STRANDED_STARTING_RETRY_KEY] = {"count": 1, "at": _now_iso()}
+            _rewrite_state_file(state_file, data)
+        return "running"
+    if _STRANDED_STARTING_RETRY_KEY in data and not dry_run:
+        # The marker moved on since the retry — a successful boot (or operator intent) rewrote
+        # gateway_state/desired_state, so this profile earns a fresh retry next time.
+        del data[_STRANDED_STARTING_RETRY_KEY]
+        _rewrite_state_file(state_file, data)
+    return prior_state
+
+
+def _now_iso() -> str:
+    from datetime import UTC, datetime
+    return datetime.now(UTC).isoformat()
 
 
 def _cleanup_stale_runtime_files(profile_dir: Path) -> None:
