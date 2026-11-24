@@ -64,6 +64,15 @@ def mask_negated_forget(text: str) -> str:
 
 # Verb prefix for "modify agent config" patterns.
 _MODIFY = r"(update|modify|edit|write|change|append|add\s{1,64}to)\s{1,64}[^\n]{0,2048}"
+
+# Pattern ids the table labels warn-only: a hit means the text *names* a C2 / red-team
+# framework (the "Known C2 / red-team framework names" family below), which a security
+# research AGENTS.md legitimately does. A consumer that can warn instead of dropping the
+# content treats these ids as advisory — see ``agent.prompt_builder._scan_context_content``.
+# Every other id keeps its block-on-hit contract: this is a severity label, never a regex
+# or a scope change.
+WARN_ONLY_PATTERN_IDS = frozenset({"known_c2_framework"})
+
 # (regex, pattern_id, scope); scope ∈ {"all", "context", "strict"}
 _PATTERNS: list[tuple[str, str, str]] = [
     # ── Classic prompt injection (applies everywhere) ────────────────
@@ -110,6 +119,8 @@ _PATTERNS: list[tuple[str, str, str]] = [
     # ── Known C2 / red-team framework names (warn-only) ─────────────
     # Every token must be a distinctive offensive-security brand: a common English word here
     # (e.g. "praxis", also a legitimate agent name) false-positives whole AGENTS.md / SOUL.md files.
+    # Naming a brand is advisory, not an instruction, so this id is listed in
+    # WARN_ONLY_PATTERN_IDS above and loads with a warning where the consumer can warn.
     (r'\b(?:cobalt\s{0,64}strike|sliver|havoc|mythic|metasploit|brainworm)\b', "known_c2_framework", "context"),
     (r'\bc2\s{1,64}(?:server|channel|infrastructure|beacon)\b', "c2_explicit", "context"),
     (r'\bcommand\s{1,64}and\s{1,64}control\b', "c2_explicit_long", "context"),
@@ -267,4 +278,5 @@ def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
             f"injection or exfiltration payloads.")
 
 
-__all__ = ["EMOJI_TAG_SEQUENCE_RE", "INVISIBLE_CHARS", "MAX_SCAN_CHARS", "first_threat_message", "scan_for_threats"]
+__all__ = ["EMOJI_TAG_SEQUENCE_RE", "INVISIBLE_CHARS", "MAX_SCAN_CHARS", "WARN_ONLY_PATTERN_IDS",
+           "first_threat_message", "scan_for_threats"]
