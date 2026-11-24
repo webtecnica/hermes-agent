@@ -38,6 +38,7 @@ from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
 from agent.lsp import deferred as lsp_deferred
 from agent.prompt_cache_scope import conversation_id
+from agent.tool_argument_guards import parse_arguments_for_call
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -182,7 +183,9 @@ class _BatchAbandoned(BaseException):
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments without repairing or coercing them: a complete ``null``
+    is "no arguments" only for a tool declaring no input (see ``agent.tool_argument_guards``),
+    never a truncated string, and a tool that requires input still errors (#159689)."""
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
@@ -458,7 +461,7 @@ class _ParsedCall:
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
     name = _canonical_tool_name(tool_call.function.name)
-    args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
+    args, parse_error = parse_arguments_for_call(agent, name, tool_call.function.arguments)
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
