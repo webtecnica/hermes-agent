@@ -28,7 +28,7 @@ from agent.skill_utils import (
     iter_skill_index_files, parse_frontmatter, skill_matches_apps, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
 )
-from tools.threat_patterns import scan_for_threats as _scan_for_threats
+from tools.threat_patterns import WARN_ONLY_PATTERN_IDS, scan_for_threats as _scan_for_threats
 from utils import atomic_json_write, file_cache_version
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,11 @@ def _scan_context_content(content: str, filename: str, *, user_authored: bool = 
     (repo AGENTS.md / .cursorrules / .hermes.md) arrive with the checkout and keep blocking, and so does
     a SOUL.md owned by a profile distribution (``hermes profile install <git-url>`` copies it in unscanned;
     ``load_soul_md`` passes ``user_authored=False`` when ``distribution.yaml`` owns the file).
+
+    Findings the table calls warn-only (``tools.threat_patterns.WARN_ONLY_PATTERN_IDS``) load the file with
+    a warning when they are the *only* findings: naming a C2 / red-team product in a security-research
+    AGENTS.md is not an instruction to the agent (#159750). One non-warn-only finding — a real injection,
+    invisible unicode — keeps the blocking path below, and any hit is still logged in full.
     """
     # A leading UTF-8 BOM is a Windows-editor artifact, not an injection.
     content = content.removeprefix("\ufeff")
@@ -104,6 +109,12 @@ def _scan_context_content(content: str, filename: str, *, user_authored: bool = 
     if user_authored:
         logger.warning("Context file %s matched injection pattern(s) %s; loaded anyway because it is the "
                        "user's own file in HERMES_HOME — review it if you did not write that text",
+                       filename, ", ".join(findings))
+        return content
+    blocking = [finding for finding in findings if finding not in WARN_ONLY_PATTERN_IDS]
+    if not blocking:
+        logger.warning("Context file %s matched warn-only pattern(s) %s; loaded anyway — a framework name "
+                       "is advisory, not an instruction (review it if you did not write that text)",
                        filename, ", ".join(findings))
         return content
     logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
