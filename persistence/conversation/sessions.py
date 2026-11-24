@@ -516,6 +516,9 @@ class SessionQuery:
     local_created_sources: Optional[tuple[str, ...]] = None
     #: Only rows in this workspace (``hermes -c``'s rule): the git repo root equals it, or a row without one has its cwd at or under it.
     workspace_key: Optional[str] = None
+    #: False for a navigation read whose response drops the token/cost columns: list the committed rows
+    #: without draining queued usage writes first (neither for the page nor for a projected compression tip).
+    needs_usage_totals: bool = True
 
 
 @dataclass(frozen=True, slots=True)

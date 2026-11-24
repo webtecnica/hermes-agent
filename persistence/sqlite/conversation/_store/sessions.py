@@ -1271,15 +1271,18 @@ def list_sessions_rich(
     id_query: str | None = None, search_query: str | None = None, compact_rows: bool = False,
     include_pinned: bool = False, session_key: str | None = None, include_hidden: bool = False,
     include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
-    workspace_key: str | None = None,
+    workspace_key: str | None = None, needs_usage_totals: bool = True,
 ) -> list[dict[str, Any]]:
     """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
     by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
     ``include_pinned`` back-fills pins the page missed, still obeying the other
     filters except archived: a pin is an explicit keep, so a pinned row stamped
     archived must still return. ``local_created_sources`` restricts ``source='local'``
-    rows to those surfaces before LIMIT/OFFSET. ``workspace_key``: the ``hermes -c`` folder rule."""
-    holder.flush_for_read()  # rows carry token/cost totals
+    rows to those surfaces before LIMIT/OFFSET. ``workspace_key``: the ``hermes -c`` folder rule.
+    ``needs_usage_totals=False`` for a navigation response that drops the token/cost columns: it reads
+    the committed rows without waiting for queued usage writes, for the page and for a projected tip."""
+    if needs_usage_totals:  # rows carry token/cost totals
+        holder.flush_for_read()
     where_clauses, params = _session_filter_where(
         exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
         exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
@@ -1414,7 +1417,7 @@ def list_sessions_rich(
                 sessions.append(s)
     if project_compression_tips and not include_children:
         from persistence.sqlite.conversation._store.session_list import project_compression_tips
-        sessions = project_compression_tips(holder, sessions, compact_rows)
+        sessions = project_compression_tips(holder, sessions, compact_rows, needs_usage_totals=needs_usage_totals)
     if heads:
         from persistence.sqlite.conversation._store.local import annotate_local_lineages
         sessions = annotate_local_lineages(sessions, heads)

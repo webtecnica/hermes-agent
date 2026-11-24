@@ -7,10 +7,12 @@ from persistence.sqlite.conversation._store.compression import get_compression_c
 from persistence.sqlite.conversation._store.portability import _get_session_rich_rows_batch
 
 
-def project_compression_tips(db, sessions: list[dict[str, Any]], compact_rows: bool) -> list[dict[str, Any]]:
+def project_compression_tips(db, sessions: list[dict[str, Any]], compact_rows: bool, *,
+                             needs_usage_totals: bool = True) -> list[dict[str, Any]]:
     """Replace each compression root's surfaced fields with its live tip's (root ``started_at`` kept
     for stable ordering), one batched query. ``_lineage_ids`` carries every chain id (a tile may
-    hold a MIDDLE segment's id)."""
+    hold a MIDDLE segment's id). ``needs_usage_totals=False`` skips the tip fetch's usage drain for a
+    navigation read that drops the totals."""
     chain_by_root: dict[str, list[str]] = {}  # only roots whose tip differs from themselves
     for s in sessions:
         if s.get("end_reason") == "compression":
@@ -20,6 +22,7 @@ def project_compression_tips(db, sessions: list[dict[str, Any]], compact_rows: b
     tip_rows = (
         _get_session_rich_rows_batch(db,
             {chain[-1] for chain in chain_by_root.values()}, compact_rows=compact_rows,
+            needs_usage_totals=needs_usage_totals,
         ) if chain_by_root else {}
     )
     projected = []
