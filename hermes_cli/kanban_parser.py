@@ -84,10 +84,33 @@ _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
-_NOTIFY_TARGET = (
-    _arg("--platform", required=True),
+
+
+def _notify_platform(value: str) -> str:
+    """argparse ``type`` for ``notify-subscribe --platform``: refuse what no notifier delivers.
+
+    Delegates to ``kanban_db_notify.resolve_notify_platform`` so the CLI, the command handler and
+    the gateway notifier share one definition of "deliverable" (#159821)."""
+    try:
+        return kbn.resolve_notify_platform(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+# ``notify-subscribe`` validates the platform; ``notify-unsubscribe`` deliberately does NOT, so an
+# orphan row written by an older CLI (or by hand) can still be removed by its own platform string.
+_NOTIFY_CHAT_TARGET = (
     _arg("--chat-id", required=True),
     _arg("--thread-id"),
+)
+_NOTIFY_TARGET = (_arg("--platform", required=True), *_NOTIFY_CHAT_TARGET)
+_NOTIFY_SUBSCRIBE_TARGET = (
+    _arg("--platform", required=True, type=_notify_platform, metavar="PLATFORM",
+         help="Delivery platform: a gateway platform configured on this profile (telegram, "
+              "discord, local, …) or a bundled/registered plugin platform. 'tui' is also accepted "
+              "with --chat-id equal to the active Desktop/TUI session key, but it only delivers "
+              "while that session holds an active-session lease."),
+    *_NOTIFY_CHAT_TARGET,
 )
 _STEP_HANDOFF = (
     _arg("--summary", help="Structured handoff summary. Falls back to --result if omitted."),
@@ -388,7 +411,7 @@ _SPECS = [
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
     _cmd("notify-subscribe", [
         _TASK_ID,
-        *_NOTIFY_TARGET,
+        *_NOTIFY_SUBSCRIBE_TARGET,
         _arg("--user-id"),
         _arg("--user-id-alt"),
         _arg("--chat-type", choices=("dm", "group", "channel", "thread"),

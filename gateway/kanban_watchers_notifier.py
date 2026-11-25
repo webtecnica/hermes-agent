@@ -323,8 +323,21 @@ class _Collector:
         owner_profile = sub.get("notifier_profile") or None
         platform = (sub.get("platform") or "").lower()
         if platform not in self.active_platforms:
-            logger.debug("kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                         sub.get("task_id"), platform or "<missing>")
+            if not _kbn().is_deliverable_notify_platform(platform):
+                # Nothing here will ever claim this row: no gateway adapter exists for the platform
+                # and the TUI poller only reads ``platform='tui'``. A DEBUG-only skip made such a
+                # subscription invisible forever (#159821); say so once per row at WARNING.
+                _warn_unroutable_sub_once(
+                    sub, platform or "<missing>",
+                    "kanban notifier: subscription for %s on %s:%s names a platform no gateway "
+                    "adapter or TUI poller delivers, so it will never notify; remove it with "
+                    "`hermes kanban notify-unsubscribe %s --platform %s --chat-id %s` or "
+                    "re-subscribe with a gateway platform or 'tui'.",
+                    sub.get("task_id"), platform or "<missing>", sub.get("chat_id"),
+                )
+            else:
+                logger.debug("kanban notifier: subscription for %s on %s skipped; adapter not connected",
+                             sub.get("task_id"), platform or "<missing>")
             return None
         from gateway.config import Platform
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:

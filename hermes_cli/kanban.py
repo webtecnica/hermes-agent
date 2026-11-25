@@ -1170,6 +1170,13 @@ def _caller_identity_for_target(platform: str, chat_id: str, thread_id, user_id,
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+    # argparse validates ``--platform`` too, but this entry point is also reached programmatically:
+    # re-check here, before any DB read/write, so an unroutable platform can never persist a row
+    # that both the gateway and TUI notifiers would drop silently (#159821).
+    try:
+        args.platform = kbn.resolve_notify_platform(args.platform)
+    except kbn.NotifyPlatformError as exc:
+        return _err(str(exc))
     delivery_metadata = {
         key: value
         for key, value in (

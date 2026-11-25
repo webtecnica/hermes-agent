@@ -25,6 +25,54 @@ if TYPE_CHECKING:
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 
+# Platforms a subscription row can actually be delivered on. ``tui`` has no gateway adapter:
+# ``tui_gateway/session_notifications.py`` polls ``platform='tui'`` rows itself, and only while the
+# Desktop/TUI session holds an active-session lease.
+TUI_NOTIFY_PLATFORM = "tui"
+
+
+class NotifyPlatformError(ValueError):
+    """``--platform`` names something neither a gateway adapter nor the TUI poller delivers."""
+
+
+def resolve_notify_platform(platform: Any) -> str:
+    """Canonical deliverable platform name for ``kanban_notify_subs.platform`` (#159821).
+
+    ``gateway.config.Platform`` is deliberately NOT a closed enum: ``Platform._missing_`` mints a
+    pseudo-member for every bundled or runtime-registered plugin platform, so ``Platform("irc")``
+    is legitimate while ``Platform("desktop")`` raises. Validating through it (instead of a
+    hardcoded literal list) is what keeps plugin platforms acceptable while still refusing a name
+    no notifier delivers. The returned value is the member's canonical ``.value``, so a plugin
+    manifest alias (e.g. ``sms-platform``) is stored under the directory name the notifier routes
+    on rather than becoming a fresh orphan row.
+
+    Raises ``NotifyPlatformError`` for anything unroutable.
+    """
+    value = str(platform or "").strip().lower()
+    if value == TUI_NOTIFY_PLATFORM:
+        return TUI_NOTIFY_PLATFORM
+    from gateway.config import Platform
+    try:
+        return Platform(value).value
+    except ValueError as exc:
+        raise NotifyPlatformError(
+            f"unknown --platform {value or platform!r}: no gateway adapter or TUI poller delivers "
+            f"kanban notifications for it, so the subscription would never fire. Use 'tui' with "
+            f"--chat-id <active session key> (delivered only while that Desktop/TUI session holds "
+            f"an active-session lease), or a gateway platform configured on this profile "
+            f"(e.g. telegram, discord, local)."
+        ) from exc
+
+
+def is_deliverable_notify_platform(platform: Any) -> bool:
+    """Whether any notifier can deliver a subscription on ``platform`` (see ``resolve_notify_platform``)."""
+    try:
+        resolve_notify_platform(platform)
+    except NotifyPlatformError:
+        return False
+    return True
+
+
 _SCALAR_TYPES = (str, int, float, bool)
 
 # Subscription primary key predicate; every per-row statement below binds
