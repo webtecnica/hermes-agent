@@ -722,6 +722,9 @@ gateway:
     cron_session_read_only: "⚠️ Bu sohbet zamanlanmış bir göreve ait ve yalnızca o görevi çalıştırıyor, bu yüzden mesajın çalıştırılmadı. Göndermek için yeni bir sohbet başlat."
     workspace_unavailable: "⚠️ Bu sohbetin çalışma klasörü artık yok ({path}), bu yüzden mesajın çalıştırılmadı. Klasörü yeniden oluştur ya da sohbeti başka bir klasöre taşı (CLI'da `/worktree new`, masaüstü uygulamasında “Move to project”), sonra mesajını yeniden gönder."
     launch_credentials_unavailable: "⚠️ Bu sohbet, başlatıldığı API anahtarını artık kullanamıyor{detail}, bu yüzden içinde hiçbir şey çalıştırılamaz. Açık bir sohbet asla kendiliğinden başka bir anahtara geçmez, bu nedenle /retry de aynı şekilde başarısız olur. Mevcut anahtarınla yeni bir sohbet başlatmak için /new kullan."
+    failed_turn_notice: "Your request was not processed. Send it again if you still want me to carry it out."
+    partial_failed_turn_notice: "This turn did not complete. Some actions may already have run; verify their effects before resending."
+    automation_interrupted_notice: "An automated delivery was interrupted and was not run again. Some actions may already have run; verify their effects."
   skills:
     disabled: "**{name}** skill'i kurulu ancak devre dışı.\nEtkinleştirmek için: `hermes skills config`"
     not_installed: "**{name}** skill'i mevcut ancak kurulu değil.\nKurmak için: `hermes skills install {install_name}`"

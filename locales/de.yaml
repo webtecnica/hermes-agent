@@ -722,6 +722,9 @@ gateway:
     cron_session_read_only: "⚠️ Dieser Chat gehört zu einer geplanten Aufgabe und führt nur diese aus, daher wurde deine Nachricht nicht ausgeführt. Starte einen neuen Chat, um sie zu senden."
     workspace_unavailable: "⚠️ Der Arbeitsordner dieses Chats existiert nicht mehr ({path}), daher wurde deine Nachricht nicht ausgeführt. Lege den Ordner neu an oder verschiebe den Chat in einen anderen (`/worktree new` in der CLI, „In Projekt verschieben“ in der Desktop-App) und sende deine Nachricht dann erneut."
     launch_credentials_unavailable: "⚠️ Dieser Chat kann den API-Schlüssel, mit dem er gestartet wurde, nicht mehr verwenden{detail}, daher kann darin nichts mehr ausgeführt werden. Ein offener Chat wechselt nie von selbst zu einem anderen Schlüssel, deshalb scheitert /retry genauso. Starte mit /new einen neuen Chat mit deinem aktuellen Schlüssel."
+    failed_turn_notice: "Your request was not processed. Send it again if you still want me to carry it out."
+    partial_failed_turn_notice: "This turn did not complete. Some actions may already have run; verify their effects before resending."
+    automation_interrupted_notice: "An automated delivery was interrupted and was not run again. Some actions may already have run; verify their effects."
   skills:
     disabled: "Der Skill **{name}** ist installiert, aber deaktiviert.\nAktivieren Sie ihn mit: `hermes skills config`"
     not_installed: "Der Skill **{name}** ist verfügbar, aber nicht installiert.\nInstallieren Sie ihn mit: `hermes skills install {install_name}`"

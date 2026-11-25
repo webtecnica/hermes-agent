@@ -13,7 +13,7 @@ import threading
 import time
 from agent.i18n import t
 from agent.turn_failure_copy import (
-    FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, OPEN_TURN_TAIL_ROLES, PARTIAL_FAILED_TURN_NOTICE,
+    FAILED_TURN_DISPLAY_KIND, OPEN_TURN_TAIL_ROLES, PARTIAL_FAILED_TURN_NOTICE_KEY, failed_turn_notice,
 )
 from agent.session_activity import format_iteration_progress
 from contextlib import nullcontext, suppress
@@ -340,13 +340,8 @@ class GatewayTurnPersistenceMixin:
         turn_messages = _current_turn_messages(
             agent_result.get("messages", []) or [], agent_result.get("history_offset", 0),
         )
-        if any(
-            message.get("role") == "tool"
-            or (message.get("role") == "assistant" and message.get("tool_calls"))
-            for message in turn_messages
-        ):
-            return PARTIAL_FAILED_TURN_NOTICE
-        return FAILED_TURN_NOTICE
+        # Same selection (and the same i18n resolution) as the core closer in conversation_loop.
+        return failed_turn_notice(turn_messages)
 
     async def _hmwa_close_failed_turn(self, session_id, notice):
         """Append the gateway-owned assistant boundary iff the durable tail is open (a user row, or the
@@ -866,7 +861,7 @@ class GatewayTurnPersistenceMixin:
                         session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
                     )
                 # Tool effects are unknown after an exception.
-                await self._hmwa_close_failed_turn(session_entry.session_id, PARTIAL_FAILED_TURN_NOTICE)
+                await self._hmwa_close_failed_turn(session_entry.session_id, t(PARTIAL_FAILED_TURN_NOTICE_KEY))
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
         # Never expose raw exception types/messages to end users (info-leakage risk).
@@ -907,7 +902,7 @@ class GatewayTurnPersistenceMixin:
         # real cause, so its details line is not the chat apology with the log pointer cut off.
         local_error = f"{error_type_name(e)}: {e}"[:500] if source.platform == Platform.LOCAL else None
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
-            t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
+            t("gateway.errors.generic_failed_with_hint", hint=status_hint), t(PARTIAL_FAILED_TURN_NOTICE_KEY),
         ), error=local_error)
 
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):

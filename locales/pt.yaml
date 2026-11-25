@@ -722,6 +722,9 @@ gateway:
     cron_session_read_only: "⚠️ Este chat pertence a uma tarefa agendada e só executa essa tarefa, por isso a sua mensagem não foi executada. Inicie um novo chat para enviá-la."
     workspace_unavailable: "⚠️ A pasta de trabalho deste chat já não existe ({path}), por isso a sua mensagem não foi executada. Recrie a pasta ou mova o chat para outra (`/worktree new` na CLI, «Move to project» na aplicação de ambiente de trabalho) e envie a mensagem novamente."
     launch_credentials_unavailable: "⚠️ Este chat não pode mais usar a chave de API com que foi iniciado{detail}, então nada pode ser executado nele. Um chat aberto nunca muda sozinho para outra chave, então /retry falha da mesma forma. Use /new para começar um novo chat com sua chave atual."
+    failed_turn_notice: "Seu pedido não foi processado. Envie-o novamente se ainda quiser que eu o execute."
+    partial_failed_turn_notice: "Este turno não foi concluído. Algumas ações podem já ter sido executadas; verifique os efeitos antes de reenviar."
+    automation_interrupted_notice: "Uma entrega automatizada foi interrompida e não voltou a ser executada. Algumas ações podem já ter sido executadas; verifique os efeitos."
   skills:
     disabled: "A skill **{name}** está instalada, mas desativada.\nAtive-a com: `hermes skills config`"
     not_installed: "A skill **{name}** está disponível, mas não instalada.\nInstale-a com: `hermes skills install {install_name}`"

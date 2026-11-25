@@ -722,6 +722,9 @@ gateway:
     cron_session_read_only: "⚠️ هذه المحادثة تابعة لمهمة مجدولة ولا تشغّل سوى تلك المهمة، لذا لم تُنفَّذ رسالتك. ابدأ محادثة جديدة لإرسالها."
     workspace_unavailable: "⚠️ لم يعد مجلد عمل هذه المحادثة موجوداً ({path})، لذا لم تُنفَّذ رسالتك. أعد إنشاء المجلد، أو انقل المحادثة إلى مجلد آخر (`/worktree new` في واجهة سطر الأوامر، أو «Move to project» في تطبيق سطح المكتب)، ثم أرسل رسالتك مجدداً."
     launch_credentials_unavailable: "⚠️ لم تعد هذه المحادثة قادرة على استخدام مفتاح API الذي بدأت به{detail}، لذلك لا يمكن تشغيل أي شيء فيها. المحادثة المفتوحة لا تنتقل أبدًا إلى مفتاح مختلف من تلقاء نفسها، لذا سيفشل /retry بالطريقة نفسها. استخدم /new لبدء محادثة جديدة بمفتاحك الحالي."
+    failed_turn_notice: "Your request was not processed. Send it again if you still want me to carry it out."
+    partial_failed_turn_notice: "This turn did not complete. Some actions may already have run; verify their effects before resending."
+    automation_interrupted_notice: "An automated delivery was interrupted and was not run again. Some actions may already have run; verify their effects."
   skills:
     disabled: "مهارة **{name}** مثبّتة لكنها معطّلة.\nفعّلها بـ: `hermes skills config`"
     not_installed: "مهارة **{name}** متاحة لكنها غير مثبّتة.\nثبّتها بـ: `hermes skills install {install_name}`"

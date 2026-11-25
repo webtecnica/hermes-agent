@@ -56,6 +56,9 @@ def stamp_failure(result: dict[str, Any], reason: str, retryable: bool) -> dict[
 # (``agent/conversation_loop.py::run_conversation``) and the gateway's own writer
 # (``gateway/run_turn.py::_hmwa_close_failed_turn``) say the same thing.
 
+# The English defaults, kept as importable constants: the bundled ``en`` catalog carries the same
+# bytes under the same shape, and these names are the module's public surface. Writers resolve the
+# key through ``agent.i18n.t()`` so the row lands in the configured language.
 FAILED_TURN_NOTICE = (
     "Your request was not processed. Send it again if you still want me to carry it out."
 )
@@ -70,6 +73,17 @@ AUTOMATION_INTERRUPTED_NOTICE = (
     "An automated delivery was interrupted and was not run again. Some "
     "actions may already have run; verify their effects."
 )
+FAILED_TURN_NOTICE_KEY = "gateway.errors.failed_turn_notice"
+PARTIAL_FAILED_TURN_NOTICE_KEY = "gateway.errors.partial_failed_turn_notice"
+AUTOMATION_INTERRUPTED_NOTICE_KEY = "gateway.errors.automation_interrupted_notice"
+_FAILED_TURN_NOTICE_KEYS = (
+    FAILED_TURN_NOTICE_KEY, PARTIAL_FAILED_TURN_NOTICE_KEY, AUTOMATION_INTERRUPTED_NOTICE_KEY,
+)
+# Boundaries written before the closers resolved a catalog key: the English literals are still read
+# back from disk after the profile switched language.
+_LEGACY_FAILED_TURN_NOTICES = frozenset({
+    FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, AUTOMATION_INTERRUPTED_NOTICE,
+})
 # Durable tail roles a failed turn leaves open: its accepted ``user`` row, or the ``tool`` row of a
 # call that ran before the failure. An ``assistant`` tail is already closed (a reply or a boundary).
 OPEN_TURN_TAIL_ROLES = frozenset({"user", "tool"})
@@ -89,24 +103,46 @@ FAILED_TURN_DISPLAY_KIND = "failed_turn"
 # and open-time repair write, so they are defined once, in the transcript contract (imported above).
 
 
+def _localized_failed_turn_notices(lang: str) -> frozenset[str]:
+    """The boundary texts of ``lang`` (``t()`` already falls back to ``en`` for missing keys).
+
+    Read side only, and only consulted when ``lang`` is not the default: under ``en`` the literals
+    above ARE the catalog values (pinned by ``tests/test_159745_failed_turn_notice_i18n.py``).
+    """
+    from agent.i18n import t
+
+    return frozenset(t(key, lang=lang) for key in _FAILED_TURN_NOTICE_KEYS)
+
+
 def untyped_failed_turn_display_kind(role: Any, content: Any) -> Optional[str]:
     """``FAILED_TURN_DISPLAY_KIND`` for a boundary row persisted before the closers typed it
     (exact notice text, so a real reply quoting it stays a reply); read-side only."""
-    if role == "assistant" and isinstance(content, str) and content.strip() in (
-        FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, AUTOMATION_INTERRUPTED_NOTICE,
-    ):
+    if role != "assistant" or not isinstance(content, str):
+        return None
+    text = content.strip()
+    if text in _LEGACY_FAILED_TURN_NOTICES:
+        return FAILED_TURN_DISPLAY_KIND
+    # Rows written after the closers started resolving ``gateway.errors.*`` carry the text of the
+    # language active then; recognise them without giving up the English rows persisted before.
+    from agent.i18n import DEFAULT_LANGUAGE, get_language
+
+    lang = get_language()
+    if lang != DEFAULT_LANGUAGE and text in _localized_failed_turn_notices(lang):
         return FAILED_TURN_DISPLAY_KIND
     return None
 
 
 def failed_turn_notice(turn_messages: Any) -> str:
-    """Boundary copy for a failed turn: never claim "not processed" when a tool may have run."""
+    """Boundary copy for a failed turn, in the configured language: never claim "not processed"
+    when a tool may have run."""
+    from agent.i18n import t
+
     for row in turn_messages or ():
         if isinstance(row, dict) and (
             row.get("role") == "tool" or (row.get("role") == "assistant" and row.get("tool_calls"))
         ):
-            return PARTIAL_FAILED_TURN_NOTICE
-    return FAILED_TURN_NOTICE
+            return t(PARTIAL_FAILED_TURN_NOTICE_KEY)
+    return t(FAILED_TURN_NOTICE_KEY)
 
 
 def provider_label_for(provider: Any) -> str:
