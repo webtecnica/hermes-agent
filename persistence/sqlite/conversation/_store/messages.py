@@ -76,7 +76,13 @@ def _encode_content(content: Any) -> Any:
 
 def _decode_content(content: Any) -> Any:
     """Reverse :meth:`_encode_content`; returns scalars unchanged. Fail closed: a reserved-prefix
-    string that isn't valid JSON (a legacy/malformed marker row) returns the raw string."""
+    string that isn't valid JSON (a legacy/malformed marker row) returns the raw string.
+
+    A row from a legacy column without TEXT affinity arrives as ``bytes``; decode it
+    first so the reserved JSON envelope is still recognized and message content is
+    never handed back as raw bytes."""
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", errors="replace")
     if isinstance(content, str) and content.startswith(_CONTENT_JSON_PREFIX):
         return _json_or(content[len(_CONTENT_JSON_PREFIX):], content,
             "Failed to decode JSON-encoded message content; returning raw string")

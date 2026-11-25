@@ -272,6 +272,11 @@ class StoreHolder:
     def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
         if system_prompt is None:
             return None
+        if isinstance(system_prompt, bytes):
+            # A legacy column without TEXT affinity hands the snapshot back as
+            # bytes; decode it so dedupe hashes and stores the prompt instead
+            # of aborting schema init with AttributeError.
+            system_prompt = system_prompt.decode("utf-8", errors="replace")
         prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
         conn.execute(
             "INSERT OR IGNORE INTO system_prompts (hash, prompt) VALUES (?, ?)",
