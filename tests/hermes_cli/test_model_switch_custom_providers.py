@@ -1734,6 +1734,98 @@ def test_save_discovered_models_preserves_dict_form(monkeypatch):
     )
 
 
+def test_save_discovered_models_persists_to_providers_mapping(monkeypatch):
+    """A successful probe must persist the discovered catalog into the modern
+    ``providers:`` mapping shape (dict of provider-key to entry), not only into
+    the legacy ``custom_providers`` list (#159908)."""
+    cfg = {
+        "providers": {
+            "my-gateway": {
+                "base_url": "https://gateway.example.com/v1",
+                "key_env": "MY_KEY",
+                "models": [],
+            }
+        }
+    }
+    save_calls = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
+    )
+
+    _save_discovered_models_to_config(
+        "https://gateway.example.com/v1", ["a", "b"]
+    )
+
+    entry = cfg["providers"]["my-gateway"]
+    assert entry["models"] == {"a": {}, "b": {}}
+    assert entry["models_discovered"] is True
+    assert len(save_calls) == 1, (
+        "the discovered catalog must be saved exactly once for the providers mapping"
+    )
+
+
+def test_save_discovered_models_preserves_dict_form_in_providers_mapping(monkeypatch):
+    """The legacy rule holds for the modern shape too: a ``models`` dict of
+    per-model metadata is user-curated and must never be replaced."""
+    curated = {"configured-model": {"context_length": 8192}}
+    cfg = {
+        "providers": {
+            "my-gateway": {
+                "base_url": "https://gateway.example.com/v1",
+                "models": dict(curated),
+            }
+        }
+    }
+    save_calls = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
+    )
+
+    _save_discovered_models_to_config(
+        "https://gateway.example.com/v1", ["configured-model", "discovered-model"]
+    )
+
+    entry = cfg["providers"]["my-gateway"]
+    assert entry["models"] == curated
+    assert "models_discovered" not in entry
+    assert save_calls == []
+
+
+def test_save_discovered_models_skips_providers_mapping_with_other_base_url(monkeypatch):
+    """Only the entry whose base_url matches the probe is written; a sibling
+    entry on another endpoint keeps its models untouched."""
+    cfg = {
+        "providers": {
+            "matching-gateway": {
+                "base_url": "https://gateway.example.com/v1",
+                "models": [],
+            },
+            "other-gateway": {
+                "base_url": "https://other.example.com/v1",
+                "models": [],
+            },
+        }
+    }
+    save_calls = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
+    )
+
+    _save_discovered_models_to_config(
+        "https://gateway.example.com/v1", ["a", "b"]
+    )
+
+    other = cfg["providers"]["other-gateway"]
+    assert other["models"] == []
+    assert "models_discovered" not in other
+    # The matching sibling proves the modern save path ran at all.
+    assert cfg["providers"]["matching-gateway"]["models"] == {"a": {}, "b": {}}
+    assert len(save_calls) == 1
+
+
 def test_model_flow_named_custom_persists_discovered_models(monkeypatch):
     """The ``hermes model`` named-custom-provider flow persists the discovered
     catalog back to the entry's ``models:`` list.
