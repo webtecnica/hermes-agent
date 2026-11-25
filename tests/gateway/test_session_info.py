@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from unittest.mock import patch
 
 from gateway.run import GatewayRunner
+from agent.i18n import t
 
 
 @pytest.fixture()
@@ -27,6 +28,18 @@ def _patch_info(tmp_path, config_yaml, model, runtime):
 
 class TestFormatSessionInfo:
 
+
+
+    def test_unresolved_provider_shows_neutral_marker_not_openrouter(self, runner, tmp_path):
+        """#159861: an unresolved provider must not be advertised as a real one in the banner."""
+        p1, p2, p3 = _patch_info(
+            tmp_path, "model:\n  default: test-model\n  context_length: 32768\n",
+            "test-model", {"provider": "", "base_url": "", "api_key": ""})
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        unknown = t("gateway.shared.unknown_value")
+        assert "openrouter" not in info.lower()
+        assert t("gateway.session.info_provider", provider=unknown) in info
 
 
     def test_config_context_length(self, runner, tmp_path):
