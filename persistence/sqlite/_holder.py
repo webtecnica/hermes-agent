@@ -269,9 +269,15 @@ class StoreHolder:
     _closed_by_close_all = False
 
     @staticmethod
-    def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
+    def _store_system_prompt(conn, system_prompt: Optional[str | bytes]) -> Optional[str]:
         if system_prompt is None:
             return None
+        # A legacy row can hand back ``bytes`` where the column declares TEXT (a BLOB value is
+        # never coerced by column affinity). Hashing is a READ of that cell, so decode it first:
+        # ``errors="replace"`` keeps a corrupted cell from raising, and the decoded text is what
+        # both the hash and the stored snapshot are derived from.
+        if isinstance(system_prompt, bytes):
+            system_prompt = system_prompt.decode("utf-8", "replace")
         prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
         conn.execute(
             "INSERT OR IGNORE INTO system_prompts (hash, prompt) VALUES (?, ?)",

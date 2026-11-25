@@ -76,7 +76,18 @@ def _encode_content(content: Any) -> Any:
 
 def _decode_content(content: Any) -> Any:
     """Reverse :meth:`_encode_content`; returns scalars unchanged. Fail closed: a reserved-prefix
-    string that isn't valid JSON (a legacy/malformed marker row) returns the raw string."""
+    string that isn't valid JSON (a legacy/malformed marker row) returns the raw string.
+
+    A legacy BLOB-affinity cell hands back ``bytes`` where this column declares TEXT (affinity never
+    coerces a BLOB). Decode it for the prefix check — ``errors="replace"`` so a corrupted cell is never
+    an exception — and the single prefix rule below judges the decoded text. A cell without the prefix
+    is not structured content: it comes back as the original object, ``bytes`` included (#116510: a
+    schema column must never vanish or silently change type)."""
+    if isinstance(content, bytes):
+        text = content.decode("utf-8", "replace")
+        if not text.startswith(_CONTENT_JSON_PREFIX):
+            return content
+        content = text
     if isinstance(content, str) and content.startswith(_CONTENT_JSON_PREFIX):
         return _json_or(content[len(_CONTENT_JSON_PREFIX):], content,
             "Failed to decode JSON-encoded message content; returning raw string")
