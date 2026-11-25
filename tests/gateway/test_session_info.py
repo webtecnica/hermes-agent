@@ -39,6 +39,54 @@ class TestFormatSessionInfo:
         assert "config" in info
 
 
+    def test_unresolved_provider_is_not_named_as_openrouter(self, runner, tmp_path):
+        """#159861: an unresolved provider must not be shown as a concrete one.
+
+        No ``model.provider`` in config plus an empty runtime provider left
+        ``resolved.provider`` unset, and the banner hardcoded ``openrouter`` —
+        claiming a provider the session may not even have credentials for. It
+        must fall back to a provider-neutral marker instead.
+        """
+        from agent.i18n import t
+
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: test-model\n  context_length: 32768\n",
+            "test-model",
+            {"provider": "", "base_url": "", "api_key": ""},
+        )
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "openrouter" not in info.lower()
+        assert t("gateway.shared.unknown_value").lower() in info.lower()
+
+    def test_resolved_openrouter_provider_is_still_named(self, runner, tmp_path):
+        """Control: when the provider really is openrouter, the banner must say so."""
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: test-model\n  provider: openrouter\n",
+            "test-model",
+            {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1", "api_key": ""},
+        )
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "openrouter" in info.lower()
+
+    def test_resolved_custom_provider_is_still_named(self, runner, tmp_path):
+        """Control: a resolved custom provider keeps its own name in the banner."""
+        from agent.i18n import t
+
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: test-model\n  provider: custom\n",
+            "test-model",
+            {"provider": "custom", "base_url": "", "api_key": ""},
+        )
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "custom" in info.lower()
+        assert t("gateway.shared.unknown_value").lower() not in info.lower()
+
     def test_local_endpoint_shown(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(
             tmp_path,

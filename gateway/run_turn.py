@@ -389,7 +389,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         )
         lines = [
             t("gateway.session.info_model", model=resolved.model),
-            t("gateway.session.info_provider", provider=resolved.provider or "openrouter"),
+            # #159861: an unresolved provider is unknown, not openrouter. The old literal
+            # claimed a concrete provider (and its billing) for a session that may have no
+            # OpenRouter credentials at all; say so with the already-translated marker.
+            t("gateway.session.info_provider",
+              provider=resolved.provider or t("gateway.shared.unknown_value")),
             t("gateway.session.info_context", tokens=ctx_display, source=ctx_source),
         ]
         if (resolved.provider or "") == "moa":
