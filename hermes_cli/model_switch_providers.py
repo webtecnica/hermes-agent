@@ -42,6 +42,7 @@ def _save_discovered_models_to_config(
         cfg = load_config()
         norm_url = api_url.strip().rstrip("/").lower()
         changed = False
+        legacy_changed = False
 
         providers = cfg.get("custom_providers") or []
         if isinstance(providers, list):
@@ -59,9 +60,9 @@ def _save_discovered_models_to_config(
                     continue
                 entry["models"] = {model_id: {} for model_id in model_ids}
                 entry["models_discovered"] = True
-                changed = True
+                changed = legacy_changed = True
 
-            if changed:
+            if legacy_changed:
                 cfg["custom_providers"] = providers
 
         # Modern ``providers:`` shape: a mapping of provider-key to entry. Normalise each entry

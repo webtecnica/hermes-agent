@@ -1826,6 +1826,33 @@ def test_save_discovered_models_skips_providers_mapping_with_other_base_url(monk
     assert len(save_calls) == 1
 
 
+def test_save_discovered_models_makes_no_write_when_no_provider_matches(monkeypatch):
+    """An unmatched probe must not save and must not inject an empty legacy
+    ``custom_providers`` key into a config that only uses ``providers:``."""
+    cfg = {
+        "providers": {
+            "other-gateway": {
+                "base_url": "https://other.example.com/v1",
+                "models": [],
+            }
+        }
+    }
+    save_calls = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
+    )
+
+    _save_discovered_models_to_config(
+        "https://gateway.example.com/v1", ["a", "b"]
+    )
+
+    assert cfg["providers"]["other-gateway"]["models"] == []
+    assert "models_discovered" not in cfg["providers"]["other-gateway"]
+    assert "custom_providers" not in cfg
+    assert save_calls == []
+
+
 def test_model_flow_named_custom_persists_discovered_models(monkeypatch):
     """The ``hermes model`` named-custom-provider flow persists the discovered
     catalog back to the entry's ``models:`` list.
