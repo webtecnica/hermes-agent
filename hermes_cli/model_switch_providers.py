@@ -45,9 +45,9 @@ def _save_discovered_models_to_config(
         norm_url = api_url.strip().rstrip("/").lower()
         changed = False
 
-        def _matches_probe(entry: dict, entry_url: str) -> bool:
+        def _matches_probe(entry: dict, entry_url: str, want_api_mode: str | None) -> bool:
             """Whether *entry* points at the probed endpoint with the same transport/auth."""
-            if entry_url.strip().rstrip("/").lower() != norm_url or _entry_api_mode(entry) != api_mode:
+            if entry_url.strip().rstrip("/").lower() != norm_url or _entry_api_mode(entry) != want_api_mode:
                 return False
             if headers is not None and _extra_headers_from_config(entry) != headers:
                 return False
@@ -60,7 +60,7 @@ def _save_discovered_models_to_config(
             for entry in providers:
                 if not isinstance(entry, dict):
                     continue
-                if not _matches_probe(entry, entry.get("base_url", "") or entry.get("url", "")):
+                if not _matches_probe(entry, entry.get("base_url", "") or entry.get("url", ""), api_mode):
                     continue
                 if not _discovered_catalog_stale(entry, model_ids):
                     continue
@@ -74,12 +74,15 @@ def _save_discovered_models_to_config(
         # of ids becomes a dict), which would hide the legacy list-vs-dict staleness rules.
         modern_providers = cfg.get("providers")
         if isinstance(modern_providers, dict):
-            from hermes_cli.config_providers import _normalize_custom_provider_entry
+            from hermes_cli.config_providers import _canonical_api_mode, _normalize_custom_provider_entry
+            # The picker passes api_mode as declared on the entry (``responses``), while a
+            # normalized entry carries the canonical spelling (``codex_responses``).
+            want_api_mode = _canonical_api_mode(api_mode) if api_mode else api_mode
             for provider_key, live_entry in modern_providers.items():
                 normalized = _normalize_custom_provider_entry(live_entry, provider_key=str(provider_key))
                 if normalized is None:
                     continue
-                if not _matches_probe(normalized, normalized.get("base_url", "") or ""):
+                if not _matches_probe(normalized, normalized.get("base_url", "") or "", want_api_mode):
                     continue
                 if not _discovered_catalog_stale(live_entry, model_ids):
                     continue
@@ -1039,6 +1042,7 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
                 "has_explicit_models": False,
                 "api_key": inline_api_key or _scoped_key_env(key_env),
                 "headers": headers, "api_mode": ep_cfg.get("api_mode"),
+                "credential_identity": cred_identity,
                 "discovery_allowed": bool(api_url) and _discover_flag(ep_cfg), "raw_names": [], "aliases": set()}
         grp = ep_groups[group_key]
         # ``default_model`` is the legacy key; ``model`` matches custom_providers.
@@ -1056,13 +1060,20 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
         ep_url_norm = _norm_url(api_url)
         ep_aliases = {str(alias).lower() for alias in grp["aliases"]}
         is_current = b.endpoint_is_current(ep_name, ep_aliases, ep_url_norm)
-        discovered, native_catalog_empty, _ = b.discover_endpoint(
+        discovered, native_catalog_empty, probe_live = b.discover_endpoint(
             grp["api_key"], api_url,
             ep_name if str(ep_name).strip().lower() in {"ollama", "custom:ollama"} else "custom",
             grp["has_explicit_models"], headers=grp["headers"] or None, api_mode=grp["api_mode"],
             discovery_allowed=grp["discovery_allowed"], is_current=is_current)
         if discovered is not None:
             models_list = discovered
+            if probe_live:  # a successful live probe persists the catalog for no-probe surfaces
+                try:
+                    _save_discovered_models_to_config(
+                        api_url, discovered, api_mode=grp["api_mode"], headers=grp["headers"] or None,
+                        credential_identity=grp["credential_identity"])
+                except Exception:
+                    pass
 
         b.add_endpoint_row(ep_name, display_name, api_url, models_list, is_current, native_catalog_empty)
         b.seen_slugs.update(ep_aliases)

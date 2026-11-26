@@ -1793,6 +1793,53 @@ def test_save_discovered_models_matches_providers_entry_api_alias(monkeypatch):
     assert len(save_calls) == 1
 
 
+def test_picker_probe_persists_a_providers_mapping_entry(monkeypatch):
+    """End to end through the picker builder for #159908: ``providers:`` entries are
+    probed in section 3 (``_lap_user_provider_rows``), so a successful live probe there
+    must reach the same saver as the legacy ``custom_providers:`` rows and persist the
+    catalog into the entry itself."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids", lambda *_a, **_kw: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models", lambda *_a, **_kw: ["live-a", "live-b"]
+    )
+    cfg = {
+        "providers": {
+            "my-gateway": {
+                "base_url": "https://gateway.example.com/v1",
+                "models": [],
+            }
+        }
+    }
+    save_calls = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="my-gateway",
+        current_base_url="https://gateway.example.com/v1",
+        user_providers=cfg["providers"],
+        custom_providers=[],
+        probe_custom_providers=True,
+        max_models=50,
+    )
+
+    entry = cfg["providers"]["my-gateway"]
+    assert entry["models"] == {"live-a": {}, "live-b": {}}
+    assert entry["models_discovered"] is True
+    assert len(save_calls) == 1
+    row = next(
+        (p for p in providers if p.get("api_url") == "https://gateway.example.com/v1"),
+        None,
+    )
+    assert row is not None and row["models"] == ["live-a", "live-b"]
+
+
 def test_save_discovered_models_preserves_dict_form_in_providers_mapping(monkeypatch):
     """The legacy staleness rule holds per entry in the modern ``providers:`` shape:
     a ``models`` dict of per-model metadata is user-curated and must never be
