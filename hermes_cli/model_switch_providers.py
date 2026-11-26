@@ -31,43 +31,47 @@ def _save_discovered_models_to_config(
     headers: Optional[dict[str, str]] = None, credential_identity: str | None = None) -> None:
     """Persist a successful ``/v1/models`` probe into the matching provider entry.
 
-    Reads both config shapes: the legacy ``custom_providers`` list and the modern
-    ``providers`` mapping (dict of provider-key to entry). Matches by base_url
-    (slash-normalised), api_mode, headers and credential identity. A failed config
-    write is swallowed — the picker still shows the live models for this session."""
+    Handles both config shapes: the legacy ``custom_providers`` list and the modern
+    ``providers`` mapping (provider-key -> entry). Matches by base_url (slash-normalised),
+    api_mode, extra headers and credential identity, then applies the same staleness rule
+    in both shapes. A failed config write is swallowed — the picker still shows the live
+    models for this session."""
     if not api_url or not model_ids:
         return
     try:
         from hermes_cli.config import load_config, save_config
+        from hermes_cli.model_switch import _extra_headers_from_config
         cfg = load_config()
         norm_url = api_url.strip().rstrip("/").lower()
         changed = False
-        legacy_changed = False
+
+        def _matches_probe(entry: dict, entry_url: str) -> bool:
+            """Whether *entry* points at the probed endpoint with the same transport/auth."""
+            if entry_url.strip().rstrip("/").lower() != norm_url or _entry_api_mode(entry) != api_mode:
+                return False
+            if headers is not None and _extra_headers_from_config(entry) != headers:
+                return False
+            if credential_identity is not None and _entry_credentials(entry, "key_env", "api_key_env")[2] != credential_identity:
+                return False
+            return True
 
         providers = cfg.get("custom_providers") or []
         if isinstance(providers, list):
             for entry in providers:
                 if not isinstance(entry, dict):
                     continue
-                entry_url = (entry.get("base_url", "") or entry.get("url", "")).strip()
-                if entry_url.rstrip("/").lower() != norm_url or _entry_api_mode(entry) != api_mode:
-                    continue
-                if headers is not None and _extra_headers_from_config(entry) != headers:
-                    continue
-                if credential_identity is not None and _entry_credentials(entry, "key_env", "api_key_env")[2] != credential_identity:
+                if not _matches_probe(entry, entry.get("base_url", "") or entry.get("url", "")):
                     continue
                 if not _discovered_catalog_stale(entry, model_ids):
                     continue
                 entry["models"] = {model_id: {} for model_id in model_ids}
                 entry["models_discovered"] = True
-                changed = legacy_changed = True
+                changed = True
 
-            if legacy_changed:
-                cfg["custom_providers"] = providers
-
-        # Modern ``providers:`` shape: a mapping of provider-key to entry. Normalise each entry
-        # through the shared normaliser so URL/api_mode/headers/credential matching follows the
-        # same rules as the picker rows, but write into the LIVE entry, never the copy.
+        # Modern ``providers:`` shape: a mapping of provider-key to entry. Reuse the shared
+        # normaliser for the matching rules (so they cannot drift from the picker rows), but
+        # decide staleness and write on the LIVE entry: normalising rewrites ``models`` (a list
+        # of ids becomes a dict), which would hide the legacy list-vs-dict staleness rules.
         modern_providers = cfg.get("providers")
         if isinstance(modern_providers, dict):
             from hermes_cli.config_providers import _normalize_custom_provider_entry
@@ -75,12 +79,7 @@ def _save_discovered_models_to_config(
                 normalized = _normalize_custom_provider_entry(live_entry, provider_key=str(provider_key))
                 if normalized is None:
                     continue
-                entry_url = (normalized.get("base_url", "") or "").strip()
-                if entry_url.rstrip("/").lower() != norm_url or _entry_api_mode(normalized) != api_mode:
-                    continue
-                if headers is not None and _extra_headers_from_config(normalized) != headers:
-                    continue
-                if credential_identity is not None and _entry_credentials(normalized, "key_env", "api_key_env")[2] != credential_identity:
+                if not _matches_probe(normalized, normalized.get("base_url", "") or ""):
                     continue
                 if not _discovered_catalog_stale(live_entry, model_ids):
                     continue

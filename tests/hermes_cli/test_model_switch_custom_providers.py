@@ -1766,15 +1766,22 @@ def test_save_discovered_models_persists_to_providers_mapping(monkeypatch):
 
 
 def test_save_discovered_models_preserves_dict_form_in_providers_mapping(monkeypatch):
-    """The legacy rule holds for the modern shape too: a ``models`` dict of
-    per-model metadata is user-curated and must never be replaced."""
+    """The legacy staleness rule holds per entry in the modern ``providers:`` shape:
+    a ``models`` dict of per-model metadata is user-curated and must never be
+    replaced, while a sibling entry on the same endpoint still gets the discovered
+    catalog. A guard-only variant (curated entry alone) would also pass on the bug,
+    because the bug writes nothing at all."""
     curated = {"configured-model": {"context_length": 8192}}
     cfg = {
         "providers": {
-            "my-gateway": {
+            "gateway-curated": {
                 "base_url": "https://gateway.example.com/v1",
                 "models": dict(curated),
-            }
+            },
+            "gateway-discovered": {
+                "base_url": "https://gateway.example.com/v1",
+                "models": [],
+            },
         }
     }
     save_calls = []
@@ -1787,19 +1794,26 @@ def test_save_discovered_models_preserves_dict_form_in_providers_mapping(monkeyp
         "https://gateway.example.com/v1", ["configured-model", "discovered-model"]
     )
 
-    entry = cfg["providers"]["my-gateway"]
-    assert entry["models"] == curated
-    assert "models_discovered" not in entry
-    assert save_calls == []
+    curated_entry = cfg["providers"]["gateway-curated"]
+    assert curated_entry["models"] == curated
+    assert "models_discovered" not in curated_entry
+    discovered_entry = cfg["providers"]["gateway-discovered"]
+    assert discovered_entry["models"] == {
+        "configured-model": {},
+        "discovered-model": {},
+    }
+    assert discovered_entry["models_discovered"] is True
+    assert len(save_calls) == 1
 
 
 def test_save_discovered_models_skips_providers_mapping_with_other_base_url(monkeypatch):
-    """Only the entry whose base_url matches the probe is written; a sibling
-    entry on another endpoint keeps its models untouched."""
+    """Only the entry whose base_url matches the probe is written; a sibling entry
+    on another endpoint keeps its models untouched, and the legacy
+    ``custom_providers`` key is not injected into a ``providers:``-only config."""
     cfg = {
         "providers": {
             "matching-gateway": {
-                "base_url": "https://gateway.example.com/v1",
+                "base_url": "https://gateway.example.com/v1/",
                 "models": [],
             },
             "other-gateway": {
@@ -1821,36 +1835,12 @@ def test_save_discovered_models_skips_providers_mapping_with_other_base_url(monk
     other = cfg["providers"]["other-gateway"]
     assert other["models"] == []
     assert "models_discovered" not in other
-    # The matching sibling proves the modern save path ran at all.
+    # Trailing slash on the entry's base_url still matches, and the write proves the
+    # modern save path ran at all.
     assert cfg["providers"]["matching-gateway"]["models"] == {"a": {}, "b": {}}
-    assert len(save_calls) == 1
-
-
-def test_save_discovered_models_makes_no_write_when_no_provider_matches(monkeypatch):
-    """An unmatched probe must not save and must not inject an empty legacy
-    ``custom_providers`` key into a config that only uses ``providers:``."""
-    cfg = {
-        "providers": {
-            "other-gateway": {
-                "base_url": "https://other.example.com/v1",
-                "models": [],
-            }
-        }
-    }
-    save_calls = []
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
-    monkeypatch.setattr(
-        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
-    )
-
-    _save_discovered_models_to_config(
-        "https://gateway.example.com/v1", ["a", "b"]
-    )
-
-    assert cfg["providers"]["other-gateway"]["models"] == []
-    assert "models_discovered" not in cfg["providers"]["other-gateway"]
+    assert cfg["providers"]["matching-gateway"]["models_discovered"] is True
     assert "custom_providers" not in cfg
-    assert save_calls == []
+    assert len(save_calls) == 1
 
 
 def test_model_flow_named_custom_persists_discovered_models(monkeypatch):
