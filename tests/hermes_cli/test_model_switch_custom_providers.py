@@ -1765,6 +1765,34 @@ def test_save_discovered_models_persists_to_providers_mapping(monkeypatch):
     )
 
 
+def test_save_discovered_models_matches_providers_entry_api_alias(monkeypatch):
+    """The ``providers:`` shape accepts ``api:`` for ``base_url`` (and ``transport:``
+    for ``api_mode``). Matching goes through ``_normalize_custom_provider_entry``, so
+    the alias-only entry must be found and written too."""
+    cfg = {
+        "providers": {
+            "my-gateway": {
+                "api": "https://gateway.example.com/v1",
+                "models": [],
+            }
+        }
+    }
+    save_calls = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda config: save_calls.append(config)
+    )
+
+    _save_discovered_models_to_config(
+        "https://gateway.example.com/v1", ["a", "b"]
+    )
+
+    entry = cfg["providers"]["my-gateway"]
+    assert entry["models"] == {"a": {}, "b": {}}
+    assert entry["models_discovered"] is True
+    assert len(save_calls) == 1
+
+
 def test_save_discovered_models_preserves_dict_form_in_providers_mapping(monkeypatch):
     """The legacy staleness rule holds per entry in the modern ``providers:`` shape:
     a ``models`` dict of per-model metadata is user-curated and must never be
